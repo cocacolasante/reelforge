@@ -1,0 +1,18 @@
+services:
+  test:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: core
+    profiles: ["test"]
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: ""
+    volumes:
+      - ./packages:/app/packages
+      - ./apps:/app/apps
+      - ./tests:/app/tests
+      - ./pyproject.toml:/app/pyproject.toml
+    command: ["pytest", "-ra", "-v"]
+    networks: [reelforge_net]

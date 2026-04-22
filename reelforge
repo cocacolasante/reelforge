@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Host shim: runs `reelforge ...` inside the cli container with ./data mounted at /data.
+set -euo pipefail
+
+tty_flag=""
+if [ -t 0 ] && [ -t 1 ]; then
+  tty_flag="-it"
+fi
+
+exec docker compose --profile cli run --rm $tty_flag cli "$@"

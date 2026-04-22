@@ -1,0 +1,49 @@
+[project]
+name = "reelforge"
+version = "0.1.0"
+description = "Containerized long-form-to-reels video pipeline"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Core
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    # API
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    # Queue / broker
+    "arq>=0.26",
+    "redis>=5.2",
+    # External services
+    "anthropic>=0.40",
+    # CLI
+    "typer>=0.15",
+    "rich>=13.9",
+    # Analysis pipeline
+    "scenedetect[opencv]>=0.6.4",
+    "faster-whisper>=1.0.0",
+    "numpy>=1.26,<3",
+    # Phase 5: API persistence + async I/O
+    "sqlmodel>=0.0.22",
+    "aiosqlite>=0.20",
+    "aiofiles>=24.1",
+    "python-multipart>=0.0.20",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "httpx>=0.27",
+    "ruff>=0.8",
+    "fakeredis>=2.26",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

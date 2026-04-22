@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# In-container wrapper: runs the Typer CLI module.
+set -euo pipefail
+exec python -m apps.cli.main "$@"

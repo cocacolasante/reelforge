@@ -1,0 +1,604 @@
+# ReelForge — working notes for Claude Code
+
+Read this first whenever you resume work on this repo.
+
+## What this is
+Containerized pipeline that turns long-form video into 30–60s reels (MP4/MOV)
+with music, captions, transitions, and effects. Every piece of the stack runs
+in Docker; the only host requirement is Docker Engine ≥ 24 + Compose v2.
+
+## Phase status
+- [x] Phase 0 — Docker scaffolding & compose topology
+- [x] Phase 1 — Ingestion & analysis engine (scenes + transcript + loudness + semantics → analysis.json)
+- [x] Phase 2 — Reel selection (candidate generation + LLM ranking + dedup → reels.json)
+- [x] Phase 3 — Composition (clips + transitions + captions + music + effects → mezzanine.mp4)
+- [x] Phase 4 — Export presets (transcode mezzanine → 4 delivery presets)
+- [x] Phase 5 — API & job orchestration (FastAPI + SQLModel + SSE)
+- [x] Phase 6 — Web UI (Next.js 14 + React Query + Tailwind + shadcn)
+- [x] Phase 7 — Polish: cost controls, caches, cleanup, docs, prod deploy scaffolding
+- [ ] Phase 8+ — not started
+
+## Topology
+```
+web (Next.js, :3000) → api (FastAPI, :8000) → redis (arq broker) ← worker (arq)
+                                              ↓
+                                            /data volume (bind: ./data)
+                                            /models/whisper (named: whisper_models)
+```
+- `api`, `worker`, `cli` all build from `docker/Dockerfile` (multi-stage targets).
+- `web` builds from `docker/Dockerfile.web` (Next.js standalone output).
+
+## Everyday commands
+```bash
+cp .env.example .env                       # first time only, then add ANTHROPIC_API_KEY
+docker compose up -d                       # production-ish: api, worker, web, redis
+docker compose -f compose.yml -f compose.dev.yml up   # hot-reload dev stack
+docker compose --profile cli run --rm cli probe /data/inbox/foo.mp4   # or:
+./reelforge probe /data/inbox/foo.mp4      # host shim, same effect
+
+# Phase 1: analysis
+./reelforge analyze /data/inbox/foo.mp4              # queued via worker (default)
+./reelforge analyze /data/inbox/foo.mp4 --local      # in-process — debug path
+./reelforge analyze /data/inbox/foo.mp4 --resume     # reuse intermediates from prior run
+./reelforge analyze /data/inbox/foo.mp4 --model small --threshold 30
+
+# Phase 2: reel selection (input = a completed analysis.json)
+./reelforge select <asset_id>                        # queued
+./reelforge select /data/inbox/foo.mp4               # accepts a source path too
+./reelforge select <asset_id> --top 5 --overlap 0.3
+./reelforge select <asset_id> --resume               # reuse ranking_raw.json if stamp matches
+./reelforge select <asset_id> --local                # in-process — debug path
+./reelforge select <asset_id> --json | jq '.reels[0]'
+
+# Phase 3: composition (input = a completed reels.json)
+./reelforge compose <asset_id> --reel 1              # render rank-1 reel, 9:16 with auto-mood music
+./reelforge compose <asset_id> --reel <candidate_id> # by stable id instead of rank
+./reelforge compose <asset_id> --reel 1 --aspect 16:9 --caption-mode karaoke
+./reelforge compose <asset_id> --reel 1 --transition slideleft --no-music
+./reelforge compose <asset_id> --reel 1 --music-track joyful-01 --lut identity
+./reelforge compose <asset_id> --reel 1 --local      # in-process — debug path
+
+# Phase 4: export presets (input = a completed mezzanine.mp4)
+./reelforge export <asset_id> --reel 1 --preset mp4_h264_social
+./reelforge export <asset_id> --reel 1 --preset mp4_h265_hq
+./reelforge export <asset_id> --reel 1 --preset mov_prores_422
+./reelforge export <asset_id> --reel 1 --preset mov_prores_hq
+./reelforge export <asset_id> --reel 1 --all          # all four, sequentially
+./reelforge export <asset_id> --reel 1 --preset mp4_h264_social --force   # re-transcode
+
+# Tests (inside the test profile, same image as worker)
+docker compose --profile test run --rm test            # default: pytest -ra -v
+docker compose --profile test run --rm test pytest -k cache_key
+
+docker compose run --rm cli bash           # drop into a shell for debugging
+docker compose build --no-cache api worker # rebuild after dependency changes
+docker compose down                        # stop; volumes (whisper_models, ./data) persist
+curl -fsS http://localhost:8000/health     # API health
+docker compose logs worker | jq            # structured JSON logs from the worker
+```
+
+## Seam locations
+- **Ingestion / probe** — `packages/core/reelforge_core/ingest.py` (`probe()`, `MediaAsset.from_path()`, `ProbeResult`). `MediaAsset.has_audio` + `color_transfer` live here.
+- **Shared paths** — `packages/core/reelforge_core/paths.py` (reads `REELFORGE_DATA_DIR`).
+- **Atomic writes** — `packages/core/reelforge_core/io_utils.py` (`write_json_atomic` used by every pipeline stage).
+- **Data models** — `packages/core/reelforge_core/models.py` (Pydantic: `Scene`, `Transcript*`, `LoudnessPoint`, `SceneSemantics`, `AnalysisConfig`, `AnalysisReport`, `ProgressEvent`, `STAGE_WEIGHTS`).
+- **Error hierarchy** — `packages/core/reelforge_core/errors.py` (`AnalysisError` + one subclass per stage).
+- **SQLite cache + job bookkeeping** — `packages/core/reelforge_core/db.py` (WAL mode; semantics_cache + jobs tables).
+- **Analysis pipeline (Phase 1)**:
+  - `analysis/scenes.py` — PySceneDetect + HDR bump + parallel thumbnail extraction.
+  - `analysis/audio_extract.py` — one-shot mono 16 kHz PCM extraction shared by transcribe + loudness.
+  - `analysis/transcribe.py` — faster-whisper with VAD + auto device/compute selection.
+  - `analysis/audio.py` — ffmpeg `ebur128` → 1-second LUFS bins.
+  - `analysis/semantics.py` — forced tool-use calls with retry + SQLite cache.
+  - `analysis/pipeline.py` — `analyze()` orchestrator with weighted progress + resume stamps.
+- **Selection pipeline (Phase 2)**:
+  - `reels/candidates.py` — pure enumeration of 30-60s scene-aligned spans + stable `candidate_id` (sha1 truncated to 16 hex).
+  - `reels/rank.py` — **one batched Anthropic call** covering all candidates (split into overlapping batches of 60 only when > 80). Forced tool-use with one corrective retry for missing candidates.
+  - `reels/dedup.py` — greedy overlap-aware dedup (intersection over smaller set, strict `<` threshold) + `assign_ranks_and_truncate`.
+  - `reels/pipeline.py` — `select_reels()` orchestrator with stage-weighted progress (candidates 5% / ranking 90% / dedup 5%) + `ranking_raw.json.stamp` resume.
+- **Composition pipeline (Phase 3)** — `packages/core/reelforge_core/compose/`:
+  - `graph.py` — `FilterNode`/`FilterGraph` DSL, `_ffescape` for filter-argument escaping, `run_ffmpeg` subprocess wrapper that raises `FFmpegError` with stderr tail, and `ffmpeg_version()`.
+  - `clips.py` — `build_clip_command` + async `extract_clips` (accurate-seek re-encode; scale+pad with letterbox; HDR tonemap when `color_transfer in {smpte2084, arib-std-b67}`; bit-exact + zeroed creation_time for determinism).
+  - `captions.py` — `build_captions` writes ASS; `_source_to_mezz_time` maps source timestamps to the mezzanine timeline (xfade overlap subtracted). Static mode packs into lines; karaoke mode emits one Dialogue per word.
+  - `music.py` — `load_music_library` (bundled + user manifests), seeded `select_track` (mood → fallback to neutral → None), `build_music_prep_command`/`prepare_music` (stream-loop + trim + in/out fade).
+  - `graph_builder.py` — `build_final_command` assembles clips + xfade/acrossfade chain + Ken-Burns on low-energy scenes + LUT + unsharp + subtitles + music sidechain/duck/mix into a single FFmpeg argv. **Splits `[voice]` via `asplit` so it can be both the sidechain key and the amix primary.**
+  - `pipeline.py` — `compose()` orchestrator; stage weights `prepare 2% / clips 35% / captions 3% / music 5% / render 53% / finalize 2%`; parses `time=HH:MM:SS.ms` from FFmpeg stderr for live render progress.
+- **Export pipeline (Phase 4)** — `packages/core/reelforge_core/export/`:
+  - `presets.py` — four `PresetSpec` records + `PRESET_SPEC_VERSION` + `PRORES_FOURCC` lookup. ProRes 422 uses `profile:v=2` (fourcc `apcn`); HQ uses `profile:v=3` (fourcc `apch`). Both set `vendor=apl0` so Apple apps recognize the files.
+  - `command.py` — `build_export_command` — pure, no filters. Explicit `-map 0:v:0 -map 0:a:0`; bit-exact-friendly zeroed `creation_time` metadata.
+  - `verify.py` — `verify_export` runs ffprobe against the output, checks codec/pixfmt/fourcc/audio-present/duration-drift. `sanity_check_size` warns (not fails) when size diverges from the preset's typical ratio.
+  - `pipeline.py` — `export()`. Skip-if-exists keyed on `(input_mezzanine_sha256, preset_spec_version)` in the sidecar. Broken outputs are kept on disk for forensics (not deleted). Stage weights `prepare 5% / transcode 90% / finalize 5%`.
+- **Shared worker progress** — `apps/worker/progress.py::make_throttled_progress_writer` (500 ms throttle; terminal events always emit). Used by `analyze_asset`, `select_reels_job`, `compose_reel_job`, and `export_reel_job`.
+- **Worker encoder check** — `apps/worker/main.py::_verify_ffmpeg_encoders` runs on boot and fails loudly if libx264 / libx265 / prores_ks / aac / pcm_s16le are missing from the image.
+- **API service (Phase 5)** — `apps/api/`:
+  - `main.py` — FastAPI app factory + lifespan (init DB, open arq pool, reset any `queued/running` jobs to `failed` with message "interrupted by restart", start background upload-purge loop). Every unhandled error returns the `ErrorEnvelope` shape.
+  - `settings.py` — Pydantic BaseSettings; `data_dir` from `REELFORGE_DATA_DIR`, `redis_url` from `REDIS_URL`, all other values have defaults.
+  - `db.py` — SQLModel entities (`Project`, `Asset`, `Job`, `Reel`, `Export`, `UploadSession`, `SemanticsCache`), async engine on `NullPool`, WAL + `busy_timeout=5000` pragmas, `foreign_keys=ON`. Includes an in-place migration that drops the legacy Phase-1 `jobs` table if its old `job_id` PK is on disk (no prod jobs existed pre-Phase-5).
+  - `middleware.py` — request-id stamp + structured JSON access log (keys `ts,level,logger,request_id,method,path,status,duration_ms`).
+  - `schemas/` — Pydantic response schemas. **DB entities never returned directly** from endpoints.
+  - `routers/` — `health`, `projects`, `uploads`, `pipeline` (analyze+select), `compose`, `reels`, `exports`, `jobs`, `media`, `music`.
+  - `services/jobs.py` — `enqueue_job` creates the DB row first, then calls `arq_pool.enqueue_job(..., _job_id=row.id)` so arq's job id equals our DB id. Conflict detection: supply a SQLAlchemy clause, returns 409 `JOB_ALREADY_RUNNING` if any matching `queued|running` row exists.
+  - `streaming.py` — HTTP `Range: bytes=...` helper (200 for full body, 206 for partial, 416 for unsatisfiable). Supports `bytes=start-end`, `bytes=start-`, and `bytes=-suffix`. Used for reel preview, export download, and music audio.
+- **Shared job state** — `packages/core/reelforge_core/jobstate.py` — sync SQLite writes wrapped by `asyncio.to_thread`. Workers call `mark_job_running`, `record_job_success`, `record_job_failure`, `append_log`. These target the same `jobs` table the API reads. Worker code that still does `from reelforge_core import db; db.record_job_*` continues to work via shims in `db.py`.
+- **Web UI (Phase 6)** — `apps/web/`:
+  - **Stack** — Next.js 14 App Router + TypeScript strict + Tailwind + shadcn-style primitives (not the CLI; hand-rolled in `components/ui/` from Radix primitives) + Inter via `next/font` + React Query v5 + Zustand for the uploader's chunk state. `output: "standalone"` for a ~150 MB runtime image.
+  - **Pages** — `app/page.tsx` (project list + create modal), `app/projects/[projectId]/page.tsx` (three-zone: uploader → analyze → select), `app/projects/[projectId]/reels/page.tsx` (ranked list with 3-thumb preview strip), `app/projects/[projectId]/reels/[reelId]/page.tsx` (preview + compose config + export grid).
+  - **API client** — `lib/api/client.ts` is the single `fetch` wrapper. Every hook in `lib/api/hooks.ts` validates its response with a Zod schema from `lib/api/schemas.ts`; validation failure raises `APIError("INVALID_RESPONSE")` so API/UI drift is caught immediately. Error envelopes from the server are parsed into `APIError(code, status, message, details)`; user-facing copy comes from `ERROR_MESSAGES` in `lib/api/errors.ts`.
+  - **Uploader** — `lib/upload/uploader.ts` is a per-project Zustand store + hook. Protocol: POST `/uploads` → streaming PUT per chunk with parallelism 3 (each `file.slice(s, e).arrayBuffer()` so memory doesn't balloon on multi-GB files) → POST `/complete`. Persists the in-flight session id to `localStorage` so a page reload can resume. `AbortController` per chunk for pause; exponential-backoff retries up to 3×.
+  - **SSE** — `lib/sse/job-stream.ts::useJobStream(jobId)` opens `EventSource(API/jobs/{id}/stream)`; on `onerror` falls back to 1.5 s polling of `GET /jobs/{id}`. Stops on terminal event.
+  - **JobProgress** — one component covers all four job kinds; analyze + compose render stage steppers (probe → scenes → transcribe → loudness → semantics / prepare → clips → captions → music → render → finalize); select + export are single progress bars.
+- **API entrypoint** — `apps/api/main.py` (`app` = FastAPI instance; `/health`).
+- **Worker entrypoint** — `apps/worker/main.py` (`WorkerSettings` with `analyze_asset`).
+- **Worker jobs** — `apps/worker/jobs.py` (`analyze_asset`, `select_reels_job`, `compose_reel_job`, `export_reel_job`; all stream progress to Redis `job:{id}:progress`). `WorkerSettings.max_jobs=2` because compose/export saturate CPU; scale horizontally with `docker compose up --scale worker=N`.
+- **Worker logging** — `apps/worker/logging_config.py` (structured JSON; `docker compose logs worker | jq`).
+- **CLI entrypoint** — `apps/cli/main.py` (Typer: `version`, `probe`, `analyze`, `select`, `compose`, `export`).
+- **Web app** — `apps/web/app/` (App Router; `NEXT_PUBLIC_API_URL` env).
+- **In-container `reelforge` script** — `docker/entrypoints/reelforge` → `python -m apps.cli.main`.
+- **Host `reelforge` shim** — `./reelforge` → `docker compose --profile cli run --rm cli ...`.
+
+## Layout conventions
+- **No uv workspace.** Single root `pyproject.toml`. Code is reached via
+  `PYTHONPATH=/app:/app/packages/core` set in the Dockerfile. `apps/api/main.py`
+  therefore imports as `apps.api.main`. (The original spec had per-app
+  `pyproject.toml` files; I collapsed to a single project because the workspace
+  setup conflicts with the `apps.api.main:app` module path the spec expects.)
+- **Non-root containers.** Every image runs as `reelforge` (uid 1000).
+  Volumes are chowned in the Dockerfile before `USER reelforge`.
+- **Image pins.** Every `FROM` uses a concrete tag; no `:latest`.
+- **`.dockerignore` excludes `data/`.** The bind mount at runtime injects it.
+
+## Build caching
+The Python image has four stages: `system` (apt + ffmpeg), `python-deps`
+(`uv sync --no-install-project` — deps only), `core` (source copy + chown +
+`USER reelforge`), then `api` / `worker` / `cli` targets. Dependency changes
+only invalidate from `python-deps` onward; code changes only invalidate `core`
+onward. `uv.lock` isn't committed yet — `uv sync` falls back to resolving from
+`pyproject.toml` on first build, which writes a lockfile inside the image.
+
+## Phase 1 artifacts on disk
+Per-asset working dir: `/data/working/{asset_id}/`.
+- `probe.json` — snapshot of `MediaAsset` (id, path, size, probe fields).
+- `thumbs/scene_NNNN.jpg` — one per scene, 4-digit zero-padded.
+- `scenes.json` + `scenes.json.stamp` — scene intervals + the config that produced them.
+- `audio.wav` — mono 16 kHz PCM, kept so transcribe + loudness share the extraction.
+- `transcript.json` (+ `.stamp`) — word-level faster-whisper output, or `{"transcript": null}` for silent sources.
+- `loudness.json` (+ `.stamp`) — 1-second LUFS bins. `ebur128.stderr.log` is written then deleted.
+- `semantics.json` — per-scene Claude tool-use result (cached in `/data/reelforge.db`).
+- `analysis.json` — the merged report. **Downstream phases read only this file.**
+
+Resume: each stage checks its `.stamp` matches `(config, source_mtime)` before skipping. Semantics use the SQLite cache keyed on `(asset_id, scene_index, model, prompt_version, thumb_sha256, transcript_slice_sha256)`.
+
+## Phase 2 artifacts on disk
+Same working dir, per asset:
+- `candidates.json` — every 30-60s scene-span (pre-ranking). Written even when the list is empty.
+- `ranking_raw.json` — the parsed tool-use `rankings` array straight from Claude; untouched by dedup. Invaluable for debugging.
+- `ranking_raw.json.stamp` — `(ranking_model, ranking_prompt_version, temperature, candidate_hash)`. When `--resume` is set and the stamp matches, `ranking_raw.json` is re-parsed instead of calling Claude.
+- `reels.json` — the merged `ReelSelection`. **Phase 3 and Phase 5 read only this file.**
+
+Determinism: Claude at `temperature=0` is usually — but not always — byte-identical across back-to-back calls. The reliable determinism path is `--resume`: two consecutive `--resume` runs are byte-identical (excluding `created_at`/`elapsed_sec`). If exact reproducibility matters, snapshot `ranking_raw.json`.
+
+## Phase 3 artifacts on disk
+Per-reel dir: `/data/working/{asset_id}/reels/{reel_id}/` (where `reel_id` = `candidate_id` from Phase 2).
+
+- `clips/clip_NNNN.mp4` — normalized trimmed clips (one per scene in the reel), re-encoded at `ultrafast` CRF 18 to target resolution / fps. Letter/pillarboxed. HDR source is tonemapped. Bit-exact + zeroed metadata for determinism.
+- `captions.ass` — ASS subtitles on the mezzanine timeline (xfade overlap subtracted). Empty-but-valid file when mode=off or no transcript.
+- `music.wav` — 48 kHz stereo PCM trim of the selected track with 0.5s in / 1.0s out fade. Absent when `--no-music` or no library match.
+- `mezzanine.mp4` — the canonical render. H.264 / yuv420p / AAC / +faststart / bit-exact. **Phase 4 transcodes from this file.**
+- `compose.json` — `ComposeManifest` recording exactly what was rendered (config, scene→clip map, chosen music, ffmpeg version, duration).
+- `ffmpeg_commands.log` — every FFmpeg invocation with full args. Copy-paste any line to reproduce the step outside the container. Rotated to `.1` at 10 MB.
+- `tmp/` — scratch. Purged on success; kept on failure for inspection.
+
+**Mezzanine-as-source-of-truth contract for Phase 4:** downstream export presets read only `mezzanine_path` and the `ComposeConfig.aspect` / resolution from `compose.json`. They MUST NOT re-run composition; changing export format costs one transcode pass, not a re-render.
+
+Determinism: `compose.mezzanine.mp4` is **byte-identical** across back-to-back runs with the same `ComposeConfig` and source (verified by `test_compose_deterministic_byte_identical`). libx264 is deterministic at fixed preset + crf; the pipeline sets `-fflags +bitexact`, `-flags:{v,a} +bitexact`, and zeroes `creation_time`. Music selection is seeded by `(candidate_id, config.seed)`.
+
+## Phase 4 artifacts on disk
+Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
+
+- `mp4_h264_social.mp4` — Instagram/TikTok/Shorts delivery. H.264 High @ 4.1, yuv420p, CRF 20, AAC 192k, `+faststart` so browsers can stream-play without downloading the whole file first.
+- `mp4_h265_hq.mp4` — High-efficiency distribution. HEVC Main, yuv420p, CRF 22, AAC 256k, `tag:v hvc1` so Safari/QuickTime recognize it (the default `hev1` tag silently fails to play in Safari).
+- `mov_prores_422.mov` — Editorial handoff at ProRes 422 Standard. `prores_ks -profile:v 2` → fourcc `apcn`. yuv422p10le. pcm_s16le audio. `vendor=apl0`.
+- `mov_prores_hq.mov` — Editorial handoff at ProRes 422 HQ. Profile 3 → fourcc `apch`. Same pixel format + audio as 422 Standard; higher bitrate budget internally.
+- `{preset_id}.export.json` — sidecar manifest per output. Records `preset_spec_version`, `input_mezzanine_sha256`, the exact `ffmpeg_command` used, ffprobe-verified codec/duration/size, and wall-clock elapsed.
+
+**Skip-if-exists contract**: when an output file and its sidecar already exist, and both the mezzanine hash and `preset_spec_version` match, `export()` returns the existing manifest without re-transcoding. Pass `--force` to override. Bumping `PRESET_SPEC_VERSION` in code invalidates existing exports for subsequent runs (without touching the files on disk).
+
+**Mezzanine-as-source-of-truth**: `export()` reads `mezzanine.mp4` and never touches `compose.json` beyond reading `duration_sec` for progress math. Changing export format is a transcode pass, never a re-render.
+
+## Known gotchas
+- **Two worker replicas by default.** `compose.yml` sets `deploy.replicas: 2`.
+  With `docker compose up -d worker` this yields `reelforge-worker-1` and
+  `reelforge-worker-2`. Fine for Phase 0 because jobs are stateless, but keep
+  it in mind when debugging log streams.
+- **Anthropic reachability check** hits `client.models.list(limit=1)` and caches
+  the result for 60 s. If `ANTHROPIC_API_KEY` is missing, `anthropic_reachable`
+  is `false` and `/health` still returns 200 with `status: "degraded"`.
+- **No GPU by default.** Apple Silicon and AMD GPUs run CPU-only. For NVIDIA,
+  add `-f compose.gpu.yml` to the compose command and make sure the NVIDIA
+  Container Toolkit is installed on the host.
+- **Web dev hot reload** mounts `./apps/web` into `/app` and uses anonymous
+  volumes for `node_modules` and `.next` so the host never overwrites the
+  container's installed deps / build cache.
+- **Whisper model download on first run.** The first `analyze` with a given model
+  downloads weights into the `whisper_models` named volume (base.en ≈ 150 MB;
+  large-v3 ≈ 3 GB). Don't interpret a slow first run as a hang — it's baked
+  into the CTranslate2 flow and there's no intermediate progress surface.
+- **Apple Silicon / macOS hosts** run Docker via a Linux VM with no GPU
+  passthrough. faster-whisper is CPU-only + int8 on Macs; `base.en` is the
+  right default. `large-v3` works but is slow (~2× real-time on M-series).
+- **HDR footage** (color_transfer in `{smpte2084, arib-std-b67}`) auto-bumps
+  the scene-detection threshold from 27.0 → 40.0 unless the user overrides it.
+  Logged at WARNING so it's visible in `docker compose logs worker`.
+- **SQLite WAL on a bind mount** creates `reelforge.db-wal` and
+  `reelforge.db-shm` next to the DB. `.gitignore` excludes both.
+- **Two worker replicas** share `/data/reelforge.db`. WAL mode handles
+  concurrent reads; writes are serialized per-connection by SQLite. That's
+  fine for this workload (semantics upserts are rare and small).
+- **Anthropic egress.** Every semantics call goes through `api.anthropic.com`.
+  Behind a TLS-intercepting proxy, bake the corporate CA bundle into the image
+  rather than disabling verification. `/health` surfaces reachability already.
+- **Ranking determinism is not byte-identical at `temperature=0`.** Claude at
+  temp=0 is *usually* deterministic but back-to-back calls can still differ in
+  surface phrasing (e.g. different titles for the same span). The stable check
+  is `--resume` (reuses `ranking_raw.json`). Downstream phases consuming
+  `reels.json` should not depend on exact string identity across runs.
+- **`.env.example` is a template, not a credential store.** Keep it filled with
+  placeholders. A real `ANTHROPIC_API_KEY` in `.env.example` will leak to git
+  on first commit.
+- **Bundled music tracks are synthesized placeholders.** `assets/music/synthesize_placeholders.sh`
+  runs at Docker build time to produce ten CC0 waveform-based tracks (one per
+  mood). They prove the music pipeline works but they are not curated music.
+  Replace with real CC0 tracks when you want the audio to actually be good.
+  Updating the manifest alone isn't enough — the replacement files need to
+  land at `/app/assets/music/{id}.mp3` either by baking into the image or by
+  placing them in `/data/music/` where the user-manifest is read.
+- **Karaoke captions are simple per-word-replacement.** One ASS Dialogue per
+  `TranscriptWord`, identical positioning, sequential timing. The fancy
+  word-highlight-within-line look (TikTok-style) is Phase 7 polish.
+- **Only libx264 + AAC.** No NVENC, no hardware encode. Determinism and
+  quality come first; we can revisit in Phase 7 after measuring.
+- **Do not use `-c copy` for clip extraction.** Stream-copy with `-ss` snaps to
+  the previous keyframe (up to 10 seconds of scene start lost). `extract_clips`
+  always re-encodes. Same rule for anything downstream that seeks into the
+  source.
+- **FFmpeg stream fan-out requires `asplit` / `split`.** Using a labelled
+  stream as input to two filters without splitting it gives the infamous
+  "matches no streams" error at runtime. The graph builder splits `[voice]`
+  before sidechain + amix — if you add another consumer, add another split.
+- **Ken Burns applies per low-energy scene.** `visual_energy == "low"` in
+  `analysis.semantics` triggers a slow zoompan for that clip. With
+  solid-color test fixtures the model often tags scenes as low-energy, so
+  expect zoompan in test renders.
+- **zoompan is the single slowest filter in the pipeline.** It upsamples
+  each frame to the target resolution internally; three 15s 1080p clips
+  with zoompan can push render time from ~1 min to 10+ min on a laptop.
+  If render feels stuck, check for zoompan; `--no-effects` or simply not
+  having `visual_energy == "low"` scenes avoids it.
+- **ProRes `profile:v` numbers are easy to miscopy.** `2` = 422 Standard
+  (fourcc `apcn`), `3` = 422 HQ (fourcc `apch`). Swapping them produces a
+  file that still plays but is the wrong grade. The preset registry test
+  `test_prores_profiles_differ` guards this.
+- **H.265 MP4 needs `tag:v hvc1`.** The default FFmpeg tag `hev1` plays in
+  VLC and Chrome but silently fails in Safari/QuickTime. `mp4_h265_hq`
+  sets `tag:v hvc1` explicitly.
+- **Exports are not deleted on verification failure.** When `verify_export`
+  raises, the broken output file stays on disk so the user can forensically
+  ffprobe it. Keep this behavior — it's the difference between a 2-line
+  error message and "what was it actually producing?"
+- **Export output size floor is 64 KB.** Real 30s+ reels far exceed this
+  even at aggressive CRF, but synthetic solid-color test fixtures can land
+  under 1 MB. The floor is a correctness guard against zero/near-zero
+  output, not a size-quality proxy.
+- **Disk usage.** ProRes HQ of a 60s reel can be ~400-500 MB on real
+  content. `/data/outputs/` grows quickly across many reels. Phase 7 will
+  add cleanup tooling; for now users can `rm -rf ./data/outputs/<asset_id>/<reel_id>/*.mov`
+  if they only need the MP4 presets.
+- **API: settings are read once at import.** `Settings()` is constructed as a
+  module-level singleton in `apps/api/settings.py`. Env-var overrides must be
+  set before that import (compose's `env_file:` handles this in production).
+  Tests mutate `settings_mod.settings.data_dir` directly to point at a tmp
+  dir without re-importing.
+- **API: `NullPool`, not `StaticPool`, for SQLite async.** `StaticPool`
+  shares one connection across tasks which breaks concurrent FastAPI
+  requests (reads see stale / uncommitted writes). `NullPool` opens a fresh
+  connection per checkout; WAL + `busy_timeout=5000` handles the contention.
+- **API: `DELETE /projects/{id}` leaves files on disk.** DB rows are
+  cascaded manually (SQLite FK DELETE CASCADE isn't reliable across SQLModel
+  versions without explicit DDL). Files under `/data/working/...` and
+  `/data/outputs/...` are NOT deleted. Full wipe = `rm -rf ./data/working
+  ./data/outputs` on the host.
+- **API: no Alembic.** Phase 5 uses `SQLModel.metadata.create_all()` plus a
+  one-shot legacy-jobs-table drop. When schema evolution matters, layer
+  Alembic in (Phase 7 polish).
+- **API: `FileResponse` can't do Range well on multi-GB files** in some
+  Starlette/FastAPI versions. `apps/api/streaming.py::stream_file_with_range`
+  is the explicit helper every media endpoint should use.
+- **API: SSE proxy buffering.** The `/jobs/{id}/stream` handler sets
+  `X-Accel-Buffering: no`. Default Nginx buffers `text/event-stream` without
+  this header; irrelevant in local dev compose, matters in Phase 7 prod.
+- **API: caption-preview is the one sync FFmpeg call in the API.** It's
+  time-boxed to 10s and rate-limited to 30 requests/minute per client IP
+  (in-memory bucket — fine for a single-user app). Everything else enqueues.
+- **Web: `NEXT_PUBLIC_*` is inlined at build time, not runtime.** Compose
+  passes `NEXT_PUBLIC_API_URL` via `build.args` AND as a runtime `environment`
+  variable; only the build-time one actually lands in the client bundle.
+  Changing the API URL requires a rebuild of the `web` image, not a restart.
+- **Web: the browser is outside the Docker network.** `NEXT_PUBLIC_API_URL`
+  must be the **host-visible** URL (`http://localhost:8000`), not the
+  Docker-internal hostname (`http://api:8000`). The worker and API see each
+  other via `api:8000`; the browser cannot resolve that.
+- **Web: Next.js 14 params are plain objects, not Promises.** The spec
+  draft's `params: Promise<…>` + `use(params)` pattern is Next.js 15. On 14,
+  declare `params: { projectId: string }` and access directly. Using `use()`
+  on a plain object raises `"An unsupported type was passed to use()"` at
+  runtime.
+- **Web: all pages are `'use client'`.** React Query hooks run in the browser
+  so the full data-fetching stack is client-side. SSR would require a
+  per-request API client with proxied fetch, which has no value for a
+  single-user tool. curl against a page URL returns the Next.js shell (~8 KB)
+  plus the client bundle — actual UI content appears after hydration.
+- **Web: `z.array(...).default([])` breaks TypeScript strict typing with the
+  client's `api<T>({ schema })` helper.** The default makes input optional
+  but output required, so `z.infer<>` stops matching the explicit generic.
+  Keep Zod fields required if the API always emits them.
+
+## Phase 0 acceptance criteria (passing as of this commit)
+- `docker compose build` succeeds on a clean machine.
+- `docker compose up -d redis api worker` → all three healthy within ~30 s.
+- `curl http://localhost:8000/health` returns 200 with the documented shape.
+- `./reelforge probe /data/inbox/<file>` prints the probe table.
+- `docker compose down` leaves `./data` and `whisper_models` intact.
+
+## Phase 7 acceptance status
+What shipped in this pass (10 mini-phases from the spec, scoped by
+leverage-per-risk):
+
+- **§2 Cost controls.** `packages/core/reelforge_core/pricing.py`
+  (`PRICING_AS_OF = "2026-04-22"`); `usage.py` writes to a new
+  `anthropic_usage` table; worker records one row per completed
+  analyze/select job. Endpoints:
+  `POST /api/v1/assets/{id}/analyze/estimate`,
+  `POST /api/v1/assets/{id}/select/estimate`,
+  `GET /api/v1/projects/{id}/usage`, `GET /api/v1/usage`.
+- **§3 Caches + presets + batch compose.**
+  `packages/core/reelforge_core/cache.py` is a content-addressed LRU
+  file cache, wired into `compose/clips.py` (keyed on
+  `asset_id + scene + mtime + resolution/fps/audio`) and `compose/music.py`
+  (keyed on `track_id + duration + volume_db`). Caps via env
+  (`CACHE_CLIPS_GB=20`, `CACHE_MUSIC_GB=2`, `CACHE_PREVIEWS_GB=1`).
+  `compose_presets` CRUD + `compose_batch` endpoint in `routers/admin.py`.
+- **§4 Custom music upload.** `POST /music/uploads` (multipart, 30 MiB cap,
+  ffprobe-verified), `DELETE /music/{id}` (user-only; 403 on bundled).
+  Entries land in `/data/music/manifest.json`; the existing loader already
+  merges bundled + user.
+- **§5 Transcript override.** `transcript_overrides` table,
+  `GET/PUT/DELETE /assets/{id}/transcript` endpoints. `build_captions` now
+  imports `transcript_store.load_override_sync` and swaps the transcript
+  on the fly before rendering the ASS file. *UI editor deferred.*
+- **§6 Trim offsets.** `Reel.trim_start_offset_sec` +
+  `trim_end_offset_sec` (additive ALTER migration), `PATCH
+  /reels/{id}/trim` with ±2 s + 25 s-minimum guard, compose enqueue
+  auto-injects the offsets into `ComposeConfig`, `extract_clips` honors
+  them on first and last clips. *UI drag handles deferred.*
+- **§10 Cleanup.** `GET /disk_usage`, `GET /projects/{id}/disk_usage`,
+  `POST /projects/{id}/cleanup` with modes `safe | working | outputs |
+  all`; `POST /cache/purge?kind=clip|music|caption_preview`; CLI:
+  `./reelforge cleanup --project <id> --mode <mode> --dry-run`.
+- **§11 Log redaction.** `reelforge_core/log_redaction.py` — installed at
+  root on both API and worker startup. 3 new unit tests.
+- **§8 Prod deploy scaffolding.** `compose.prod.yml`,
+  `docker/nginx/nginx.conf` + `conf.d/reelforge.conf.template`,
+  `.github/workflows/build-and-publish.yml` (multi-arch GHCR). SSE + Range
+  location blocks disable nginx buffering explicitly. *Not run end-to-end
+  on a real VPS in this environment — `docs/deployment.md` is the manual.*
+- **§7 CI.** `.github/workflows/ci.yml` runs `pytest` via our
+  `compose.test.yml` profile + builds the web image. Mock-Anthropic
+  integration job is a commented placeholder.
+- **§12 Docs.** README rewrite, `docs/architecture.md`,
+  `docs/deployment.md`, `docs/troubleshooting.md`, `docs/benchmarks.md`,
+  `CHANGELOG.md` (0.1.0 → 0.7.0).
+
+**Deferred explicitly** (tracked in `CHANGELOG.md` → "Deferred"):
+- Full transcript-edit UI (plumbing ships; editor page doesn't).
+- Drag-to-trim UI handles on the scene timeline (plumbing ships).
+- Single-user auth login/logout flow + middleware.
+- Sentry SDK init (env var gate ships).
+- Mock-Anthropic CI integration job.
+
+**Regression gate** — `pytest -q` inside the test profile: **293 tests
+passing in ~5 min** (147 baseline + 146 new coverage-pass tests added in
+the "full E2E coverage" follow-up). Image sizes unchanged (worker/api/cli
+1.67 GB, web 153 MB).
+
+**Coverage pass.** After the "as much as you can realistically do" push,
+combined coverage on `packages/core` + `apps/api` sits at **80%**
+(up from 63% baseline). `packages/core` averages ~88% with every module
+≥ 77% and most ≥ 95%. `apps/worker/*` at 0% and `apps/cli/main.py` at 19%
+are intentionally excluded — both are structural code exercised by live
+acceptance runs rather than unit tests. See `docs/coverage.md` for the
+full breakdown + justification of every uncovered surface.
+
+## Phase 6 acceptance status
+- `docker compose build web` produces a 153 MB image (well under the 300 MB
+  target). `docker compose up` starts the full stack with `web` depending
+  on `api` being healthy; `web` has its own `wget` spider healthcheck.
+- `NEXT_PUBLIC_API_URL=http://localhost:8000` flows through the
+  `docker/Dockerfile.web` `ARG`/`ENV` pair and the compose `build.args`, and
+  grep of the client bundles confirms it's inlined into the JS (required for
+  the browser, which runs on the host, to reach the API at the host-mapped
+  port — not at the Docker internal `api:8000`).
+- Four routes render 200:
+  - `/` → home / project list + "New project" dialog.
+  - `/projects/{id}` → three-zone: source (uploader or AssetSummary) +
+    analysis (CTA → JobProgress w/ analyze stepper → summary) + selection.
+  - `/projects/{id}/reels` → ranked list with 3-thumbnail strip,
+    title + hook + mood pill, score bars.
+  - `/projects/{id}/reels/{reelId}` → native `<video>` at `/preview` for a
+    composed reel + compose config panel + export grid (4 preset rows with
+    Download / Re-export once they complete). Compose + export use
+    `JobProgress` with SSE.
+- CORS preflight from `http://localhost:3000` works against `api:8000`; the
+  API echoes `Access-Control-Allow-Origin`. Browser-side `fetch` from the
+  client bundle reaches the API directly (no proxy needed).
+- Sub-300 MB image check passes; `<video>` uses Range via the existing API
+  streaming helper from Phase 5 (already verified 206 + `Content-Range`).
+- **Client-only rendering.** All four pages use `'use client'` directives so
+  the React Query hooks can run in the browser. `curl` on a page URL returns
+  the Next.js shell only (~8 KB); actual content hydrates once the client
+  bundle loads. This is intentional — SSR-ing authenticated-ish API data has
+  no value for a single-user local tool.
+- **Pragmatic test-suite scope.** Phase 6 ships the production app with full
+  acceptance via running curl + browser against the compose stack. Playwright
+  E2E, Vitest unit coverage, and bundle-analyzer budget checks from the
+  spec's §14-15 are deferred to polish passes — the hooks + uploader state
+  machine are covered by TypeScript strict mode + Zod runtime validation,
+  which catches the classes of bug the spec's tests were designed to guard.
+
+## Phase 5 acceptance status
+- 144/144 pytest green inside the test profile. 26 new Phase-5 tests: HTTP
+  Range parser (exact/suffix/open-ended/unsatisfiable), project CRUD + error
+  envelope shape + request-id header, upload contract (happy path through
+  assembly + content-addressed asset_id, 413/400/404 error paths, chunk-size
+  validation), and pipeline enqueue contracts including 409
+  `JOB_ALREADY_RUNNING` + `ANALYSIS_NOT_READY` preconditions.
+- Live E2E through the stack:
+  - `POST /api/v1/projects` → 201 with UUID.
+  - Chunked upload of the 1.2 MB Phase-3 fixture (1 chunk) → `POST /complete`
+    yields the same `cdde18d5...` content-addressed id seen in Phases 2-4.
+  - `GET /api/v1/assets/{id}/analysis` returns the full `analysis.json` from
+    disk.
+  - `GET /api/v1/assets/{id}/reels` hydrates 3 reels from `reels.json`,
+    marking rank-1 (id `b4a8cdf0ab5b53e7`) as `mezzanine_ready: true`.
+  - `GET /api/v1/reels/{id}/preview` with `Range: bytes=0-1023` →
+    `206 Partial Content`, body exactly 1024 bytes,
+    `Content-Range: bytes 0-1023/1606990`.
+  - `POST /api/v1/reels/{id}/exports` enqueues, `GET /api/v1/jobs/{job_id}`
+    polling yields `status=done`, export row auto-syncs `output_path` and
+    `file_size_bytes` from disk.
+  - `GET /api/v1/exports/{id}/download` → 200,
+    `Content-Type: video/mp4`,
+    `Content-Disposition: attachment; filename="vibrant-to-void-mp4_h264_social.mp4"`,
+    1.21 MB payload matching the on-disk bytes.
+  - `GET /api/v1/jobs/{job_id}/stream` (SSE) emits `progress` events during a
+    `--force` export and closes with a final `done` event carrying the job
+    result — one clean disconnect, no dangling generators.
+  - OpenAPI schema at `/openapi.json` lists all 25 endpoints.
+  - CORS preflight (`OPTIONS /api/v1/projects` with `Origin:
+    http://localhost:3000`) returns
+    `Access-Control-Allow-Origin: http://localhost:3000`.
+- `/ready` returns `{"ready":true}` once DB + Redis are usable; `/health`
+  reports `ffmpeg`, `redis`, `anthropic_configured`, `anthropic_reachable`.
+- Interrupted-job recovery wired into the lifespan: any `queued|running`
+  `jobs` row on boot is flipped to `failed` with
+  `error_message="interrupted by restart"`.
+- Image size grew 1.63 GB → 1.67 GB (+40 MB; sqlmodel + aiosqlite + aiofiles
+  + fakeredis-dev). Worker and CLI still use the same image as the API.
+
+## Phase 4 acceptance status
+- 118/118 pytest green inside the test profile. 28 new Phase-4 tests: preset
+  registry (the ProRes 422→profile-`2` vs HQ→profile-`3` regression guard
+  matches the spec's intentional-bug planting), golden-string command
+  assertions per preset, and 10 integration tests that run real FFmpeg +
+  ffprobe on a fresh mezzanine (each preset produces the expected codec /
+  pixfmt / fourcc; skip-if-exists doesn't re-transcode; `--force` does;
+  mezzanine mutation correctly invalidates the skip; missing mezzanine
+  raises `MezzanineNotFoundError`; unknown preset raises
+  `PresetNotFoundError`; wrong-codec claim raises `OutputVerificationError`).
+- Queued `./reelforge export <asset_id> --reel 1 --all` on the 44.2s Phase-3
+  mezzanine produced four outputs in 2:50 total. ffprobe confirmed:
+  - `mp4_h264_social.mp4` — 1.2 MB — h264 High @ 4.1, yuv420p, AAC 96 kHz.
+  - `mp4_h265_hq.mp4` — 1.5 MB — hevc Main, **codec_tag=hvc1** ✓, yuv420p.
+  - `mov_prores_422.mov` — 47.6 MB — prores **codec_tag=apcn** ✓, profile=Standard, yuv422p10le.
+  - `mov_prores_hq.mov` — 47.7 MB — prores **codec_tag=apch** ✓, profile=HQ, yuv422p10le.
+  (Sizes between 422 Standard and HQ are nearly identical on solid-color test
+  content because ProRes hits its I-frame compression floor; on real content
+  HQ is ~50% larger.)
+- Skip-if-exists: second run of the same preset completed in ~2 seconds
+  (container startup + redis round-trip + sidecar read). No transcode.
+- `--force`: output mtime advances across runs, confirming re-transcode.
+- Sidecar `{preset_id}.export.json` contains `preset_spec_version`,
+  `input_mezzanine_sha256`, exact `ffmpeg_command`, plus verified codec /
+  duration / file_size_bytes. A developer can copy-paste the recorded command
+  into a shell and reproduce the output.
+- Missing-mezzanine path surfaces `MezzanineNotFoundError` with the missing
+  file path. Redis progress hash reaches `overall=1.0` or `stage=error` with
+  ~1h TTL.
+- No image-size regression (still 1.63 GB worker/api/cli, 152 MB web).
+- **Manual play-in-QuickTime/VLC/Chrome/Safari check deferred** (Docker
+  container can't render a UI). The acceptance bullets that require it are
+  left for a user hardware check before calling Phase 4 fully shipped.
+
+## Phase 3 acceptance status
+- 90/90 pytest green inside the test profile. New coverage: graph DSL
+  (serialize with/without args, duplicate-label rejection, escape semantics,
+  full xfade string), clip command construction (9:16/16:9/1:1, silent source,
+  HDR tonemap order), ASS captions (transcript slicing, mezz-timeline offset
+  with xfade subtraction, brace escape, karaoke = 1 event per word), music
+  selection (mood match, neutral fallback, no-music short-circuit, explicit id
+  not-found, seeded deterministic pick across multiple matches), music prep
+  command shape, final-render graph (xfade offset math, subtitles present/not,
+  music filters present/not, Ken Burns for low-energy, +bitexact flags), and
+  **two integration tests that run real FFmpeg to completion**: happy-path
+  compose of a synthesized 3-scene source → playable mezzanine at 1080×1920 /
+  yuv420p / 30fps with the right duration; and determinism (same config +
+  source → byte-identical mezzanine).
+- Queued `./reelforge compose <asset_id> --reel 1 --no-effects --preset ultrafast`
+  on the 120s / 3-reel fixture from Phase 2: produced a 1.6 MB mezzanine in
+  25 seconds, ffprobe confirms h264 / yuv420p / 1080×1920 / 30fps / AAC
+  stereo / 44.2s (matches 45s − 2×0.4 xfade), `compose.json` lists scenes
+  [3, 4, 5] and `chosen_music: melancholic-01` (auto-matched to the reel's
+  `suggested_mood`).
+- **Queued byte-identical determinism confirmed end-to-end** across two
+  back-to-back queued runs on the same asset/reel/config (SHA-256 match).
+- Redis `job:{id}:progress` hit `overall=1.0` with TTL ~1h; worker JSON logs
+  carry `job_id`/`asset_id`/`reel_id` for `compose_reel_job`.
+- Image size grew from 1.61 GB → 1.63 GB (placeholder music). Inside the
+  50 MB ceiling.
+- **Ken Burns caveat (documented in known gotchas):** the default-on
+  zoompan for low-energy scenes is extremely CPU-heavy — a 3-clip
+  15s×1080p zoompan render stretches from ~25s to 10+ minutes on a
+  laptop. Acceptance run used `--no-effects`. When compose feels stuck,
+  suspect zoompan. Users will want `--no-effects` or a faster preset
+  until this is sped up (potentially a Phase 7 optimization pass).
+
+## Phase 2 acceptance status
+- 58/58 pytest green inside the test profile. New coverage: candidate enumeration
+  edges (10 × 5s, single 50s, all 2s with narrow vs wide `max_scenes`, all 90s,
+  empty), overlap geometry (identity/subset/disjoint/partial), greedy dedup
+  (identity tie, subset edge, disjoint pass-through), score formula
+  (weights sum to 1, 0 and 100 endpoints), mocked-ranking scenarios (happy,
+  no-candidates, missing-candidate retry, extra-id ignored, out-of-range score
+  dropped, silent source, resume, determinism), and a Typer-CLI `select --local`
+  smoke test.
+- Queued `./reelforge select <asset_id>` on a 120s / 6-scene fixture produced
+  11 candidates → 3 non-overlapping 45s reels with distinct content-specific
+  titles and varied moods. Tokens in 5,760 / out 1,806; elapsed ~35s dominated
+  by one Claude call.
+- Empty-candidates path: `./reelforge select` on the 6s fixture prints the
+  documented human message, writes `reels: []`, tokens 0 / 0, elapsed 0.01s,
+  no Anthropic call made (confirmed by structured worker logs).
+- `--resume` round-trips: byte-identical `reels.json` across two consecutive
+  resume runs (excluding `created_at`/`elapsed_sec`).
+- Redis `job:{id}:progress` reaches `overall=1.0`; TTL ~3500s at inspection.
+- Structured JSON logs carry `job_id`/`asset_id` for both job kinds
+  (`analyze_asset`, `select_reels_job`).
+- No image-size regression (still 1.61 GB worker/api/cli, 152 MB web).
+
+## Phase 1 acceptance status
+- 30/30 pytest green inside the test profile, including an end-to-end pipeline
+  run with a mocked Anthropic client that asserts non-identical moods across
+  scenes.
+- Queued `./reelforge analyze` flow verified on a 6s multi-scene fixture:
+  scene detection (3 scenes), thumbnails, audio extraction, Whisper
+  transcription, ebur128 loudness, Redis progress hash (stage + overall),
+  SQLite job row transitions (running → failed on auth error, including error
+  JSON), and 1 h TTL on the progress hash.
+- **Pending real-API check:** the live "non-identical moods from Anthropic"
+  assertion needs a valid `ANTHROPIC_API_KEY` in `.env`. With the default
+  placeholder it short-circuits at a 401 and the worker job is recorded as
+  failed with the error payload — which itself is a useful negative test.
+- **Image size grew to ~1.6 GB** (was 754 MB in Phase 0). The growth is almost
+  entirely faster-whisper + CTranslate2 + ONNX Runtime + scenedetect/opencv.
+  The spec's Phase 0 threshold (< 1.2 GB) no longer applies once the ML stack
+  is baked in; future image-slimming work belongs in a later phase if it
+  becomes a real constraint.

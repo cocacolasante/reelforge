@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python-unit:
+    name: Python unit tests (pytest inside the test profile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # Make .env present so compose's env_file doesn't complain.
+      - run: cp .env.example .env
+
+      - name: Build test image
+        run: docker compose -f compose.yml -f compose.test.yml --profile test build test
+
+      - name: Run pytest
+        run: docker compose -f compose.yml -f compose.test.yml --profile test run --rm test pytest -q
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f compose.yml -f compose.test.yml logs
+
+  web-build:
+    name: Web build (typecheck + bundle)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build web image
+        run: docker compose build web
+
+  # Placeholder for the full compose-stack smoke test that needs real-Anthropic
+  # credentials. Wire to a repo secret + a mock-anthropic service in a follow-up.
+  # integration:
+  #   needs: [python-unit, web-build]
+  #   ...

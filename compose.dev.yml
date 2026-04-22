@@ -1,0 +1,35 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: core
+    command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    environment:
+      REELFORGE_ENV: development
+    volumes:
+      - ./packages:/app/packages
+      - ./apps:/app/apps
+      - ./assets:/app/assets
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: core
+    command: ["arq", "apps.worker.main.WorkerSettings", "--watch", "/app"]
+    volumes:
+      - ./packages:/app/packages
+      - ./apps:/app/apps
+      - ./assets:/app/assets
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+      target: builder
+    command: ["pnpm", "dev"]
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+      - /app/.next

@@ -1,0 +1,47 @@
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Host runtime data
+data/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.uv-cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node artifacts
+node_modules/
+apps/web/.next/
+apps/web/.turbo/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Docs / CI metadata not needed in image
+README.md
+CLAUDE.md
+.github/
+
+# Large media that should never be baked into the image
+**/*.mp4
+**/*.mov
+**/*.mkv
+**/*.webm
+# Allow bundled assets
+!assets/**/*.mp4
+!assets/**/*.mov

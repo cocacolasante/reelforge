@@ -1,0 +1,95 @@
+name: reelforge
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [reelforge_net]
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: api
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      REELFORGE_ENV: production
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports: ["8000:8000"]
+    volumes:
+      - ./data:/data
+      - whisper_models:/models/whisper
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks: [reelforge_net]
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: worker
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+      - whisper_models:/models/whisper
+    networks: [reelforge_net]
+    deploy:
+      replicas: 2
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks: [reelforge_net]
+
+  cli:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: cli
+    profiles: ["cli"]
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data:/data
+      - whisper_models:/models/whisper
+    networks: [reelforge_net]
+
+volumes:
+  whisper_models:
+
+networks:
+  reelforge_net:
+    driver: bridge

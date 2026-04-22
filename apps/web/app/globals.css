@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Dark is the default; light vars kept for future toggle */
+    --background: 220 13% 7%;
+    --foreground: 210 20% 96%;
+    --card: 220 13% 10%;
+    --card-foreground: 210 20% 96%;
+    --popover: 220 13% 8%;
+    --popover-foreground: 210 20% 96%;
+    --primary: 210 90% 60%;
+    --primary-foreground: 220 13% 7%;
+    --secondary: 220 13% 16%;
+    --secondary-foreground: 210 20% 96%;
+    --muted: 220 13% 14%;
+    --muted-foreground: 215 16% 65%;
+    --accent: 220 13% 16%;
+    --accent-foreground: 210 20% 96%;
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 210 20% 98%;
+    --border: 220 13% 18%;
+    --input: 220 13% 18%;
+    --ring: 210 90% 60%;
+    --radius: 8px;
+    color-scheme: dark;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html, body {
+    @apply bg-background text-foreground antialiased;
+  }
+  body {
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}

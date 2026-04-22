@@ -1,0 +1,14 @@
+{
+  "tracks": [
+    {"id": "calm-01",        "path": "/app/assets/music/calm-01.mp3",        "bpm": 70,  "mood": "calm",        "duration_sec": 90.0, "license": "CC0", "attribution": null},
+    {"id": "tense-01",       "path": "/app/assets/music/tense-01.mp3",       "bpm": 120, "mood": "tense",       "duration_sec": 90.0, "license": "CC0", "attribution": null},
+    {"id": "joyful-01",      "path": "/app/assets/music/joyful-01.mp3",      "bpm": 115, "mood": "joyful",      "duration_sec": 90.0, "license": "CC0", "attribution": null},
+    {"id": "somber-01",      "path": "/app/assets/music/somber-01.mp3",      "bpm": 60,  "mood": "somber",      "duration_sec": 90.0, "license": "CC0", "attribution": null},
+    {"id": "energetic-01",   "path": "/app/assets/music/energetic-01.mp3",   "bpm": 128, "mood": "energetic",   "duration_sec": 90.0, "license": "CC0", "attribution": null},
+    {"id": "mysterious-01",  "path": "/app/assets/music/mysterious-01.mp3",  "bpm": 85,  "mood": "mysterious",  "duration_sec": 90.0, "license": "CC0", "attribution": null},
+    {"id": "romantic-01",    "path": "/app/assets/music/romantic-01.mp3",    "bpm": 78,  "mood": "romantic",    "duration_sec": 90.0, "license": "CC0", "attribution": null},
+    {"id": "triumphant-01",  "path": "/app/assets/music/triumphant-01.mp3",  "bpm": 100, "mood": "triumphant",  "duration_sec": 90.0, "license": "CC0", "attribution": null},
+    {"id": "melancholic-01", "path": "/app/assets/music/melancholic-01.mp3", "bpm": 64,  "mood": "melancholic", "duration_sec": 90.0, "license": "CC0", "attribution": null},
+    {"id": "neutral-01",     "path": "/app/assets/music/neutral-01.mp3",     "bpm": 90,  "mood": "neutral",     "duration_sec": 90.0, "license": "CC0", "attribution": null}
+  ]
+}
