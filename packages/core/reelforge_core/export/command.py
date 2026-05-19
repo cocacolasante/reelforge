@@ -21,6 +21,11 @@ def build_export_command(
         "-hide_banner",
         "-loglevel",
         "warning",
+        # -stats forces ffmpeg to emit periodic `time=...` lines on stderr even
+        # when -loglevel is warning. Without it the export progress watcher
+        # never sees an update and the UI sticks at the prepare-done 5% until
+        # the whole encode finishes.
+        "-stats",
         "-y",
         "-i",
         str(mezzanine_path),

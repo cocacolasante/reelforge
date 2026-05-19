@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import Link from 'next/link';
-import { Download, Film, Play, RotateCcw, Wand2 } from 'lucide-react';
+import { Download, Film, Play, RotateCcw, Sparkles, Wand2 } from 'lucide-react';
 import { AppShell } from '@/components/layouts/app-shell';
 import { JobProgress } from '@/components/app/job-progress';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -37,6 +37,33 @@ const PRESETS = [
   { id: 'mov_prores_hq', label: 'MOV · ProRes HQ', description: 'Editorial (HQ)', ratio: 12.0 },
 ] as const;
 
+// Mirror of TRANSITION_BY_MOOD / LUT_BY_MOOD in packages/core/reelforge_core/compose/auto.py.
+// Used purely to preview the AI's planned picks; the server is the source of truth.
+const TRANSITION_BY_MOOD: Record<string, string> = {
+  calm: 'fade',
+  tense: 'fade',
+  joyful: 'dissolve',
+  somber: 'fadeblack',
+  energetic: 'slideleft',
+  mysterious: 'fadeblack',
+  romantic: 'dissolve',
+  triumphant: 'slideleft',
+  melancholic: 'fadeblack',
+  neutral: 'fade',
+};
+const LUT_BY_MOOD: Record<string, string | null> = {
+  calm: 'warm',
+  tense: 'cinematic',
+  joyful: 'vivid',
+  somber: 'cool',
+  energetic: 'vivid',
+  mysterious: 'cool',
+  romantic: 'warm',
+  triumphant: 'cinematic',
+  melancholic: 'cool',
+  neutral: null,
+};
+
 export default function ReelDetailPage({
   params,
 }: {
@@ -57,6 +84,7 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
   const [composeJobId, setComposeJobId] = React.useState<string | null>(null);
 
   // Local compose-config state (intentionally not persisted across reload).
+  const [smart, setSmart] = React.useState(true);
   const [aspect, setAspect] = React.useState<'9:16' | '16:9' | '1:1'>('9:16');
   const [captionMode, setCaptionMode] = React.useState<'off' | 'static' | 'karaoke'>('static');
   const [transition, setTransition] = React.useState('fade');
@@ -80,14 +108,28 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
   const mezzanineBytesGuess = 1_500_000; // worst-case default for size estimates before we know
 
   const triggerCompose = async () => {
-    try {
-      const job = await compose.mutateAsync({
-        reelId,
-        config: {
+    const config = smart
+      ? {
           aspect,
           target_fps: 30,
           video_crf: crf[0],
           captions: { mode: captionMode },
+          smart_mode: true,
+          transition: { kind: 'auto', duration_sec: 0.4 },
+          effects: {
+            ken_burns_on_low_energy: true,
+            unsharp: true,
+            lut: 'auto',
+          },
+          music_track_id: null,
+          no_music: false,
+        }
+      : {
+          aspect,
+          target_fps: 30,
+          video_crf: crf[0],
+          captions: { mode: captionMode },
+          smart_mode: false,
           transition: { kind: transition, duration_sec: transitionDur[0] },
           effects: {
             ken_burns_on_low_energy: !noEffects,
@@ -96,13 +138,17 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
           },
           music_track_id: musicTrack === '__auto__' ? null : musicTrack,
           no_music: musicTrack === '__none__',
-        },
-      });
+        };
+    try {
+      const job = await compose.mutateAsync({ reelId, config });
       setComposeJobId(job.id);
     } catch {
       /* surfaced inline */
     }
   };
+
+  const plannedTransition = TRANSITION_BY_MOOD[r.suggested_mood] ?? 'fade';
+  const plannedLut = LUT_BY_MOOD[r.suggested_mood] ?? null;
 
   return (
     <div className="container space-y-4 py-6">
@@ -177,6 +223,40 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
             <CardTitle>Compose</CardTitle>
           </CardHeader>
           <CardContent className="space-y-5">
+            {/* Smart toggle */}
+            <section className="rounded-md border border-primary/30 bg-primary/5 p-3">
+              <label className="flex cursor-pointer items-start gap-3">
+                <input
+                  type="checkbox"
+                  checked={smart}
+                  onChange={(e) => setSmart(e.target.checked)}
+                  className="mt-1 h-4 w-4 accent-primary"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center gap-1.5 text-sm font-medium">
+                    <Sparkles className="h-3.5 w-3.5 text-primary" />
+                    AI auto-direction
+                  </div>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    Pick transitions, music, color grade & effects from the reel&apos;s
+                    mood ({r.suggested_mood}).
+                  </p>
+                </div>
+              </label>
+              {smart ? (
+                <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-1 border-t border-primary/20 pt-3 text-xs">
+                  <span className="text-muted-foreground">Transition</span>
+                  <span className="font-mono">{plannedTransition}</span>
+                  <span className="text-muted-foreground">Color grade</span>
+                  <span className="font-mono">{plannedLut ?? 'none'}</span>
+                  <span className="text-muted-foreground">Music</span>
+                  <span className="font-mono">auto-match ({r.suggested_mood})</span>
+                  <span className="text-muted-foreground">Effects</span>
+                  <span className="font-mono">Ken Burns + unsharp</span>
+                </div>
+              ) : null}
+            </section>
+
             {/* Aspect */}
             <section className="space-y-2">
               <Label>Aspect</Label>
@@ -196,35 +276,6 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
                   </button>
                 ))}
               </div>
-            </section>
-
-            {/* Transition */}
-            <section className="space-y-2">
-              <Label>Transition</Label>
-              <Select value={transition} onValueChange={setTransition}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {['fade', 'fadeblack', 'slideleft', 'wipeleft', 'dissolve', 'cut'].map((t) => (
-                    <SelectItem key={t} value={t}>
-                      {t}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {transition !== 'cut' ? (
-                <div className="pt-2 space-y-1">
-                  <Label className="text-xs">Duration: {transitionDur[0].toFixed(2)}s</Label>
-                  <Slider
-                    value={transitionDur}
-                    min={0}
-                    max={1.5}
-                    step={0.05}
-                    onValueChange={setTransitionDur}
-                  />
-                </div>
-              ) : null}
             </section>
 
             {/* Captions */}
@@ -248,35 +299,68 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
               </div>
             </section>
 
-            {/* Music */}
-            <section className="space-y-2">
-              <Label>Music</Label>
-              <Select value={musicTrack} onValueChange={setMusicTrack}>
-                <SelectTrigger>
-                  <SelectValue placeholder="auto" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__auto__">Auto (match mood)</SelectItem>
-                  <SelectItem value="__none__">No music</SelectItem>
-                  {music.data?.tracks.map((t) => (
-                    <SelectItem key={t.id} value={t.id}>
-                      {t.id} · {t.mood} {t.bpm ? `· ${t.bpm} BPM` : ''}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </section>
+            {!smart ? (
+              <>
+                {/* Transition */}
+                <section className="space-y-2">
+                  <Label>Transition</Label>
+                  <Select value={transition} onValueChange={setTransition}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {['fade', 'fadeblack', 'slideleft', 'wipeleft', 'dissolve', 'cut'].map((t) => (
+                        <SelectItem key={t} value={t}>
+                          {t}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {transition !== 'cut' ? (
+                    <div className="pt-2 space-y-1">
+                      <Label className="text-xs">Duration: {transitionDur[0].toFixed(2)}s</Label>
+                      <Slider
+                        value={transitionDur}
+                        min={0}
+                        max={1.5}
+                        step={0.05}
+                        onValueChange={setTransitionDur}
+                      />
+                    </div>
+                  ) : null}
+                </section>
 
-            {/* Effects */}
-            <section className="flex items-center justify-between">
-              <Label className="text-sm">Effects (Ken Burns + unsharp)</Label>
-              <input
-                type="checkbox"
-                checked={!noEffects}
-                onChange={(e) => setNoEffects(!e.target.checked)}
-                className="h-4 w-4 accent-primary"
-              />
-            </section>
+                {/* Music */}
+                <section className="space-y-2">
+                  <Label>Music</Label>
+                  <Select value={musicTrack} onValueChange={setMusicTrack}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="auto" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__auto__">Auto (match mood)</SelectItem>
+                      <SelectItem value="__none__">No music</SelectItem>
+                      {music.data?.tracks.map((t) => (
+                        <SelectItem key={t.id} value={t.id}>
+                          {t.id} · {t.mood} {t.bpm ? `· ${t.bpm} BPM` : ''}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </section>
+
+                {/* Effects */}
+                <section className="flex items-center justify-between">
+                  <Label className="text-sm">Effects (Ken Burns + unsharp)</Label>
+                  <input
+                    type="checkbox"
+                    checked={!noEffects}
+                    onChange={(e) => setNoEffects(!e.target.checked)}
+                    className="h-4 w-4 accent-primary"
+                  />
+                </section>
+              </>
+            ) : null}
 
             {/* Advanced */}
             <section className="space-y-1.5">

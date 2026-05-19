@@ -261,6 +261,73 @@ async def compose_reel_job(
 # ---------------------------------------------------------------------------
 
 
+async def compile_montage_job(
+    ctx: dict,
+    project_id: str,
+    montage_id: str,
+    child_mezzanine_paths: list[str],
+    transition_duration: float = 0.6,
+    target_resolution_w: int = 1080,
+    target_resolution_h: int = 1920,
+    target_fps: int = 30,
+    transition_kind: str = "fade",
+) -> dict:
+    """Long-form montage: concatenate already-rendered mezzanines with xfade.
+
+    Inputs are validated to exist on disk; the worker just runs FFmpeg.
+    """
+    job_id = ctx["job_id"]
+    redis = ctx["redis"]
+    extra = {"job_id": job_id, "project_id": project_id, "montage_id": montage_id}
+    log.info("compile_montage_job start", extra=extra)
+
+    await db.record_job_start(job_id, kind="compile_montage", asset_id=None)
+    on_progress = make_throttled_progress_writer(redis, job_id)
+
+    inputs = [Path(p) for p in child_mezzanine_paths]
+    missing = [str(p) for p in inputs if not p.exists()]
+    if missing:
+        msg = f"montage inputs missing on disk: {missing}"
+        await db.record_job_failure(job_id, msg, msg)
+        await write_terminal(redis, job_id, "error", msg)
+        raise FileNotFoundError(msg)
+
+    from reelforge_core.compose.montage import compile_montage
+
+    data_dir = Path(os.environ.get("REELFORGE_DATA_DIR", "/data"))
+    out_dir = data_dir / "working" / "_montage" / project_id / montage_id
+
+    try:
+        manifest = await compile_montage(
+            inputs=inputs,
+            output_dir=out_dir,
+            montage_id=montage_id,
+            transition_duration=transition_duration,
+            transition_kind=transition_kind,
+            target_resolution=(target_resolution_w, target_resolution_h),
+            target_fps=target_fps,
+            progress=on_progress,
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        log.error("compile_montage_job failed: %s", exc, extra=extra, exc_info=True)
+        await db.record_job_failure(job_id, str(exc), tb)
+        await write_terminal(redis, job_id, "error", str(exc))
+        raise
+
+    result = {
+        "mezzanine_path": manifest.mezzanine_path,
+        "compose_json_path": str(out_dir / "compose.json"),
+        "project_id": project_id,
+        "montage_id": montage_id,
+        "duration_sec": manifest.duration_sec,
+    }
+    await db.record_job_success(job_id, result)
+    await write_terminal(redis, job_id, "done", "done")
+    log.info("compile_montage_job done", extra=extra)
+    return result
+
+
 async def export_reel_job(
     ctx: dict,
     asset_id: str,

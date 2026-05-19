@@ -186,9 +186,19 @@ class RankedReel(BaseModel):
     suggested_mood: Mood
 
 
+OutputForm = Literal["short", "long_single", "long_montage"]
+
+
 class SelectionConfig(BaseModel):
+    # Output form controls the candidate-enumeration window:
+    #   short          → reels in [target_min_sec, target_max_sec], default 30–60s
+    #   long_single    → one big span centered on long_target_duration_sec
+    #   long_montage   → same as short; downstream `compile_montage` stitches
+    #                     top_k of them into a single longer mezzanine.
+    output_form: OutputForm = "short"
     target_min_sec: float = 30.0
     target_max_sec: float = 60.0
+    long_target_duration_sec: float | None = None  # used only when output_form="long_single"
     max_scenes_per_reel: int = 6
     top_k: int = 10
     overlap_threshold: float = 0.5
@@ -196,6 +206,28 @@ class SelectionConfig(BaseModel):
     ranking_prompt_version: str = "v1"
     temperature: float = 0.0
     resume: bool = False
+
+    @property
+    def effective_min_sec(self) -> float:
+        if self.output_form == "long_single" and self.long_target_duration_sec:
+            return max(15.0, self.long_target_duration_sec * 0.85)
+        return self.target_min_sec
+
+    @property
+    def effective_max_sec(self) -> float:
+        if self.output_form == "long_single" and self.long_target_duration_sec:
+            return self.long_target_duration_sec * 1.15
+        return self.target_max_sec
+
+    @property
+    def effective_max_scenes(self) -> int:
+        # Long spans cover more scenes; raise the ceiling so the enumerator
+        # doesn't truncate the candidate set prematurely.
+        if self.output_form == "long_single":
+            return max(self.max_scenes_per_reel, 60)
+        if self.output_form == "long_montage":
+            return self.max_scenes_per_reel
+        return self.max_scenes_per_reel
 
 
 class ReelSelection(BaseModel):
@@ -242,9 +274,10 @@ class CaptionStyle(BaseModel):
 
 
 class TransitionStyle(BaseModel):
+    # "auto" is resolved at compose time by compose.auto.pick_transition_kind.
     kind: Literal[
-        "fade", "fadeblack", "slideleft", "wipeleft", "dissolve", "cut"
-    ] = "fade"
+        "auto", "fade", "fadeblack", "slideleft", "wipeleft", "dissolve", "cut"
+    ] = "auto"
     duration_sec: float = 0.4
 
 
@@ -253,7 +286,9 @@ class EffectsConfig(BaseModel):
     ken_burns_zoom: float = 1.10
     unsharp: bool = True
     unsharp_amount: float = 0.5
-    lut: str | None = None
+    # "auto" lets compose.auto.pick_lut_id choose from bundled LUTs by mood.
+    # Any other string is treated as a literal LUT id.
+    lut: str | None = "auto"
 
 
 Aspect = Literal["9:16", "16:9", "1:1"]
@@ -292,6 +327,11 @@ class ComposeConfig(BaseModel):
     ducking_release_ms: float = 250.0
     burn_title_card: bool = False
     seed: int = 1
+    # When True (default), `transition.kind == "auto"` + `effects.lut == "auto"`
+    # are resolved to mood-driven picks at compose time. Disabling smart_mode
+    # treats those sentinels as literals (cut/null) — useful when reproducing
+    # an exact render. See `compose/auto.py::resolve_smart_config`.
+    smart_mode: bool = True
 
     @property
     def resolution(self) -> tuple[int, int]:

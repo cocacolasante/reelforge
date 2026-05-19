@@ -16,6 +16,8 @@ in Docker; the only host requirement is Docker Engine ≥ 24 + Compose v2.
 - [x] Phase 5 — API & job orchestration (FastAPI + SQLModel + SSE)
 - [x] Phase 6 — Web UI (Next.js 14 + React Query + Tailwind + shadcn)
 - [x] Phase 7 — Polish: cost controls, caches, cleanup, docs, prod deploy scaffolding
+- [x] Phase 7.1 — Multi-clip input + long-form output (montage + single span)
+- [x] Phase 7.2 — Smart auto-direction: AI-driven transitions, LUTs, music, effects
 - [ ] Phase 8+ — not started
 
 ## Topology
@@ -102,7 +104,8 @@ docker compose logs worker | jq            # structured JSON logs from the worke
   - `captions.py` — `build_captions` writes ASS; `_source_to_mezz_time` maps source timestamps to the mezzanine timeline (xfade overlap subtracted). Static mode packs into lines; karaoke mode emits one Dialogue per word.
   - `music.py` — `load_music_library` (bundled + user manifests), seeded `select_track` (mood → fallback to neutral → None), `build_music_prep_command`/`prepare_music` (stream-loop + trim + in/out fade).
   - `graph_builder.py` — `build_final_command` assembles clips + xfade/acrossfade chain + Ken-Burns on low-energy scenes + LUT + unsharp + subtitles + music sidechain/duck/mix into a single FFmpeg argv. **Splits `[voice]` via `asplit` so it can be both the sidechain key and the amix primary.**
-  - `pipeline.py` — `compose()` orchestrator; stage weights `prepare 2% / clips 35% / captions 3% / music 5% / render 53% / finalize 2%`; parses `time=HH:MM:SS.ms` from FFmpeg stderr for live render progress.
+  - `pipeline.py` — `compose()` orchestrator; stage weights `prepare 2% / clips 35% / captions 3% / music 5% / render 53% / finalize 2%`; parses `time=HH:MM:SS.ms` from FFmpeg stderr for live render progress. **First step is `resolve_smart_config()`** so `compose.json` reflects the resolved picks.
+  - `auto.py` — smart-mode pickers: `TRANSITION_BY_MOOD`, `LUT_BY_MOOD`, `pick_transition_kind`, `pick_lut_id`, `pick_transition_kind_for_montage`, `resolve_smart_config` (pure — returns new `ComposeConfig`), `describe_smart_picks`. See Phase 7.2 acceptance below.
 - **Export pipeline (Phase 4)** — `packages/core/reelforge_core/export/`:
   - `presets.py` — four `PresetSpec` records + `PRESET_SPEC_VERSION` + `PRORES_FOURCC` lookup. ProRes 422 uses `profile:v=2` (fourcc `apcn`); HQ uses `profile:v=3` (fourcc `apch`). Both set `vendor=apl0` so Apple apps recognize the files.
   - `command.py` — `build_export_command` — pure, no filters. Explicit `-map 0:v:0 -map 0:a:0`; bit-exact-friendly zeroed `creation_time` metadata.
@@ -349,6 +352,56 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
 - `./reelforge probe /data/inbox/<file>` prints the probe table.
 - `docker compose down` leaves `./data` and `whisper_models` intact.
 
+## Phase 7.2 acceptance status — smart auto-direction
+The compose pipeline now picks transitions, color grade, and music from
+the reel's `suggested_mood` instead of hard-coded defaults. The user can
+override by flipping the "AI auto" toggle off (or by supplying explicit
+non-"auto" values via the API directly).
+
+- **Sentinels.** `ComposeConfig.transition.kind` accepts `"auto"`,
+  `EffectsConfig.lut` accepts `"auto"`, and `ComposeConfig.smart_mode`
+  (default `True`) controls whether those sentinels are resolved.
+- **Resolver.** `packages/core/reelforge_core/compose/auto.py`:
+  - `TRANSITION_BY_MOOD` — 10-mood → xfade kind lookup
+    (energetic → slideleft, joyful → dissolve, calm/neutral → fade,
+    somber/mysterious/melancholic → fadeblack, romantic → dissolve,
+    triumphant → slideleft, tense → fade).
+  - `LUT_BY_MOOD` — 10-mood → bundled LUT id (calm/romantic → warm,
+    somber/mysterious/melancholic → cool, joyful/energetic → vivid,
+    tense/triumphant → cinematic, neutral → none).
+  - `resolve_smart_config(config, reel, analysis)` returns a *new*
+    `ComposeConfig` with sentinels replaced. Explicit non-auto values
+    always win over auto, even when smart_mode is on.
+  - `pick_transition_kind_for_montage(child_moods)` chooses one xfade
+    kind for the montage's chapter boundaries based on the dominant
+    chapter mood (alphabetical tie-break for determinism).
+  - `describe_smart_picks(resolved, reel)` returns a flat dict surfaced
+    to the UI/manifest so the user sees what the AI did.
+- **Wiring.** `compose/pipeline.py::compose()` calls
+  `resolve_smart_config` at the very start so `compose.json.config`
+  reflects exactly what rendered. `apps/api/routers/montages.py` passes
+  the dominant-mood transition kind to `compile_montage_job`, which
+  threads it through `compile_montage` → `build_montage_command`.
+- **LUTs bundled at build time.** `assets/luts/synthesize_luts.sh`
+  generates 4 small 17-point `.cube` files (warm / cool / cinematic /
+  vivid) into `/app/assets/luts/` during the Docker build — no binary
+  blobs in git. The graph builder resolves the id to a path via
+  `compose.pipeline.resolve_lut` and applies `lut3d` after captions.
+- **UI.** Compose panel at `apps/web/app/projects/[projectId]/reels/
+  [reelId]/page.tsx` has an "AI auto" toggle (default on) that hides the
+  transition / music / effects controls and shows a 4-row preview of the
+  planned picks (transition / color grade / music / effects). When off,
+  the manual controls render and the body sends `smart_mode: false` +
+  explicit values.
+- **Tests.** `tests/compose/test_auto.py` (15 tests) covers each picker
+  (every mood maps to a known xfade kind / LUT id), the montage
+  dominant-mood + tie-break behavior, `resolve_smart_config` passthrough
+  when `smart_mode=False`, sentinel resolution when on, explicit
+  overrides winning over auto, and the `describe_smart_picks` shape.
+- **Regression gate.** `pytest -q` in the test profile: **329 passed**
+  in ~5 min (was 293 in Phase 7; +21 in Phase 7.1 multi-asset/montage
+  suites, +15 in this auto-picker pass).
+
 ## Phase 7 acceptance status
 What shipped in this pass (10 mini-phases from the spec, scoped by
 leverage-per-risk):
@@ -417,6 +470,65 @@ combined coverage on `packages/core` + `apps/api` sits at **80%**
 are intentionally excluded — both are structural code exercised by live
 acceptance runs rather than unit tests. See `docs/coverage.md` for the
 full breakdown + justification of every uncovered surface.
+
+## Phase 7.1 — Multi-clip + long-form output
+
+What shipped:
+
+- **Multi-asset projects.** The `Project → Asset` relationship was already
+  one-to-many in the DB; the UI now actually uses it. Each asset shows its
+  own analyze state in a per-row card on the project page, and a "+ Add
+  another clip" button reveals the existing uploader inline. Selection
+  fires one `select_reels_job` per analyzed asset (the "Independent,
+  merged" mode the user picked).
+- **`GET /api/v1/projects/{id}/reels`.** Aggregates `reels.json` from every
+  asset in the project, re-sorts by `overall_score`, assigns a
+  `project_rank`. The reels page uses this in place of the per-asset
+  endpoint.
+- **`SelectionConfig.output_form`** with three values:
+  - `short` (default) — current behavior, configurable min/max sec + top_k.
+  - `long_single` — one wide span per asset around
+    `long_target_duration_sec` ±15%. Enumerator auto-bumps
+    `max_scenes_per_reel` to 60 so 5-minute spans across many short scenes
+    aren't truncated.
+  - `long_montage` — same enumeration as short; a separate compile step
+    stitches the top-K reels into one long-form mezzanine.
+  The UI exposes form + duration + count on the selection screen
+  (`apps/web/app/projects/[projectId]/page.tsx::SelectionPanel`).
+- **Montage compile pipeline.** `packages/core/reelforge_core/compose/montage.py`:
+  takes N already-composed mezzanines, builds one xfade chain, runs ffmpeg,
+  writes a `compose.json` next to the output. Each chapter keeps its own
+  music + captions; we deliberately don't try to bridge tracks across
+  chapters (deliberate; "highlight reel" feel).
+- **Montage worker job.** `apps/worker/jobs.py::compile_montage_job` — uses
+  the same throttled Redis progress writer as the other compose paths.
+- **Montage API.** `POST /api/v1/projects/{id}/montages` creates a
+  Reel row with `child_reel_ids_json` set + enqueues the compile job. The
+  Reel row's `mezzanine_path` is pre-written so the UI shows the row
+  immediately (with `mezzanine_ready: false` until the job completes).
+  `GET /api/v1/projects/{id}/montages` lists them.
+- **Reel model.** Added `child_reel_ids_json` column (idempotent
+  `ALTER TABLE` migration). Montage Reels reuse the existing
+  Phase-4 export pipeline unchanged.
+- **UI.** New "Compose montage" panel on the project reels page; selects
+  composed-and-ready reels via toggle buttons + a transition-duration
+  slider; lists active montages above the regular reel list.
+
+**Regression gate** — `pytest -q` inside the test profile: **314 tests
+passing in ~5 min** (293 + 21 new). New tests cover:
+- `SelectionConfig.effective_*` bounds for each `output_form`
+- candidate enumeration honors the widened long_single bounds
+- montage command builder: xfade offsets, single-input case, empty inputs,
+  bitexact metadata, target resolution wiring, 3-input offset chain math
+- API: project-level reel aggregation (sort + project_rank); montage create
+  rejects missing reels / un-composed reels; happy-path montage creation
+  produces a Reel row with `child_reel_ids` and a queued job.
+
+**Not run in this turn**: live-stack smoke against `:8000` (the host's
+port was held by an unrelated container). All wiring is verified via the
+test suite. To smoke against the live stack on a free host:
+`docker compose up -d` →
+`curl -s http://localhost:8000/api/v1/openapi.json | jq '.paths | keys | map(select(contains("montage")))'`.
 
 ## Phase 6 acceptance status
 - `docker compose build web` produces a 153 MB image (well under the 300 MB

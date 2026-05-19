@@ -36,6 +36,8 @@ RUN chmod +x /usr/local/bin/reelforge /usr/local/bin/api-entrypoint.sh /usr/loca
     && mkdir -p /data /models/whisper \
     # Synthesize placeholder music tracks (one per mood). Deterministic + CC0.
     && bash /app/assets/music/synthesize_placeholders.sh /app/assets/music \
+    # Synthesize the bundled LUTs (warm/cool/cinematic/vivid). ~460 KB total.
+    && bash /app/assets/luts/synthesize_luts.sh /app/assets/luts \
     && chown -R reelforge:reelforge /data /models /app
 USER reelforge
 ENV PATH="/app/.venv/bin:/usr/local/bin:$PATH" \

@@ -13,20 +13,27 @@ import { cn } from '@/lib/utils';
 
 interface UploaderProps {
   projectId: string;
+  onComplete?: () => void;
 }
 
-export function Uploader({ projectId }: UploaderProps) {
+export function Uploader({ projectId, onComplete }: UploaderProps) {
   const qc = useQueryClient();
   const { state, actions } = useUploader(projectId);
   const inputRef = React.useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = React.useState(false);
+  const lastDoneRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
     if (state.status === 'done') {
       qc.invalidateQueries({ queryKey: ['assets', projectId] });
       qc.invalidateQueries({ queryKey: ['project', projectId] });
+      const tag = state.asset?.id ?? 'done';
+      if (lastDoneRef.current !== tag) {
+        lastDoneRef.current = tag;
+        onComplete?.();
+      }
     }
-  }, [state.status, projectId, qc]);
+  }, [state.status, state.asset, projectId, qc, onComplete]);
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();

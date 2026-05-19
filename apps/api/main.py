@@ -184,6 +184,9 @@ def create_app() -> FastAPI:
     from apps.api.routers import transcripts as transcripts_router  # noqa: E402
 
     app.include_router(transcripts_router.router, prefix=api_v1)
+    from apps.api.routers import montages as montages_router  # noqa: E402
+
+    app.include_router(montages_router.router, prefix=api_v1)
 
     # Exception handlers
     @app.exception_handler(ApiError)

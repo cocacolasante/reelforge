@@ -26,7 +26,12 @@ def generate_candidates(
     scenes: list[Scene] = analysis.scenes
     n = len(scenes)
     out: list[ReelCandidate] = []
-    max_scenes = max(1, config.max_scenes_per_reel)
+    # Effective bounds honor SelectionConfig.output_form: long_single widens
+    # the [min, max] window around the user's target duration; short and
+    # long_montage use the literal target_min/max_sec.
+    min_sec = config.effective_min_sec
+    max_sec = config.effective_max_sec
+    max_scenes = max(1, config.effective_max_scenes)
     if n == 0:
         return out
     for i in range(n):
@@ -35,9 +40,9 @@ def generate_candidates(
             start = scenes[i].start_sec
             end = scenes[j].end_sec
             dur = end - start
-            if dur > config.target_max_sec:
+            if dur > max_sec:
                 break  # extending j further only makes dur larger
-            if dur < config.target_min_sec:
+            if dur < min_sec:
                 continue
             indices = list(range(i, j + 1))
             out.append(

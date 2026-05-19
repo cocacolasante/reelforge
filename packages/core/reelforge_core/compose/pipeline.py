@@ -168,6 +168,13 @@ async def compose(
     (reel_dir / "tmp").mkdir(parents=True, exist_ok=True)
     log_file = reel_dir / "ffmpeg_commands.log"
 
+    # Smart-mode: resolve "auto" transition kind + "auto" LUT before any work.
+    # The resolved config is what gets persisted in compose.json so the UI can
+    # show "the AI picked: slideleft + warm LUT + uplift-acoustic".
+    from reelforge_core.compose.auto import resolve_smart_config
+
+    config = resolve_smart_config(config, reel, analysis)
+
     # ----- prepare -----
     await progress(_emit("prepare", 0.0))
     library = load_music_library()

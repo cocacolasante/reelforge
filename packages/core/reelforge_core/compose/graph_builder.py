@@ -18,6 +18,10 @@ from reelforge_core.models import AnalysisReport, ComposeConfig
 # Map our transition.kind to xfade's `transition=` value. "cut" is implemented as
 # a 40ms fade so the graph shape stays uniform.
 _TRANSITION_MAP = {
+    # "auto" should be resolved before we reach the graph builder (see
+    # compose/auto.py::resolve_smart_config). Keep a defensive fall-through
+    # to plain fade just in case.
+    "auto": "fade",
     "fade": "fade",
     "fadeblack": "fadeblack",
     "slideleft": "slideleft",
@@ -74,7 +78,9 @@ def build_final_command(
     transition_kind = _TRANSITION_MAP[config.transition.kind]
 
     # ----- input args -----
-    args: list[str] = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
+    # -stats forces ffmpeg to emit `time=...` lines on stderr even when
+    # -loglevel is warning — required for the render progress watcher.
+    args: list[str] = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-y"]
     for clip in clips:
         args += ["-i", str(clip.path)]
     music_input_index: int | None = None

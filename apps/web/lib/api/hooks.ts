@@ -1,7 +1,7 @@
 'use client';
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api } from './client';
+import { API_BASE, api } from './client';
 import {
   AnalysisReportSchema,
   AssetListSchema,
@@ -195,7 +195,9 @@ export function useEnqueueExport() {
 export function useHealth() {
   return useQuery({
     queryKey: ['health'],
-    queryFn: () => api('/health', { schema: HealthSchema }),
+    // /health is served at the API root, not under /api/v1 — call it absolutely
+    // so the client's prefixing logic doesn't turn it into /api/v1/health (404).
+    queryFn: () => api(`${API_BASE}/health`, { schema: HealthSchema }),
     staleTime: 30_000,
     refetchInterval: 30_000,
   });

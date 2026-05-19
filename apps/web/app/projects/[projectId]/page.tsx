@@ -3,7 +3,8 @@
 import * as React from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { ArrowRight, Sparkles, Wand2 } from 'lucide-react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { ArrowRight, Plus, Sparkles, Wand2 } from 'lucide-react';
 import { AppShell } from '@/components/layouts/app-shell';
 import { Uploader } from '@/components/app/uploader';
 import { JobProgress } from '@/components/app/job-progress';
@@ -20,17 +21,18 @@ import {
 import { Label } from '@/components/ui/label';
 import { Slider } from '@/components/ui/slider';
 import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
 import {
   useAnalysis,
   useEnqueueAnalyze,
   useEnqueueSelect,
   useProject,
   useProjectAssets,
-  useReelsForAsset,
 } from '@/lib/api/hooks';
 import { humanMessage } from '@/lib/api/errors';
-import { formatBytes, formatDuration } from '@/lib/format';
 import { APIError } from '@/lib/api/errors';
+import { api } from '@/lib/api/client';
+import { formatBytes, formatDuration } from '@/lib/format';
 
 export default function ProjectDetailPage({
   params,
@@ -46,22 +48,20 @@ export default function ProjectDetailPage({
 
 function ProjectDetail({ projectId }: { projectId: string }) {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const project = useProject(projectId);
   const assets = useProjectAssets(projectId);
-  const primaryAsset = assets.data?.assets[0];
+  const projectReels = useQuery({
+    queryKey: ['project-reels', projectId],
+    queryFn: () => api<{ reels: unknown[]; asset_count: number }>(`/projects/${projectId}/reels`),
+  });
 
-  const analysis = useAnalysis(primaryAsset?.id, !!primaryAsset);
-  const reels = useReelsForAsset(primaryAsset?.id);
-
-  const [analyzeJobId, setAnalyzeJobId] = React.useState<string | null>(null);
-  const [selectJobId, setSelectJobId] = React.useState<string | null>(null);
+  const [showUploader, setShowUploader] = React.useState(false);
+  const [jobIds, setJobIds] = React.useState<Record<string, string>>({});
+  const [selectJobs, setSelectJobs] = React.useState<string[]>([]);
 
   if (project.isLoading) {
-    return (
-      <div className="container py-10">
-        <div className="h-8 w-48 animate-pulse rounded bg-card/40" />
-      </div>
-    );
+    return <div className="container py-10"><div className="h-8 w-48 animate-pulse rounded bg-card/40" /></div>;
   }
   if (project.error) {
     return (
@@ -74,6 +74,9 @@ function ProjectDetail({ projectId }: { projectId: string }) {
     );
   }
 
+  const assetList = assets.data?.assets ?? [];
+  const reelCount = (projectReels.data?.reels as unknown[] | undefined)?.length ?? 0;
+
   return (
     <div className="container space-y-6 py-8">
       <header className="flex flex-wrap items-center justify-between gap-3">
@@ -85,249 +88,114 @@ function ProjectDetail({ projectId }: { projectId: string }) {
             {project.data?.name}
           </h1>
         </div>
-        {reels.data && reels.data.reels.length > 0 ? (
+        {reelCount > 0 ? (
           <Button onClick={() => router.push(`/projects/${projectId}/reels`)}>
-            View reels
+            View {reelCount} reel{reelCount === 1 ? '' : 's'}
             <ArrowRight className="h-4 w-4" />
           </Button>
         ) : null}
       </header>
 
-      {/* Zone A — Source */}
+      {/* Source clips */}
       <Card>
-        <CardHeader>
-          <CardTitle>Source</CardTitle>
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle>Source clips</CardTitle>
+          {assetList.length > 0 ? (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setShowUploader((v) => !v)}
+            >
+              <Plus className="h-4 w-4" />
+              {showUploader ? 'Cancel' : 'Add another clip'}
+            </Button>
+          ) : null}
         </CardHeader>
-        <CardContent>
-          {primaryAsset ? (
-            <AssetSummary asset={primaryAsset} />
-          ) : (
-            <Uploader projectId={projectId} />
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Zone B — Analysis */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Analysis</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {!primaryAsset ? (
-            <p className="text-sm text-muted-foreground">
-              Upload a source video to enable analysis.
-            </p>
-          ) : analysis.data ? (
-            <AnalysisSummary analysis={analysis.data} />
-          ) : analyzeJobId ? (
-            <JobProgress
-              jobId={analyzeJobId}
-              variant="analyze"
-              onDone={() => {
-                setAnalyzeJobId(null);
-                void analysis.refetch();
+        <CardContent className="space-y-4">
+          {assetList.length === 0 || showUploader ? (
+            <Uploader
+              projectId={projectId}
+              onComplete={() => {
+                setShowUploader(false);
+                void assets.refetch();
               }}
-              onFail={() => setAnalyzeJobId(null)}
             />
-          ) : (
-            <AnalyzeTrigger
-              assetId={primaryAsset.id}
-              onQueued={(id) => setAnalyzeJobId(id)}
-            />
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Zone C — Selection */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Selection</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {!analysis.data ? (
-            <p className="text-sm text-muted-foreground">
-              Analyze the source first to unlock reel selection.
-            </p>
-          ) : reels.data && reels.data.reels.length > 0 ? (
-            <div className="flex items-center justify-between text-sm">
-              <span>
-                {reels.data.reels.length} reel
-                {reels.data.reels.length === 1 ? '' : 's'} ranked.
-              </span>
-              <Button
-                size="sm"
-                onClick={() => router.push(`/projects/${projectId}/reels`)}
-              >
-                Open reels
-                <ArrowRight className="h-4 w-4" />
-              </Button>
-            </div>
-          ) : selectJobId ? (
-            <JobProgress
-              jobId={selectJobId}
-              variant="select"
-              onDone={() => {
-                setSelectJobId(null);
-                void reels.refetch();
-              }}
-              onFail={() => setSelectJobId(null)}
-            />
-          ) : (
-            <SelectTrigger_
-              assetId={primaryAsset!.id}
-              onQueued={(id) => setSelectJobId(id)}
-              disabled={!primaryAsset}
-            />
-          )}
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
-function AssetSummary({ asset }: { asset: NonNullable<ReturnType<typeof useProjectAssets>['data']>['assets'][number] }) {
-  return (
-    <div className="flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <div className="font-medium">{asset.original_filename}</div>
-        <div className="text-sm text-muted-foreground">
-          {formatDuration(asset.duration_sec)} • {asset.width}×{asset.height} •{' '}
-          {asset.fps.toFixed(0)} fps • {formatBytes(asset.size_bytes)}
-        </div>
-      </div>
-      <Badge variant="secondary">{asset.has_audio ? 'has audio' : 'silent'}</Badge>
-    </div>
-  );
-}
-
-function AnalyzeTrigger({
-  assetId,
-  onQueued,
-}: {
-  assetId: string;
-  onQueued: (jobId: string) => void;
-}) {
-  const enqueue = useEnqueueAnalyze();
-  const [model, setModel] = React.useState('base.en');
-  const [threshold, setThreshold] = React.useState<number[]>([27]);
-
-  const trigger = async () => {
-    try {
-      const job = await enqueue.mutateAsync({
-        assetId,
-        config: { whisper_model: model, scene_threshold: threshold[0] },
-      });
-      onQueued(job.id);
-    } catch {
-      /* surfaced via enqueue.error */
-    }
-  };
-
-  return (
-    <div className="space-y-4">
-      <div className="grid gap-3 sm:grid-cols-2">
-        <div className="space-y-1.5">
-          <Label>Whisper model</Label>
-          <Select value={model} onValueChange={setModel}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {['base.en', 'small', 'medium', 'large-v3'].map((m) => (
-                <SelectItem key={m} value={m}>
-                  {m}
-                </SelectItem>
+          ) : null}
+          {assetList.length > 0 ? (
+            <div className="space-y-3">
+              {assetList.map((a) => (
+                <AssetRow
+                  key={a.id}
+                  asset={a}
+                  activeJobId={jobIds[a.id] ?? null}
+                  onQueued={(jid) =>
+                    setJobIds((prev) => ({ ...prev, [a.id]: jid }))
+                  }
+                  onSettled={() => {
+                    setJobIds((prev) => {
+                      const { [a.id]: _omit, ...rest } = prev;
+                      return rest;
+                    });
+                    // SelectionPanel reads readiness from the
+                    // `assets-with-analysis` cache; invalidate so the
+                    // Select button un-greys without a page reload.
+                    void queryClient.invalidateQueries({
+                      queryKey: ['assets-with-analysis'],
+                    });
+                  }}
+                />
               ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="space-y-1.5">
-          <Label>Scene threshold: {threshold[0]}</Label>
-          <Slider value={threshold} min={10} max={50} step={1} onValueChange={setThreshold} />
-          <p className="text-xs text-muted-foreground">
-            Higher = fewer, longer scenes. Default 27.
-          </p>
-        </div>
-      </div>
-      {enqueue.error ? <ErrorInline err={enqueue.error} /> : null}
-      <Button onClick={trigger} disabled={enqueue.isPending}>
-        <Sparkles className="h-4 w-4" />
-        {enqueue.isPending ? 'Starting…' : 'Analyze footage'}
-      </Button>
+            </div>
+          ) : null}
+        </CardContent>
+      </Card>
+
+      {/* Selection panel */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Select reels</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <SelectionPanel
+            assetIds={assetList.map((a) => a.id)}
+            activeJobIds={selectJobs}
+            existingReelCount={reelCount}
+            onQueued={(jids) => setSelectJobs(jids)}
+            onSettled={() => {
+              setSelectJobs([]);
+              void projectReels.refetch();
+              void queryClient.invalidateQueries({
+                queryKey: ['project-reels', projectId],
+              });
+              router.push(`/projects/${projectId}/reels`);
+            }}
+          />
+        </CardContent>
+      </Card>
     </div>
   );
 }
 
-function AnalysisSummary({
-  analysis,
-}: {
-  analysis: NonNullable<ReturnType<typeof useAnalysis>['data']>;
-}) {
-  const wordCount =
-    analysis.transcript && 'segments' in (analysis.transcript as object)
-      ? ((analysis.transcript as { segments?: Array<{ words?: unknown[] }> }).segments ?? []).reduce(
-          (acc, s) => acc + (s.words?.length ?? 0),
-          0,
-        )
-      : 0;
-  const moods = new Map<string, number>();
-  for (const s of analysis.semantics) moods.set(s.mood, (moods.get(s.mood) ?? 0) + 1);
-  const topMoods = [...moods.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
-  return (
-    <div className="space-y-3 text-sm">
-      <div className="grid gap-2 sm:grid-cols-3">
-        <Stat label="Scenes" value={analysis.scenes.length} />
-        <Stat
-          label="Transcript"
-          value={
-            analysis.transcript
-              ? `${wordCount.toLocaleString()} words`
-              : 'No speech'
-          }
-        />
-        <Stat
-          label="Duration"
-          value={formatDuration(analysis.duration)}
-        />
-      </div>
-      <div className="flex flex-wrap gap-1.5">
-        {topMoods.map(([m, count]) => (
-          <Badge key={m} variant="secondary">
-            {m} ×{count}
-          </Badge>
-        ))}
-      </div>
-    </div>
-  );
-}
+// ---- per-asset row ------------------------------------------------------
 
-function Stat({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="rounded-md border bg-card/60 p-3">
-      <div className="text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className="mt-1 text-base font-medium">{value}</div>
-    </div>
-  );
-}
-
-function SelectTrigger_({
-  assetId,
+function AssetRow({
+  asset,
+  activeJobId,
   onQueued,
-  disabled,
+  onSettled,
 }: {
-  assetId: string;
+  asset: NonNullable<ReturnType<typeof useProjectAssets>['data']>['assets'][number];
+  activeJobId: string | null;
   onQueued: (jobId: string) => void;
-  disabled?: boolean;
+  onSettled: () => void;
 }) {
-  const enqueue = useEnqueueSelect();
-  const [topK, setTopK] = React.useState<number[]>([10]);
+  const analysis = useAnalysis(asset.id, true);
+  const enqueue = useEnqueueAnalyze();
+  const ready = !!analysis.data;
 
   const trigger = async () => {
     try {
-      const job = await enqueue.mutateAsync({
-        assetId,
-        config: { top_k: topK[0] },
-      });
+      const job = await enqueue.mutateAsync({ assetId: asset.id, config: {} });
       onQueued(job.id);
     } catch {
       /* surfaced */
@@ -335,25 +203,246 @@ function SelectTrigger_({
   };
 
   return (
-    <div className="space-y-4">
-      <div className="space-y-1.5">
-        <Label>Top reels to keep: {topK[0]}</Label>
-        <Slider value={topK} min={3} max={20} step={1} onValueChange={setTopK} />
+    <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-card/60 p-3 text-sm">
+      <div className="min-w-0 flex-1">
+        <div className="truncate font-medium">{asset.original_filename}</div>
+        <div className="text-xs text-muted-foreground">
+          {formatDuration(asset.duration_sec)} · {asset.width}×{asset.height}
+          @ {asset.fps.toFixed(0)}fps · {formatBytes(asset.size_bytes)}
+        </div>
       </div>
-      {enqueue.error ? <ErrorInline err={enqueue.error} /> : null}
-      <Button onClick={trigger} disabled={disabled || enqueue.isPending}>
-        <Wand2 className="h-4 w-4" />
-        {enqueue.isPending ? 'Starting…' : 'Select top reels'}
-      </Button>
+      <Badge variant={ready ? 'secondary' : 'muted'}>
+        {ready ? 'analyzed' : activeJobId ? 'analyzing…' : 'pending'}
+      </Badge>
+      {!ready && !activeJobId ? (
+        <Button size="sm" onClick={trigger} disabled={enqueue.isPending}>
+          <Sparkles className="h-4 w-4" />
+          Analyze
+        </Button>
+      ) : null}
+      {activeJobId ? (
+        <div className="w-full">
+          <JobProgress
+            jobId={activeJobId}
+            variant="analyze"
+            onDone={() => {
+              onSettled();
+              void analysis.refetch();
+            }}
+            onFail={onSettled}
+          />
+        </div>
+      ) : null}
+      {enqueue.error ? (
+        <Alert variant="destructive">
+          <AlertDescription>{humanMessage(enqueue.error)}</AlertDescription>
+        </Alert>
+      ) : null}
     </div>
   );
 }
 
-function ErrorInline({ err }: { err: unknown }) {
-  const isAlreadyRunning = err instanceof APIError && err.code === 'JOB_ALREADY_RUNNING';
+// ---- selection panel ----------------------------------------------------
+
+function SelectionPanel({
+  assetIds,
+  activeJobIds,
+  existingReelCount,
+  onQueued,
+  onSettled,
+}: {
+  assetIds: string[];
+  activeJobIds: string[];
+  existingReelCount: number;
+  onQueued: (ids: string[]) => void;
+  onSettled: () => void;
+}) {
+  const enqueue = useEnqueueSelect();
+  const [form, setForm] = React.useState<'short' | 'long_single' | 'long_montage'>('short');
+  const [minSec, setMinSec] = React.useState<number[]>([30]);
+  const [maxSec, setMaxSec] = React.useState<number[]>([60]);
+  const [longTarget, setLongTarget] = React.useState<number[]>([300]);
+  const [count, setCount] = React.useState(10);
+  const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
+
+  // Snap min/max sliders to short-form defaults when toggling back from a long mode.
+  React.useEffect(() => {
+    if (form === 'short') {
+      if (minSec[0] > 120) setMinSec([30]);
+      if (maxSec[0] > 180) setMaxSec([60]);
+    }
+  }, [form, minSec, maxSec]);
+
+  // Read which assets actually have analysis on disk.
+  const { data: analyzedFlags } = useQuery({
+    queryKey: ['assets-with-analysis', assetIds],
+    enabled: assetIds.length > 0,
+    queryFn: async () => {
+      const flags: Record<string, boolean> = {};
+      await Promise.all(
+        assetIds.map(async (id) => {
+          try {
+            await api(`/assets/${id}/analysis`);
+            flags[id] = true;
+          } catch {
+            flags[id] = false;
+          }
+        }),
+      );
+      return flags;
+    },
+  });
+
+  const readyAssetIds = (assetIds ?? []).filter((id) => analyzedFlags?.[id]);
+
+  const trigger = async () => {
+    setErrorMsg(null);
+    if (readyAssetIds.length === 0) {
+      setErrorMsg('Analyze at least one source clip first.');
+      return;
+    }
+    if (existingReelCount > 0) {
+      const ok = window.confirm(
+        `Re-running Select will replace the ${existingReelCount} existing reel${
+          existingReelCount === 1 ? '' : 's'
+        } for this project. Composed mezzanines will be kept on disk but new ranking output will overwrite reels.json. Continue?`,
+      );
+      if (!ok) return;
+    }
+    const config: Record<string, unknown> = {
+      output_form: form,
+      top_k: count,
+    };
+    if (form === 'long_single') {
+      config.long_target_duration_sec = longTarget[0];
+    } else {
+      config.target_min_sec = minSec[0];
+      config.target_max_sec = maxSec[0];
+    }
+
+    const newJobIds: string[] = [];
+    for (const aid of readyAssetIds) {
+      try {
+        const job = await enqueue.mutateAsync({ assetId: aid, config });
+        newJobIds.push(job.id);
+      } catch (err) {
+        if (err instanceof APIError && err.code === 'JOB_ALREADY_RUNNING') {
+          continue; // already in flight; UI shows progress elsewhere
+        }
+        setErrorMsg(humanMessage(err));
+      }
+    }
+    onQueued(newJobIds);
+  };
+
+  if (assetIds.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Upload at least one source clip to start.
+      </p>
+    );
+  }
+
   return (
-    <Alert variant={isAlreadyRunning ? 'info' : 'destructive'}>
-      <AlertDescription>{humanMessage(err)}</AlertDescription>
-    </Alert>
+    <div className="space-y-5">
+      <div className="space-y-2">
+        <Label>Output form</Label>
+        <div className="flex flex-wrap gap-2">
+          {([
+            ['short', 'Short reels'],
+            ['long_single', 'Long single span'],
+            ['long_montage', 'Long montage'],
+          ] as const).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setForm(key)}
+              className={
+                'rounded-md border px-3 py-1.5 text-sm transition ' +
+                (form === key
+                  ? 'border-primary bg-primary/10 text-foreground'
+                  : 'border-border text-muted-foreground hover:border-muted-foreground/60')
+              }
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {form === 'short'
+            ? 'Multiple short reels, each in the chosen duration range.'
+            : form === 'long_single'
+            ? 'One long span per source clip, sized near the target duration.'
+            : 'Top short reels stitched into one longer video (per source).'}
+        </p>
+      </div>
+
+      {form === 'long_single' ? (
+        <div className="space-y-1.5">
+          <Label>Target duration: {Math.floor(longTarget[0] / 60)}:{String(longTarget[0] % 60).padStart(2, '0')}</Label>
+          <Slider value={longTarget} min={120} max={1800} step={30} onValueChange={setLongTarget} />
+          <p className="text-xs text-muted-foreground">2:00 – 30:00</p>
+        </div>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label>Min duration: {minSec[0]}s</Label>
+            <Slider value={minSec} min={10} max={300} step={5} onValueChange={setMinSec} />
+          </div>
+          <div className="space-y-1.5">
+            <Label>Max duration: {maxSec[0]}s</Label>
+            <Slider value={maxSec} min={20} max={600} step={5} onValueChange={setMaxSec} />
+          </div>
+        </div>
+      )}
+
+      {form !== 'long_single' ? (
+        <div className="space-y-1.5">
+          <Label>How many clips: {count}</Label>
+          <Input
+            type="number"
+            min={1}
+            max={30}
+            value={count}
+            onChange={(e) => setCount(Math.max(1, Math.min(30, Number(e.target.value) || 1)))}
+            className="w-24"
+          />
+          {form === 'long_montage' ? (
+            <p className="text-xs text-muted-foreground">
+              All {count} clips will be stitched into one montage.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {errorMsg ? (
+        <Alert variant="destructive">
+          <AlertDescription>{errorMsg}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      <Button onClick={trigger} disabled={enqueue.isPending || readyAssetIds.length === 0}>
+        <Wand2 className="h-4 w-4" />
+        {enqueue.isPending
+          ? 'Starting…'
+          : `Select reels from ${readyAssetIds.length} clip${readyAssetIds.length === 1 ? '' : 's'}`}
+      </Button>
+
+      {activeJobIds.length > 0 ? (
+        <div className="space-y-2">
+          {activeJobIds.map((jid) => (
+            <JobProgress
+              key={jid}
+              jobId={jid}
+              variant="select"
+              onDone={() => {
+                // settle once all are done; we just re-check after every event
+                onSettled();
+              }}
+              onFail={onSettled}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
 }

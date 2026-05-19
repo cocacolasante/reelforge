@@ -140,3 +140,63 @@ async def get_asset(asset_id: str, db: AsyncSession = Depends(get_db)) -> AssetO
     if a is None:
         raise ApiError(404, "ASSET_NOT_FOUND", f"asset {asset_id} not found")
     return _to_asset_out(a)
+
+
+@router.get("/projects/{project_id}/reels")
+async def list_project_reels(
+    project_id: str, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """Aggregated reels across every asset in the project, sorted by score."""
+    import json as _json
+
+    from reelforge_core.analysis.pipeline import working_dir_for
+    from reelforge_core.models import ReelSelection
+
+    p = await db.get(dbmod.Project, project_id)
+    if p is None:
+        raise ApiError(404, "PROJECT_NOT_FOUND", f"project {project_id} not found")
+
+    assets = (
+        await db.execute(
+            select(dbmod.Asset).where(dbmod.Asset.project_id == project_id)
+        )
+    ).scalars().all()
+
+    merged: list[dict] = []
+    for asset in assets:
+        wd = working_dir_for(asset.id)
+        reels_path = wd / "reels.json"
+        if not reels_path.exists():
+            continue
+        try:
+            sel = ReelSelection.model_validate_json(reels_path.read_text())
+        except Exception:
+            continue
+        for r in sel.reels:
+            mezz = wd / "reels" / r.candidate_id / "mezzanine.mp4"
+            merged.append(
+                {
+                    "id": r.candidate_id,
+                    "project_id": project_id,
+                    "asset_id": asset.id,
+                    "asset_filename": asset.original_filename,
+                    "rank": r.rank,  # rank within its own asset
+                    "title": r.title,
+                    "hook": r.hook,
+                    "justification": r.justification,
+                    "start_sec": r.start_sec,
+                    "end_sec": r.end_sec,
+                    "duration_sec": r.duration_sec,
+                    "overall_score": r.overall,
+                    "suggested_mood": r.suggested_mood,
+                    "scene_indices": r.scene_indices,
+                    "scores": r.scores.model_dump(),
+                    "mezzanine_ready": mezz.exists(),
+                }
+            )
+    # Re-rank merged set by overall score so the UI shows the best content first
+    # regardless of which source clip it came from.
+    merged.sort(key=lambda r: r["overall_score"], reverse=True)
+    for i, r in enumerate(merged, 1):
+        r["project_rank"] = i
+    return {"reels": merged, "asset_count": len(assets)}

@@ -83,8 +83,11 @@ class Job(SQLModel, table=True):
 class Reel(SQLModel, table=True):
     __tablename__ = "reels"
 
-    id: str = Field(primary_key=True)       # = candidate_id
+    id: str = Field(primary_key=True)       # = candidate_id, OR a synthetic "montage-..."
     project_id: str = Field(foreign_key="projects.id", index=True)
+    # For a montage reel the asset_id is the first chapter's asset (used as a
+    # fallback for thumbnails). asset_id stays non-null so we don't have to
+    # touch every code path that joins through it.
     asset_id: str = Field(foreign_key="assets.id", index=True)
     rank: int
     title: str
@@ -101,6 +104,10 @@ class Reel(SQLModel, table=True):
     mezzanine_path: Optional[str] = None
     trim_start_offset_sec: float = 0.0
     trim_end_offset_sec: float = 0.0
+    # Phase 7.x long-form montage: when set, this Reel is the concatenation of
+    # the listed child reel_ids. The compose worker takes the montage path
+    # instead of the normal extract → render path.
+    child_reel_ids_json: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=_now)
 
 
@@ -209,6 +216,11 @@ async def create_all(engine: AsyncEngine) -> None:
                 text(
                     "ALTER TABLE reels ADD COLUMN trim_end_offset_sec REAL NOT NULL DEFAULT 0.0"
                 )
+            )
+        # Phase 7.x: child_reel_ids_json column (nullable, no default needed).
+        if reel_cols and "child_reel_ids_json" not in reel_cols:
+            await conn.execute(
+                text("ALTER TABLE reels ADD COLUMN child_reel_ids_json TEXT")
             )
 
 

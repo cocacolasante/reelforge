@@ -9,6 +9,7 @@ from arq.connections import RedisSettings
 
 from apps.worker.jobs import (
     analyze_asset,
+    compile_montage_job,
     compose_reel_job,
     export_reel_job,
     select_reels_job,
@@ -69,6 +70,7 @@ class WorkerSettings:
         select_reels_job,
         compose_reel_job,
         export_reel_job,
+        compile_montage_job,
     ]
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
     # analyze_asset legitimately runs up to an hour on long sources; compose +
