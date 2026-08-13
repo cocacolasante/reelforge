@@ -21,36 +21,60 @@ export function Uploader({ projectId, onComplete }: UploaderProps) {
   const { state, actions } = useUploader(projectId);
   const inputRef = React.useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = React.useState(false);
-  const lastDoneRef = React.useRef<string | null>(null);
+  // The store outlives this component (module-level, per-project). If we
+  // mount while a *previous* upload's `done` state is still in the store,
+  // that completion was already handled — seed the ref so we don't re-fire
+  // onComplete (which closes the panel) for it, and clear the stale state so
+  // the dropzone renders.
+  const lastDoneRef = React.useRef<string | null>(
+    state.status === 'done' ? state.asset?.id ?? 'done' : null,
+  );
+  const mountedWithStaleDone = React.useRef(state.status === 'done');
+
+  React.useEffect(() => {
+    if (mountedWithStaleDone.current) {
+      mountedWithStaleDone.current = false;
+      actions.reset();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   React.useEffect(() => {
     if (state.status === 'done') {
-      qc.invalidateQueries({ queryKey: ['assets', projectId] });
-      qc.invalidateQueries({ queryKey: ['project', projectId] });
       const tag = state.asset?.id ?? 'done';
       if (lastDoneRef.current !== tag) {
         lastDoneRef.current = tag;
+        qc.invalidateQueries({ queryKey: ['assets', projectId] });
+        qc.invalidateQueries({ queryKey: ['project', projectId] });
         onComplete?.();
       }
     }
   }, [state.status, state.asset, projectId, qc, onComplete]);
 
+  const handleFile = async (f: File) => {
+    // A persisted session with no file means "pick the same file to resume".
+    // If the picked file matches, continue where we left off; otherwise fall
+    // through to a fresh upload (dropping the stale session).
+    if (state.status === 'paused' && !state.file && state.uploadId) {
+      if (await actions.attachAndResume(f)) return;
+      await actions.cancel();
+    }
+    actions.selectFile(f);
+    void actions.start();
+  };
+
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragging(false);
     const f = e.dataTransfer.files[0];
-    if (f) {
-      actions.selectFile(f);
-      void actions.start();
-    }
+    if (f) void handleFile(f);
   };
 
   const onChoose = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
-    if (f) {
-      actions.selectFile(f);
-      void actions.start();
-    }
+    if (f) void handleFile(f);
+    // Allow re-picking the same filename later.
+    e.target.value = '';
   };
 
   if (state.status === 'done') {
@@ -62,6 +86,12 @@ export function Uploader({ projectId, onComplete }: UploaderProps) {
           {state.asset?.original_filename} ·{' '}
           {state.asset ? formatBytes(state.asset.size_bytes) : ''}
         </AlertDescription>
+        <div className="mt-3">
+          <Button size="sm" variant="secondary" onClick={() => actions.reset()}>
+            <Upload className="h-4 w-4" />
+            Upload another
+          </Button>
+        </div>
       </Alert>
     );
   }
@@ -88,13 +118,6 @@ export function Uploader({ projectId, onComplete }: UploaderProps) {
           <p className="max-w-sm text-sm text-muted-foreground">
             Supported: MP4, MOV, WebM. Up to 5 GB.
           </p>
-          <input
-            ref={inputRef}
-            type="file"
-            accept="video/*"
-            className="hidden"
-            onChange={onChoose}
-          />
           <Button
             variant="secondary"
             className="mt-2"
@@ -104,6 +127,15 @@ export function Uploader({ projectId, onComplete }: UploaderProps) {
           </Button>
         </div>
       ) : null}
+
+      {/* Always mounted so the resume card can open the picker too. */}
+      <input
+        ref={inputRef}
+        type="file"
+        accept="video/*"
+        className="hidden"
+        onChange={onChoose}
+      />
 
       {state.error ? (
         <Alert variant="destructive">
@@ -167,9 +199,16 @@ export function Uploader({ projectId, onComplete }: UploaderProps) {
             </Button>
           </div>
           {resumable ? (
-            <p className="text-xs text-muted-foreground">
-              An upload was interrupted. Choose the same file again to resume.
-            </p>
+            <div className="space-y-2">
+              <p className="text-xs text-muted-foreground">
+                An upload was interrupted. Choose the same file again to pick up
+                where it left off — already-uploaded parts are kept.
+              </p>
+              <Button size="sm" onClick={() => inputRef.current?.click()}>
+                <Upload className="h-4 w-4" />
+                Choose file to resume
+              </Button>
+            </div>
           ) : null}
         </div>
       ) : null}

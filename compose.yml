@@ -23,12 +23,12 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    ports: ["8000:8000"]
+    ports: ["8001:8001"]
     volumes:
       - ./data:/data
       - whisper_models:/models/whisper
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/ready"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/ready"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -58,15 +58,15 @@ services:
       context: .
       dockerfile: docker/Dockerfile.web
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_API_URL: http://localhost:8001
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_API_URL: http://localhost:8001
     depends_on:
       api:
         condition: service_healthy
     ports: ["3000:3000"]
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/"]
       interval: 10s
       timeout: 5s
       retries: 3

@@ -12,6 +12,14 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -23,7 +31,6 @@ import { Slider } from '@/components/ui/slider';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import {
-  useAnalysis,
   useEnqueueAnalyze,
   useEnqueueSelect,
   useProject,
@@ -59,6 +66,56 @@ function ProjectDetail({ projectId }: { projectId: string }) {
   const [showUploader, setShowUploader] = React.useState(false);
   const [jobIds, setJobIds] = React.useState<Record<string, string>>({});
   const [selectJobs, setSelectJobs] = React.useState<string[]>([]);
+  const [selectOutcome, setSelectOutcome] = React.useState<
+    { reelCount: number; failed: number } | null
+  >(null);
+  // Per-job settle bookkeeping. Keyed by job id so a re-fired SSE `done`
+  // event (StrictMode remounts, stream reconnects) can't double-count.
+  const settledJobs = React.useRef(
+    new Map<string, { ok: boolean; reelCount: number }>(),
+  );
+
+  const onUploadComplete = React.useCallback(() => {
+    setShowUploader(false);
+  }, []);
+
+  const handleSelectQueued = React.useCallback((jids: string[]) => {
+    settledJobs.current = new Map();
+    setSelectOutcome(null);
+    setSelectJobs(jids);
+  }, []);
+
+  const handleSelectJobSettled = React.useCallback(
+    (jobId: string, outcome: { ok: boolean; reelCount: number }) => {
+      if (settledJobs.current.has(jobId)) return;
+      settledJobs.current.set(jobId, outcome);
+      setSelectJobs((jobs) => {
+        if (settledJobs.current.size < jobs.length) return jobs;
+        // Every select job has settled — now decide where to go.
+        const outcomes = [...settledJobs.current.values()];
+        const failed = outcomes.filter((o) => !o.ok).length;
+        const reelCount = outcomes.reduce((n, o) => n + o.reelCount, 0);
+        void (async () => {
+          await queryClient.invalidateQueries({
+            queryKey: ['project-reels', projectId],
+          });
+          await projectReels.refetch();
+          if (reelCount > 0) {
+            setSelectJobs([]);
+            router.push(`/projects/${projectId}/reels`);
+          } else {
+            // Stay put: navigating to an empty reels page is a dead end.
+            // Keep failed JobProgress cards mounted so their errors stay visible.
+            setSelectOutcome({ reelCount, failed });
+            if (failed === 0) setSelectJobs([]);
+          }
+        })();
+        return jobs;
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [projectId, queryClient, router],
+  );
 
   if (project.isLoading) {
     return <div className="container py-10"><div className="h-8 w-48 animate-pulse rounded bg-card/40" /></div>;
@@ -113,13 +170,7 @@ function ProjectDetail({ projectId }: { projectId: string }) {
         </CardHeader>
         <CardContent className="space-y-4">
           {assetList.length === 0 || showUploader ? (
-            <Uploader
-              projectId={projectId}
-              onComplete={() => {
-                setShowUploader(false);
-                void assets.refetch();
-              }}
-            />
+            <Uploader projectId={projectId} onComplete={onUploadComplete} />
           ) : null}
           {assetList.length > 0 ? (
             <div className="space-y-3">
@@ -136,11 +187,10 @@ function ProjectDetail({ projectId }: { projectId: string }) {
                       const { [a.id]: _omit, ...rest } = prev;
                       return rest;
                     });
-                    // SelectionPanel reads readiness from the
-                    // `assets-with-analysis` cache; invalidate so the
-                    // Select button un-greys without a page reload.
+                    // analysis_ready comes from the asset list — refetch it
+                    // so the badge and the Select button update together.
                     void queryClient.invalidateQueries({
-                      queryKey: ['assets-with-analysis'],
+                      queryKey: ['assets', projectId],
                     });
                   }}
                 />
@@ -155,21 +205,34 @@ function ProjectDetail({ projectId }: { projectId: string }) {
         <CardHeader>
           <CardTitle>Select reels</CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-4">
           <SelectionPanel
-            assetIds={assetList.map((a) => a.id)}
+            assets={assetList.map((a) => ({
+              id: a.id,
+              analysisReady: a.analysis_ready,
+            }))}
             activeJobIds={selectJobs}
             existingReelCount={reelCount}
-            onQueued={(jids) => setSelectJobs(jids)}
-            onSettled={() => {
-              setSelectJobs([]);
-              void projectReels.refetch();
-              void queryClient.invalidateQueries({
-                queryKey: ['project-reels', projectId],
-              });
-              router.push(`/projects/${projectId}/reels`);
-            }}
+            onQueued={handleSelectQueued}
+            onJobSettled={handleSelectJobSettled}
           />
+          {selectOutcome ? (
+            <Alert variant={selectOutcome.failed > 0 ? 'destructive' : 'info'}>
+              <AlertTitle>
+                {selectOutcome.failed > 0
+                  ? 'Clip selection had errors'
+                  : 'No clips found in this footage'}
+              </AlertTitle>
+              <AlertDescription>
+                {selectOutcome.failed > 0
+                  ? `${selectOutcome.failed} selection job${selectOutcome.failed === 1 ? '' : 's'} failed — see the error above. `
+                  : ''}
+                {selectOutcome.reelCount === 0
+                  ? 'Selection finished but no clip in your duration range could be cut from this footage. Try widening the min/max duration, or re-run Analyze so long continuous takes are split into usable segments.'
+                  : ''}
+              </AlertDescription>
+            </Alert>
+          ) : null}
         </CardContent>
       </Card>
     </div>
@@ -189,9 +252,8 @@ function AssetRow({
   onQueued: (jobId: string) => void;
   onSettled: () => void;
 }) {
-  const analysis = useAnalysis(asset.id, true);
   const enqueue = useEnqueueAnalyze();
-  const ready = !!analysis.data;
+  const ready = asset.analysis_ready;
 
   const trigger = async () => {
     try {
@@ -225,10 +287,7 @@ function AssetRow({
           <JobProgress
             jobId={activeJobId}
             variant="analyze"
-            onDone={() => {
-              onSettled();
-              void analysis.refetch();
-            }}
+            onDone={onSettled}
             onFail={onSettled}
           />
         </div>
@@ -245,17 +304,20 @@ function AssetRow({
 // ---- selection panel ----------------------------------------------------
 
 function SelectionPanel({
-  assetIds,
+  assets,
   activeJobIds,
   existingReelCount,
   onQueued,
-  onSettled,
+  onJobSettled,
 }: {
-  assetIds: string[];
+  assets: Array<{ id: string; analysisReady: boolean }>;
   activeJobIds: string[];
   existingReelCount: number;
   onQueued: (ids: string[]) => void;
-  onSettled: () => void;
+  onJobSettled: (
+    jobId: string,
+    outcome: { ok: boolean; reelCount: number },
+  ) => void;
 }) {
   const enqueue = useEnqueueSelect();
   const [form, setForm] = React.useState<'short' | 'long_single' | 'long_montage'>('short');
@@ -264,6 +326,7 @@ function SelectionPanel({
   const [longTarget, setLongTarget] = React.useState<number[]>([300]);
   const [count, setCount] = React.useState(10);
   const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
 
   // Snap min/max sliders to short-form defaults when toggling back from a long mode.
   React.useEffect(() => {
@@ -273,42 +336,23 @@ function SelectionPanel({
     }
   }, [form, minSec, maxSec]);
 
-  // Read which assets actually have analysis on disk.
-  const { data: analyzedFlags } = useQuery({
-    queryKey: ['assets-with-analysis', assetIds],
-    enabled: assetIds.length > 0,
-    queryFn: async () => {
-      const flags: Record<string, boolean> = {};
-      await Promise.all(
-        assetIds.map(async (id) => {
-          try {
-            await api(`/assets/${id}/analysis`);
-            flags[id] = true;
-          } catch {
-            flags[id] = false;
-          }
-        }),
-      );
-      return flags;
-    },
-  });
+  const readyAssetIds = assets.filter((a) => a.analysisReady).map((a) => a.id);
 
-  const readyAssetIds = (assetIds ?? []).filter((id) => analyzedFlags?.[id]);
-
-  const trigger = async () => {
+  const startSelect = () => {
     setErrorMsg(null);
     if (readyAssetIds.length === 0) {
       setErrorMsg('Analyze at least one source clip first.');
       return;
     }
     if (existingReelCount > 0) {
-      const ok = window.confirm(
-        `Re-running Select will replace the ${existingReelCount} existing reel${
-          existingReelCount === 1 ? '' : 's'
-        } for this project. Composed mezzanines will be kept on disk but new ranking output will overwrite reels.json. Continue?`,
-      );
-      if (!ok) return;
+      setConfirmOpen(true);
+      return;
     }
+    void runSelect();
+  };
+
+  const runSelect = async () => {
+    setConfirmOpen(false);
     const config: Record<string, unknown> = {
       output_form: form,
       top_k: count,
@@ -335,7 +379,7 @@ function SelectionPanel({
     onQueued(newJobIds);
   };
 
-  if (assetIds.length === 0) {
+  if (assets.length === 0) {
     return (
       <p className="text-sm text-muted-foreground">
         Upload at least one source clip to start.
@@ -386,11 +430,29 @@ function SelectionPanel({
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="space-y-1.5">
             <Label>Min duration: {minSec[0]}s</Label>
-            <Slider value={minSec} min={10} max={300} step={5} onValueChange={setMinSec} />
+            <Slider
+              value={minSec}
+              min={10}
+              max={300}
+              step={5}
+              onValueChange={(v) => {
+                setMinSec(v);
+                if (v[0] > maxSec[0]) setMaxSec([v[0]]);
+              }}
+            />
           </div>
           <div className="space-y-1.5">
             <Label>Max duration: {maxSec[0]}s</Label>
-            <Slider value={maxSec} min={20} max={600} step={5} onValueChange={setMaxSec} />
+            <Slider
+              value={maxSec}
+              min={20}
+              max={600}
+              step={5}
+              onValueChange={(v) => {
+                setMaxSec(v);
+                if (v[0] < minSec[0]) setMinSec([v[0]]);
+              }}
+            />
           </div>
         </div>
       )}
@@ -420,12 +482,43 @@ function SelectionPanel({
         </Alert>
       ) : null}
 
-      <Button onClick={trigger} disabled={enqueue.isPending || readyAssetIds.length === 0}>
+      <Button onClick={startSelect} disabled={enqueue.isPending || readyAssetIds.length === 0}>
         <Wand2 className="h-4 w-4" />
         {enqueue.isPending
           ? 'Starting…'
+          : existingReelCount > 0
+          ? `Re-select reels from ${readyAssetIds.length} clip${readyAssetIds.length === 1 ? '' : 's'}`
           : `Select reels from ${readyAssetIds.length} clip${readyAssetIds.length === 1 ? '' : 's'}`}
       </Button>
+
+      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Replace existing reels?</DialogTitle>
+            <DialogDescription>
+              Re-running Select overwrites the ranking for this project. The{' '}
+              <span className="font-semibold text-foreground">
+                {existingReelCount} existing reel{existingReelCount === 1 ? '' : 's'}
+              </span>{' '}
+              will be replaced with a fresh selection.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-foreground/80">
+            Composed mezzanines on disk are kept (re-selecting the same span will
+            reuse them). Only <code className="font-mono">reels.json</code> and
+            the DB rows get rewritten.
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button variant="outline" onClick={() => setConfirmOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={() => void runSelect()}>
+              <Wand2 className="h-4 w-4" />
+              Replace & re-select
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {activeJobIds.length > 0 ? (
         <div className="space-y-2">
@@ -434,11 +527,14 @@ function SelectionPanel({
               key={jid}
               jobId={jid}
               variant="select"
-              onDone={() => {
-                // settle once all are done; we just re-check after every event
-                onSettled();
+              onDone={(result) => {
+                const reelCount =
+                  result && typeof result === 'object' && 'reel_count' in result
+                    ? Number((result as { reel_count?: unknown }).reel_count) || 0
+                    : 0;
+                onJobSettled(jid, { ok: true, reelCount });
               }}
-              onFail={onSettled}
+              onFail={() => onJobSettled(jid, { ok: false, reelCount: 0 })}
             />
           ))}
         </div>

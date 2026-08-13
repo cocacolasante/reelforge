@@ -33,7 +33,7 @@ services:
       - ./data:/data
       - whisper_models:/models/whisper
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/ready"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/ready"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -65,7 +65,7 @@ services:
     environment:
       NEXT_PUBLIC_API_URL: "https://${DOMAIN}/api"
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/"]
       interval: 10s
       timeout: 5s
       retries: 3

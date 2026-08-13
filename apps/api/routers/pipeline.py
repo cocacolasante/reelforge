@@ -78,8 +78,11 @@ async def analyze_asset_endpoint(
 @router.get("/assets/{asset_id}/analysis")
 async def get_analysis(asset_id: str, db: AsyncSession = Depends(get_db)) -> dict:
     row = await _ensure_asset(db, asset_id)
-    wd = working_dir_for(asset_id)
-    analysis_path = wd / "analysis.json"
+    # Read-only endpoint: build the path without working_dir_for(), which
+    # mkdirs working/{asset_id}/thumbs as a side effect.
+    from apps.api.settings import settings
+
+    analysis_path = settings.data_dir / "working" / asset_id / "analysis.json"
     if not analysis_path.exists():
         raise ApiError(
             404,

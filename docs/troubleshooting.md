@@ -68,12 +68,11 @@ start by checking `docker compose logs api worker | jq .`.
 
 ## Compose feels slow (first run)
 
-- **Known:** Ken Burns zoompan is expensive on 1080p clips flagged
-  `visual_energy=low`. A 3-clip reel with all-low scenes can take 10+
-  minutes instead of ~25 s. Workarounds:
-  - Pass `--no-effects` on the CLI, or toggle "Effects" off in the UI.
-  - Phase-7 clip cache means re-composes with identical aspect/fps skip the
-    clip re-encode entirely — typically 5-20× faster on the second run.
+- **Fixed:** Ken Burns used to run through FFmpeg's `zoompan` (per-frame
+  resampling — a 3-clip all-low-energy reel could take 10+ minutes). It's now
+  a constant-zoom + animated-crop pan with negligible render cost. If a
+  compose is still slow, check for HDR tonemapping and remember the clip
+  cache makes re-composes with identical aspect/fps 5-20× faster.
 
 ## "This file is larger than the configured limit" on upload
 

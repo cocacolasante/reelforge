@@ -373,3 +373,111 @@ async def export_reel_job(
     await write_terminal(redis, job_id, "done", "done")
     log.info("export_reel_job done", extra=extra)
     return result
+
+
+async def publish_reel_job(ctx: dict, publication_id: str) -> dict:
+    """Upload a finished export to the connected social account."""
+    import asyncio
+
+    from reelforge_core.publish import store as pub_store
+    from reelforge_core.publish import youtube
+
+    job_id = ctx["job_id"]
+    redis = ctx["redis"]
+    extra = {"job_id": job_id, "publication_id": publication_id}
+    log.info("publish_reel_job start", extra=extra)
+
+    await db.record_job_start(job_id, kind="publish_reel", asset_id=None)
+    on_progress = make_throttled_progress_writer(redis, job_id)
+
+    try:
+        pub = await asyncio.to_thread(pub_store.get_publication, publication_id)
+        if pub is None:
+            raise RuntimeError(f"publication {publication_id} not found")
+        account = await asyncio.to_thread(pub_store.get_account, pub["platform"])
+        if account is None:
+            raise RuntimeError(f"no {pub['platform']} account connected")
+
+        client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+        if not client_id or not client_secret:
+            raise RuntimeError("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not configured")
+
+        # Reels row -> asset id for the output path.
+        from reelforge_core.publish.store import _conn  # reuse the sync conn
+
+        def _asset_id() -> str | None:
+            r = _conn().execute(
+                "SELECT asset_id FROM reels WHERE id = ?", (pub["reel_id"],)
+            ).fetchone()
+            return r["asset_id"] if r else None
+
+        asset_id = await asyncio.to_thread(_asset_id)
+        if asset_id is None:
+            raise RuntimeError(f"reel {pub['reel_id']} not found")
+        data_dir = Path(os.environ.get("REELFORGE_DATA_DIR", "/data"))
+        video_path = (
+            data_dir / "outputs" / asset_id / pub["reel_id"] / f"{pub['preset_id']}.mp4"
+        )
+        if not video_path.exists():
+            raise RuntimeError(f"export missing on disk: {video_path}")
+
+        await asyncio.to_thread(pub_store.mark_publication_running, publication_id)
+        await on_progress(ProgressEvent("upload", 0.02, 0.02))
+
+        access_token = await asyncio.to_thread(
+            youtube.refresh_access_token,
+            client_id,
+            client_secret,
+            account["refresh_token"],
+        )
+        await asyncio.to_thread(
+            pub_store.update_account_access_token, pub["platform"], access_token
+        )
+
+        loop = asyncio.get_running_loop()
+
+        def _cb(frac: float) -> None:
+            fut = asyncio.run_coroutine_threadsafe(
+                on_progress(ProgressEvent("upload", frac, frac)), loop
+            )
+            try:
+                fut.result(timeout=5)
+            except Exception:
+                pass
+
+        video_id = await asyncio.to_thread(
+            youtube.upload_video,
+            access_token,
+            video_path,
+            title=pub["title"],
+            description=pub["description"] or "",
+            privacy=pub["privacy"] or "private",
+            progress_cb=_cb,
+        )
+        url = youtube.video_url(video_id)
+        await asyncio.to_thread(
+            pub_store.mark_publication_done, publication_id, video_id, url
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        log.error("publish_reel_job failed: %s", exc, extra=extra, exc_info=True)
+        try:
+            await asyncio.to_thread(
+                pub_store.mark_publication_failed, publication_id, str(exc)
+            )
+        except Exception:
+            log.exception("could not mark publication failed")
+        await db.record_job_failure(job_id, str(exc), tb)
+        await write_terminal(redis, job_id, "error", str(exc))
+        raise
+
+    result = {
+        "publication_id": publication_id,
+        "video_id": video_id,
+        "video_url": url,
+    }
+    await db.record_job_success(job_id, result)
+    await write_terminal(redis, job_id, "done", "done")
+    log.info("publish_reel_job done", extra=extra)
+    return result

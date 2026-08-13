@@ -13,8 +13,10 @@ import {
   MusicListSchema,
   ProjectListSchema,
   ProjectSchema,
+  PublicationListSchema,
   ReelListSchema,
   ReelSchema,
+  SocialAccountListSchema,
   UploadSessionSchema,
   type Asset,
   type Job,
@@ -96,8 +98,10 @@ export function useEnqueueAnalyze() {
         body: config ?? {},
         schema: JobSchema,
       }),
-    onSuccess: (_job, vars) => {
-      qc.invalidateQueries({ queryKey: ['asset', vars.assetId] });
+    onSuccess: () => {
+      // Readiness lives on the asset list (analysis_ready); nothing
+      // subscribes to a per-asset key.
+      qc.invalidateQueries({ queryKey: ['assets'] });
     },
   });
 }
@@ -200,5 +204,50 @@ export function useHealth() {
     queryFn: () => api(`${API_BASE}/health`, { schema: HealthSchema }),
     staleTime: 30_000,
     refetchInterval: 30_000,
+  });
+}
+
+// ---------- social publishing ----------
+
+export function useSocialAccounts() {
+  return useQuery({
+    queryKey: ['social-accounts'],
+    queryFn: () => api('/social/accounts', { schema: SocialAccountListSchema }),
+  });
+}
+
+export function usePublications(reelId: string | undefined) {
+  return useQuery({
+    queryKey: ['publications', reelId],
+    queryFn: () =>
+      api(`/reels/${reelId}/publications`, { schema: PublicationListSchema }),
+    enabled: !!reelId,
+  });
+}
+
+export function usePublishReel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      reelId,
+      body,
+    }: {
+      reelId: string;
+      body: {
+        platform: string;
+        preset_id: string;
+        title: string;
+        description: string;
+        privacy: string;
+      };
+    }) =>
+      api<Job>(`/reels/${reelId}/publish`, {
+        method: 'POST',
+        body,
+        schema: JobSchema,
+      }),
+    onSuccess: (_job, vars) => {
+      qc.invalidateQueries({ queryKey: ['publications', vars.reelId] });
+    },
   });
 }

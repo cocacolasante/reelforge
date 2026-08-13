@@ -47,8 +47,8 @@ ENV PATH="/app/.venv/bin:/usr/local/bin:$PATH" \
 
 # ---- Stage 4a: API -----------------------------------------------------------
 FROM core AS api
-EXPOSE 8000
-CMD ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+EXPOSE 8001
+CMD ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8001"]
 
 # ---- Stage 4b: Worker --------------------------------------------------------
 FROM core AS worker

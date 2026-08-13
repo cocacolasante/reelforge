@@ -23,6 +23,7 @@ htmlcov/
 
 # Node artifacts
 node_modules/
+**/node_modules/
 apps/web/.next/
 apps/web/.turbo/
 

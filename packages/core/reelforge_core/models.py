@@ -100,6 +100,12 @@ class SceneSemantics(BaseModel):
 class AnalysisConfig(BaseModel):
     scene_threshold: float = 27.0
     min_scene_duration: float = 2.0
+    # Long-take splitting: scenes longer than max_scene_sec are split into
+    # ~scene_split_target_sec pieces at speech pauses / loudness dips so raw
+    # unedited footage (few hard cuts) still yields reel candidates.
+    scene_split_enabled: bool = True
+    max_scene_sec: float = 45.0
+    scene_split_target_sec: float = 40.0
     whisper_model: str = "base.en"
     whisper_device: Literal["auto", "cpu", "cuda"] = "auto"
     whisper_compute_type: Literal["auto", "int8", "float16", "float32"] = "auto"
@@ -269,6 +275,9 @@ class CaptionStyle(BaseModel):
     highlight_color: str = "&H0000FFFF"
     max_chars_per_line: int = 28
     max_lines: int = 2
+    # Karaoke mode groups words into short single lines of at most this many
+    # characters; the spoken word is highlighted within the visible line.
+    karaoke_max_chars: int = 18
     position: Literal["lower_third", "centered", "top"] = "lower_third"
     safe_margin_pct: float = 0.15
 
@@ -289,6 +298,11 @@ class EffectsConfig(BaseModel):
     # "auto" lets compose.auto.pick_lut_id choose from bundled LUTs by mood.
     # Any other string is treated as a literal LUT id.
     lut: str | None = "auto"
+    # Reframing wider footage into portrait/square targets:
+    #   auto      — subject-tracked crop for portrait/square, letterbox else
+    #   crop      — always crop-track when the source is wider than the target
+    #   letterbox — legacy scale+pad behavior
+    reframe: Literal["auto", "crop", "letterbox"] = "auto"
 
 
 Aspect = Literal["9:16", "16:9", "1:1"]
@@ -307,6 +321,13 @@ class ComposeConfig(BaseModel):
     # target_resolution is derived from aspect if not overridden.
     target_resolution: tuple[int, int] | None = None
     target_fps: int = 30
+    # Overall encode quality. Adjusts BOTH encode stages (intermediate clips
+    # and the mezzanine render) unless video_crf / video_preset were set to
+    # non-default values explicitly (explicit always wins):
+    #   draft    — fast iteration: clips ultrafast/20, mezzanine veryfast/20
+    #   standard — clips ultrafast/18, mezzanine medium/18 (legacy behavior)
+    #   high     — final delivery: clips fast/16, mezzanine slow/16
+    quality: Literal["draft", "standard", "high"] = "standard"
     video_crf: int = 18
     video_preset: str = "medium"
     audio_bitrate_kbps: int = 256
@@ -319,8 +340,23 @@ class ComposeConfig(BaseModel):
     # minimum-duration guard.
     trim_start_offset_sec: float = 0.0
     trim_end_offset_sec: float = 0.0
+    # Speech-safe outer cuts: nudge the reel's first/last cut point off the
+    # middle of a spoken word — extend up to the max nudge to include the
+    # word, else drop the partial word entirely.
+    speech_safe_cuts: bool = True
+    speech_safe_max_nudge_sec: float = 0.6
+    # Beat-synced transitions: shorten interior clips by up to the cap so
+    # each crossfade midpoint lands on a beat of the chosen music track.
+    beat_sync: bool = True
+    beat_sync_max_adjust_sec: float = 0.45
     music_volume_db: float = -18.0
     voice_volume_db: float = -14.0
+    # Final-mix loudness normalization: one loudnorm pass on the mixed bus so
+    # every output lands at a consistent level. -14 LUFS integrated is the
+    # normalization target used by YouTube / TikTok / Spotify.
+    normalize_loudness: bool = True
+    loudness_target_lufs: float = -14.0
+    loudness_true_peak_db: float = -1.5
     ducking_threshold_db: float = -20.0
     ducking_ratio: float = 8.0
     ducking_attack_ms: float = 5.0
@@ -336,6 +372,28 @@ class ComposeConfig(BaseModel):
     @property
     def resolution(self) -> tuple[int, int]:
         return self.target_resolution or _resolution_for(self.aspect)
+
+    @property
+    def effective_mezz_preset(self) -> str:
+        if self.video_preset != "medium":  # explicit override wins
+            return self.video_preset
+        return {"draft": "veryfast", "standard": "medium", "high": "slow"}[self.quality]
+
+    @property
+    def effective_mezz_crf(self) -> int:
+        if self.video_crf != 18:  # explicit override wins
+            return self.video_crf
+        return {"draft": 20, "standard": 18, "high": 16}[self.quality]
+
+    @property
+    def clip_preset(self) -> str:
+        return {"draft": "ultrafast", "standard": "ultrafast", "high": "fast"}[
+            self.quality
+        ]
+
+    @property
+    def clip_crf(self) -> int:
+        return {"draft": 20, "standard": 18, "high": 16}[self.quality]
 
 
 class ComposeManifest(BaseModel):

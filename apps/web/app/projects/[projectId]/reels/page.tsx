@@ -65,10 +65,14 @@ function Body({ projectId }: { projectId: string }) {
     queryKey: ['project-reels', projectId],
     queryFn: () =>
       api<{ reels: ProjectReel[]; asset_count: number }>(`/projects/${projectId}/reels`),
+    // The project page pre-populates this key (often with an empty list) —
+    // always refetch on mount so a just-finished select job is picked up.
+    refetchOnMount: 'always',
   });
   const montagesQuery = useQuery({
     queryKey: ['project-montages', projectId],
     queryFn: () => api<{ montages: MontageOut[] }>(`/projects/${projectId}/montages`),
+    refetchOnMount: 'always',
   });
 
   if (project.isLoading) {
@@ -77,7 +81,13 @@ function Body({ projectId }: { projectId: string }) {
   if (project.error) {
     return <div className="container py-10"><Alert variant="destructive"><AlertDescription>{humanMessage(project.error)}</AlertDescription></Alert></div>;
   }
-  if (reelsQuery.isLoading) {
+  const reels = reelsQuery.data?.reels ?? [];
+  const montages = montagesQuery.data?.montages ?? [];
+
+  // Show the skeleton during the initial load AND while a refetch is in
+  // flight with nothing to show yet — the cache is often pre-seeded with an
+  // empty list by the project page, which makes `isLoading` false.
+  if (reelsQuery.isLoading || (reelsQuery.isFetching && reels.length === 0)) {
     return (
       <div className="container py-10 space-y-3">
         {Array.from({ length: 4 }, (_, i) => (
@@ -86,8 +96,24 @@ function Body({ projectId }: { projectId: string }) {
       </div>
     );
   }
-  const reels = reelsQuery.data?.reels ?? [];
-  const montages = montagesQuery.data?.montages ?? [];
+
+  if (reelsQuery.error) {
+    return (
+      <div className="container py-10">
+        <Alert variant="destructive">
+          <AlertTitle>Couldn&apos;t load reels</AlertTitle>
+          <AlertDescription>
+            {humanMessage(reelsQuery.error)}
+            <div className="mt-3">
+              <Button size="sm" variant="outline" onClick={() => void reelsQuery.refetch()}>
+                Try again
+              </Button>
+            </div>
+          </AlertDescription>
+        </Alert>
+      </div>
+    );
+  }
 
   if (reels.length === 0 && montages.length === 0) {
     return (
@@ -95,8 +121,19 @@ function Body({ projectId }: { projectId: string }) {
         <Alert>
           <AlertTitle>No reels yet</AlertTitle>
           <AlertDescription>
-            Run selection on an analyzed source first.{' '}
-            <Link className="underline" href={`/projects/${projectId}`}>Go back</Link>
+            <p>
+              If you just ran clip selection, it found no spans in your duration
+              range — go back, widen the min/max duration, or re-run Analyze so
+              long continuous takes get split into usable segments.
+            </p>
+            <div className="mt-3 flex gap-2">
+              <Button size="sm" variant="outline" asChild>
+                <Link href={`/projects/${projectId}`}>Back to project</Link>
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => void reelsQuery.refetch()}>
+                Refresh
+              </Button>
+            </div>
           </AlertDescription>
         </Alert>
       </div>
@@ -237,8 +274,24 @@ function MontageBuilder({
 
   if (candidateReels.length < 2) {
     // The "two or more composed reels" gate prevents 1-element montages, which
-    // would just be a re-encode with no benefit.
-    return null;
+    // would just be a re-encode with no benefit — but say so instead of
+    // silently hiding the feature.
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Layers className="h-4 w-4" />
+            Compose montage
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-muted-foreground">
+            Compose at least two reels (open a reel and hit Compose) to stitch
+            them into one longer montage video.
+          </p>
+        </CardContent>
+      </Card>
+    );
   }
 
   const toggle = (id: string) =>
@@ -346,6 +399,11 @@ function ThumbStrip({ asset_id, scene_indices }: { asset_id: string; scene_indic
           src={`${API_BASE}/api/v1/assets/${asset_id}/thumbnails/${i}`}
           className="h-14 w-20 rounded-sm object-cover bg-muted"
           loading="lazy"
+          onError={(e) => {
+            // Hide the broken-image icon; the muted background reads as a
+            // placeholder tile.
+            (e.target as HTMLImageElement).style.visibility = 'hidden';
+          }}
         />
       ))}
     </div>

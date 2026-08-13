@@ -46,6 +46,10 @@ export interface UploaderStatusSnapshot {
 interface InternalState extends UploaderStatusSnapshot {
   pauseRequested: boolean;
   abortControllers: Record<number, AbortController>;
+  // Lives in the shared store (not a hook ref): two mounted hook instances
+  // must see the same "a chunk pool is running" flag or they can double-run
+  // concurrent pools against the same session.
+  running: boolean;
   set: (partial: Partial<InternalState>) => void;
   setChunk: (idx: number, state: ChunkState) => void;
   reset: () => void;
@@ -67,6 +71,7 @@ const initial = (): InternalState => ({
   asset: null,
   pauseRequested: false,
   abortControllers: {},
+  running: false,
   set: () => {},
   setChunk: () => {},
   reset: () => {},
@@ -196,23 +201,26 @@ async function putChunk(
 export function useUploader(projectId: string) {
   const store = storeFor(projectId);
   const s = store();
-  const runningRef = useRef(false);
   const windowRef = useRef<Array<{ t: number; bytes: number }>>([]);
 
   // Crash-recovery: on mount, check for a persisted session and show it.
   useEffect(() => {
     const persisted = readPersistedSession(projectId);
     if (!persisted) return;
+    let cancelled = false;
     // Probe the server for its status.
     (async () => {
       try {
         const session = await api<UploadSession>(`/uploads/${persisted.uploadId}`, {
           schema: UploadSessionSchema,
         });
+        if (cancelled) return;
         if (session.status !== 'active') {
           clearPersistedSession(projectId);
           return;
         }
+        // Only surface the recovered session if nothing newer is in flight.
+        if (store.getState().status !== 'idle') return;
         store.setState({
           status: 'paused',
           uploadId: session.id,
@@ -223,9 +231,12 @@ export function useUploader(projectId: string) {
           progress: session.total_bytes ? session.received_bytes / session.total_bytes : 0,
         });
       } catch {
-        clearPersistedSession(projectId);
+        if (!cancelled) clearPersistedSession(projectId);
       }
     })();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
@@ -260,9 +271,8 @@ export function useUploader(projectId: string) {
   async function start() {
     const snap = store.getState();
     if (!snap.file) return;
-    if (runningRef.current) return;
-    runningRef.current = true;
-    store.setState({ status: 'creatingSession', error: null });
+    if (snap.running) return;
+    store.setState({ running: true, status: 'creatingSession', error: null });
     try {
       const session = await api<UploadSession>(
         `/projects/${projectId}/uploads`,
@@ -286,10 +296,10 @@ export function useUploader(projectId: string) {
         chunkCount: Math.ceil(session.total_bytes / session.chunk_size),
         bytesUploaded: session.received_bytes,
       });
-      await runChunkPool();
+      await runChunkPool(session.received_chunk_indices);
     } catch (err) {
-      runningRef.current = false;
       store.setState({
+        running: false,
         status: 'failed',
         error: err instanceof APIError ? err : new APIError('NETWORK_ERROR', 0, String(err)),
       });
@@ -312,11 +322,10 @@ export function useUploader(projectId: string) {
       });
       return;
     }
-    if (runningRef.current) return;
-    runningRef.current = true;
-    store.setState({ status: 'resuming', pauseRequested: false, error: null });
+    if (snap.running) return;
+    store.setState({ running: true, status: 'resuming', pauseRequested: false, error: null });
     try {
-      // Pull canonical state.
+      // Pull canonical state — including exactly which chunks the server has.
       const session = await api<UploadSession>(`/uploads/${snap.uploadId}`, {
         schema: UploadSessionSchema,
       });
@@ -330,14 +339,25 @@ export function useUploader(projectId: string) {
         bytesUploaded: session.received_bytes,
         progress: session.total_bytes ? session.received_bytes / session.total_bytes : 0,
       });
-      await runChunkPool();
+      await runChunkPool(session.received_chunk_indices);
     } catch (err) {
-      runningRef.current = false;
       store.setState({
+        running: false,
         status: 'failed',
         error: err instanceof APIError ? err : new APIError('NETWORK_ERROR', 0, String(err)),
       });
     }
+  }
+
+  /** Re-attach the user's file to a persisted (paused) session and continue.
+   * Returns false when the picked file can't belong to the session. */
+  async function attachAndResume(file: File): Promise<boolean> {
+    const snap = store.getState();
+    if (!snap.uploadId || snap.file) return false;
+    if (file.size !== snap.totalBytes) return false;
+    store.setState({ file, error: null });
+    await resume();
+    return true;
   }
 
   async function pause() {
@@ -361,7 +381,6 @@ export function useUploader(projectId: string) {
     }
     clearPersistedSession(projectId);
     store.getState().reset();
-    runningRef.current = false;
   }
 
   function retry() {
@@ -373,36 +392,22 @@ export function useUploader(projectId: string) {
     }
   }
 
-  async function runChunkPool() {
+  async function runChunkPool(receivedIndices: number[]) {
     const snap = store.getState();
     if (!snap.file || !snap.uploadId) return;
     const file = snap.file;
     const allChunks = chunkBoundaries(snap.totalBytes, snap.chunkSize);
-    const chunkSessionState: UploadSession = {
-      id: snap.uploadId,
-      project_id: projectId,
-      filename: file.name,
-      content_type: file.type || 'video/mp4',
-      total_bytes: snap.totalBytes,
-      received_bytes: snap.bytesUploaded,
-      chunk_size: snap.chunkSize,
-      status: 'active',
-      asset_id: null,
-      created_at: '',
-    };
 
-    // Ask the server which chunks are already present (by recomputing the
-    // server's received_bytes; for an uninterrupted first run this is 0).
-    // If we're resuming and the server has some bytes, we skip the first N
-    // full-chunk-sized bytes' worth of chunks.
-    const alreadyBytes = chunkSessionState.received_bytes;
-    const skipBeforeIndex = Math.floor(alreadyBytes / snap.chunkSize);
-    const pending = allChunks.filter((c) => c.index >= skipBeforeIndex);
+    // Skip exactly the chunks the server reports on disk. (Chunks upload in
+    // parallel, so "first floor(bytes/chunkSize) chunks" is wrong — chunk 1
+    // can be missing while 0 and 2 landed.)
+    const receivedSet = new Set(receivedIndices);
+    const pending = allChunks.filter((c) => !receivedSet.has(c.index));
 
-    // Seed chunk-states
-    const seeded: Record<number, ChunkState> = { ...snap.chunkStates };
+    // Seed chunk-states from the server's view.
+    const seeded: Record<number, ChunkState> = {};
     for (const c of allChunks) {
-      seeded[c.index] = seeded[c.index] ?? (c.index < skipBeforeIndex ? 'done' : 'idle');
+      seeded[c.index] = receivedSet.has(c.index) ? 'done' : 'idle';
     }
     store.setState({ chunkStates: seeded });
 
@@ -491,7 +496,7 @@ export function useUploader(projectId: string) {
     const workerCount = Math.min(PARALLELISM, pending.length);
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
-    runningRef.current = false;
+    store.setState({ running: false });
     const latest = store.getState();
     if (latest.status === 'failed') return;
     if (latest.pauseRequested) {
@@ -511,13 +516,23 @@ export function useUploader(projectId: string) {
         schema: AssetSchema,
       });
       clearPersistedSession(projectId);
-      store.setState({ status: 'done', asset });
+      store.setState({ status: 'done', asset, running: false });
     } catch (err) {
       store.setState({
         status: 'failed',
+        running: false,
         error: err instanceof APIError ? err : new APIError('NETWORK_ERROR', 0, String(err)),
       });
     }
+  }
+
+  function reset() {
+    // Abort anything in flight, then return the store to a clean idle state
+    // so the dropzone renders again for the next upload.
+    const snap = store.getState();
+    for (const ac of Object.values(snap.abortControllers)) ac.abort();
+    store.getState().reset();
+    windowRef.current = [];
   }
 
   return {
@@ -527,8 +542,10 @@ export function useUploader(projectId: string) {
       start,
       pause,
       resume,
+      attachAndResume,
       cancel,
       retry,
+      reset,
     },
   };
 }

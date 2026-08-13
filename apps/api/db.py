@@ -123,6 +123,36 @@ class Export(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_now)
 
 
+class SocialAccount(SQLModel, table=True):
+    __tablename__ = "social_accounts"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    platform: str = Field(index=True, unique=True)  # "youtube" | ...
+    access_token: str
+    refresh_token: str
+    display_name: Optional[str] = None  # channel / account title
+    created_at: datetime = Field(default_factory=_now)
+
+
+class Publication(SQLModel, table=True):
+    __tablename__ = "publications"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    reel_id: str = Field(foreign_key="reels.id", index=True)
+    platform: str = Field(index=True)
+    preset_id: str
+    title: str
+    description: str = ""
+    privacy: str = "private"  # private | unlisted | public
+    status: str = "queued"  # queued | uploading | done | failed
+    publish_job_id: Optional[str] = Field(default=None, index=True)
+    video_id: Optional[str] = None
+    video_url: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: datetime = Field(default_factory=_now)
+    completed_at: Optional[datetime] = None
+
+
 class UploadSession(SQLModel, table=True):
     __tablename__ = "upload_sessions"
 

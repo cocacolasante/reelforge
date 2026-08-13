@@ -179,6 +179,42 @@ async def compose(
     await progress(_emit("prepare", 0.0))
     library = load_music_library()
     track = select_track(library, config, reel)
+
+    # Beat sync: analyze the chosen track (tempo + phase) and compute the
+    # per-clip end trims that put each crossfade midpoint on a beat. Must
+    # happen before clip extraction — the trims change clip bounds.
+    end_trims: list[float] | None = None
+    beat_grid = None
+    if (
+        track is not None
+        and config.beat_sync
+        and len(reel.scene_indices) > 1
+        and config.transition.kind != "cut"
+    ):
+        from reelforge_core.compose.beats import compute_beat_end_trims, detect_beats
+        from reelforge_core.compose.clips import clip_bounds
+
+        beat_grid = await asyncio.to_thread(detect_beats, Path(track.path))
+        if beat_grid is not None:
+            n = len(reel.scene_indices)
+            planned = [
+                clip_bounds(pos, n, analysis.scenes[idx], config, analysis)
+                for pos, idx in enumerate(reel.scene_indices)
+            ]
+            durations = [out - in_ for in_, out in planned]
+            end_trims = compute_beat_end_trims(
+                durations,
+                config.transition.duration_sec,
+                beat_grid,
+                config.beat_sync_max_adjust_sec,
+            )
+            if any(t > 0 for t in end_trims):
+                log.info(
+                    "beat sync: %.1f BPM (phase %.2fs), trims %s",
+                    beat_grid.bpm,
+                    beat_grid.phase_sec,
+                    end_trims,
+                )
     await progress(_emit("prepare", 1.0))
 
     # ----- clips -----
@@ -189,7 +225,14 @@ async def compose(
     await progress(_emit("clips", 0.0))
     try:
         clips = await extract_clips(
-            asset, reel, analysis, config, reel_dir, log_file, _clip_progress
+            asset,
+            reel,
+            analysis,
+            config,
+            reel_dir,
+            log_file,
+            _clip_progress,
+            end_trims=end_trims,
         )
     except FFmpegError as exc:
         raise ComposeError(f"clip extraction failed: {exc}") from exc
@@ -198,7 +241,9 @@ async def compose(
     # ----- captions -----
     await progress(_emit("captions", 0.0))
     try:
-        captions_path = build_captions(reel, analysis, config, reel_dir)
+        captions_path = build_captions(
+            reel, analysis, config, reel_dir, end_trims=end_trims
+        )
     except Exception as exc:
         raise ComposeError(f"caption build failed: {exc}") from exc
     captions_for_render: Path | None

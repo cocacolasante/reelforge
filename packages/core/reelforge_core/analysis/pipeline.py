@@ -94,6 +94,11 @@ async def analyze(
         "threshold": config.scene_threshold,
         "min_duration": config.min_scene_duration,
         "source_mtime": mtime,
+        "split": (
+            [config.max_scene_sec, config.scene_split_target_sec]
+            if config.scene_split_enabled
+            else None
+        ),
     }
     if config.resume and _stamp_matches(scenes_path, scenes_stamp):
         scenes = [Scene.model_validate(s) for s in json.loads(scenes_path.read_text())]
@@ -142,6 +147,35 @@ async def analyze(
     else:
         loudness = await measure_loudness(asset, wd, config, progress)
         _write_stamp(loudness_path, loudness_stamp)
+
+    # --- scene refinement: split long takes ------------------------------------
+    # Raw unedited footage often has scenes far longer than any reel, which
+    # makes candidate enumeration produce nothing. Now that transcript +
+    # loudness exist, split over-long scenes at natural break points and
+    # rewrite scenes.json so every downstream consumer sees the refined list.
+    # Idempotent: a resume run loads already-split scenes and this is a no-op.
+    if config.scene_split_enabled:
+        from reelforge_core.analysis.scenes import build_scene_models, extract_thumbnails
+        from reelforge_core.analysis.segments import split_long_scenes
+
+        intervals = [(s.start_sec, s.end_sec) for s in scenes]
+        refined = split_long_scenes(
+            intervals,
+            transcript,
+            loudness,
+            max_scene_sec=config.max_scene_sec,
+            target_sec=config.scene_split_target_sec,
+        )
+        if refined != intervals:
+            log.info(
+                "scene split: %d scenes -> %d segments (long takes split for selection)",
+                len(intervals),
+                len(refined),
+            )
+            scenes = build_scene_models(refined, asset.fps)
+            await extract_thumbnails(asset, scenes, wd, config)
+            write_json_atomic(wd / "scenes.json", [s.model_dump() for s in scenes])
+            _write_stamp(scenes_path, scenes_stamp)
 
     # --- semantics -------------------------------------------------------------
     # Semantics uses its own SQLite cache; no stamp file needed.

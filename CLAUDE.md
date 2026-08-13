@@ -18,11 +18,16 @@ in Docker; the only host requirement is Docker Engine ≥ 24 + Compose v2.
 - [x] Phase 7 — Polish: cost controls, caches, cleanup, docs, prod deploy scaffolding
 - [x] Phase 7.1 — Multi-clip input + long-form output (montage + single span)
 - [x] Phase 7.2 — Smart auto-direction: AI-driven transitions, LUTs, music, effects
-- [ ] Phase 8+ — not started
+- [x] Phase 8 — Quality pass: scene splitting for raw footage, CC0 music library,
+      -14 LUFS loudness, karaoke captions, speech-safe cuts, beat sync,
+      auto-reframe, encode-quality knob (2026-08-12/13)
+- [x] Phase 9 — YouTube publishing: OAuth connect + resumable upload job + UI
+      (`docs/publishing.md`; needs user's GOOGLE_CLIENT_ID/SECRET in .env)
+- [ ] Phase 10+ — not started (next: Instagram/TikTok publishing)
 
 ## Topology
 ```
-web (Next.js, :3000) → api (FastAPI, :8000) → redis (arq broker) ← worker (arq)
+web (Next.js, :3000) → api (FastAPI, :8001) → redis (arq broker) ← worker (arq)
                                               ↓
                                             /data volume (bind: ./data)
                                             /models/whisper (named: whisper_models)
@@ -75,7 +80,7 @@ docker compose --profile test run --rm test pytest -k cache_key
 docker compose run --rm cli bash           # drop into a shell for debugging
 docker compose build --no-cache api worker # rebuild after dependency changes
 docker compose down                        # stop; volumes (whisper_models, ./data) persist
-curl -fsS http://localhost:8000/health     # API health
+curl -fsS http://localhost:8001/health     # API health
 docker compose logs worker | jq            # structured JSON logs from the worker
 ```
 
@@ -87,7 +92,8 @@ docker compose logs worker | jq            # structured JSON logs from the worke
 - **Error hierarchy** — `packages/core/reelforge_core/errors.py` (`AnalysisError` + one subclass per stage).
 - **SQLite cache + job bookkeeping** — `packages/core/reelforge_core/db.py` (WAL mode; semantics_cache + jobs tables).
 - **Analysis pipeline (Phase 1)**:
-  - `analysis/scenes.py` — PySceneDetect + HDR bump + parallel thumbnail extraction.
+  - `analysis/scenes.py` — PySceneDetect + HDR bump + parallel thumbnail extraction (`build_scene_models` + `extract_thumbnails` helpers reused by the split step).
+  - `analysis/segments.py` — long-take splitting: scenes > `max_scene_sec` (45s default) are split into ~`scene_split_target_sec` (40s) pieces at speech pauses → loudness dips → even grid. Runs in `pipeline.py` after loudness; rewrites `scenes.json` + re-extracts thumbs. Idempotent on resume. Without this, raw unedited footage (GoPro runs etc., few hard cuts) yields ZERO reel candidates because the enumerator only composes whole scenes.
   - `analysis/audio_extract.py` — one-shot mono 16 kHz PCM extraction shared by transcribe + loudness.
   - `analysis/transcribe.py` — faster-whisper with VAD + auto device/compute selection.
   - `analysis/audio.py` — ffmpeg `ebur128` → 1-second LUFS bins.
@@ -111,6 +117,15 @@ docker compose logs worker | jq            # structured JSON logs from the worke
   - `command.py` — `build_export_command` — pure, no filters. Explicit `-map 0:v:0 -map 0:a:0`; bit-exact-friendly zeroed `creation_time` metadata.
   - `verify.py` — `verify_export` runs ffprobe against the output, checks codec/pixfmt/fourcc/audio-present/duration-drift. `sanity_check_size` warns (not fails) when size diverges from the preset's typical ratio.
   - `pipeline.py` — `export()`. Skip-if-exists keyed on `(input_mezzanine_sha256, preset_spec_version)` in the sidecar. Broken outputs are kept on disk for forensics (not deleted). Stage weights `prepare 5% / transcode 90% / finalize 5%`.
+- **Publishing (Phase 9)** — `packages/core/reelforge_core/publish/`:
+  - `youtube.py` — OAuth token flows + resumable upload via plain httpx REST
+    (no google client lib). `PublishError` carries human-readable messages.
+  - `store.py` — sync SQLite reads/updates of `social_accounts` +
+    `publications` for the worker (jobstate.py pattern).
+  - API: `apps/api/routers/social.py` (connect/callback/disconnect, publish
+    enqueue with EXPORT_NOT_READY/SOCIAL_NOT_CONNECTED/SOCIAL_NOT_CONFIGURED
+    409s, publications list). Worker: `publish_reel_job`. Job kind "publish"
+    is in JobKindLit + the web Zod enum. UI: PublishPanel on the reel page.
 - **Shared worker progress** — `apps/worker/progress.py::make_throttled_progress_writer` (500 ms throttle; terminal events always emit). Used by `analyze_asset`, `select_reels_job`, `compose_reel_job`, and `export_reel_job`.
 - **Worker encoder check** — `apps/worker/main.py::_verify_ffmpeg_encoders` runs on boot and fails loudly if libx264 / libx265 / prores_ks / aac / pcm_s16le are missing from the image.
 - **API service (Phase 5)** — `apps/api/`:
@@ -248,16 +263,58 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
 - **`.env.example` is a template, not a credential store.** Keep it filled with
   placeholders. A real `ANTHROPIC_API_KEY` in `.env.example` will leak to git
   on first commit.
-- **Bundled music tracks are synthesized placeholders.** `assets/music/synthesize_placeholders.sh`
-  runs at Docker build time to produce ten CC0 waveform-based tracks (one per
-  mood). They prove the music pipeline works but they are not curated music.
-  Replace with real CC0 tracks when you want the audio to actually be good.
-  Updating the manifest alone isn't enough — the replacement files need to
-  land at `/app/assets/music/{id}.mp3` either by baking into the image or by
-  placing them in `/data/music/` where the user-manifest is read.
-- **Karaoke captions are simple per-word-replacement.** One ASS Dialogue per
-  `TranscriptWord`, identical positioning, sequential timing. The fancy
-  word-highlight-within-line look (TikTok-style) is Phase 7 polish.
+- **Bundled music tracks are synthesized placeholders — but a curated CC0
+  library now ships via `/data/music/`.** `scripts/fetch_cc0_music.py`
+  downloads 11 real CC0 tracks from OpenGameArt (verified licenses, one+ per
+  mood) into `/data/music/` and writes the user manifest. Run it with
+  `docker compose run --rm -T --entrypoint python cli - < scripts/fetch_cc0_music.py`.
+  `select_track` prefers `source == "user"` tracks over bundled placeholders
+  whenever the mood is covered, so the placeholders only play on a fresh
+  install that hasn't fetched the library.
+- **Final-mix loudness normalization is on by default.**
+  `ComposeConfig.normalize_loudness` adds a `loudnorm I=-14:TP=-1.5:LRA=11`
+  pass on the mixed bus (after amix / voice passthrough) followed by
+  `aresample=48000` (loudnorm internally emits 192 kHz). -14 LUFS is the
+  YouTube/TikTok/Spotify normalization target. Per-stem loudnorms still set
+  the voice/music *balance*; the bus pass pins the final level.
+- **Karaoke captions are TikTok-style word-highlight.** Words are grouped
+  into short lines (`CaptionStyle.karaoke_max_chars`, default 18); the whole
+  line stays on screen and the spoken word is re-colored via an inline
+  `\c` override + bold. One Dialogue per word interval, back-to-back times so
+  the line never flickers; intra-line pauses hold the current highlight.
+  Implemented in `compose/captions.py` (not libass `\k` tags — timing stays
+  under our control). The web compose panel defaults to karaoke.
+- **Beat-synced transitions.** `ComposeConfig.beat_sync` (default on): the
+  chosen music track is analyzed for tempo AND phase
+  (`compose/beats.py::detect_beats` — onset flux + autocorrelation, prefers
+  the finer tempo octave), then interior clips are shortened by ≤
+  `beat_sync_max_adjust_sec` (0.45s) so each crossfade midpoint lands on a
+  beat (`compute_beat_end_trims`, sequential — earlier trims shift later
+  transitions). Trims flow into `extract_clips(end_trims=...)` AND
+  `build_captions(end_trims=...)` — captions build a source→mezzanine
+  segment map from the ACTUAL clip bounds, so any new bound-changing feature
+  must thread through both.
+- **Auto-reframe (subject-tracked crop).** `EffectsConfig.reframe`
+  (default "auto"): portrait/square targets from wider sources get a
+  subject-following crop instead of letterboxing. `compose/reframe.py`
+  samples 12 frames per clip with OpenCV (motion-diff centroid + Haar face
+  detection, faces weighted 3x), yielding a start/end x-center; the clip
+  filter pans linearly between them (crop x is a t-expression — cheap).
+  Falls back to centered crop on any failure; `reframe: "letterbox"`
+  restores the old bars.
+- **Ken Burns is scale+animated-crop, not zoompan.** zoompan re-resampled
+  every frame (~10x slower renders); the current effect scales the clip up
+  once by `ken_burns_zoom` and drifts a target-sized crop window
+  diagonally. Do not reintroduce zoompan.
+- **Speech-safe outer cuts.** `ComposeConfig.speech_safe_cuts` (default on):
+  the reel's first/last cut points are snapped off the middle of spoken words
+  via `compose/speech_snap.py` — extend up to
+  `speech_safe_max_nudge_sec` (0.6s) to include the partial word, else drop
+  it. Applied in `clips.py::clip_bounds` (pure — also folds in trim offsets)
+  and mirrored by `captions.py` so caption timing tracks the ACTUAL rendered
+  bounds (this also fixed captions drifting when trim offsets were used).
+  Interior scene boundaries are never snapped — crossfades preserve words
+  across contiguous scenes.
 - **Only libx264 + AAC.** No NVENC, no hardware encode. Determinism and
   quality come first; we can revisit in Phase 7 after measuring.
 - **Do not use `-c copy` for clip extraction.** Stream-copy with `-ss` snaps to
@@ -327,9 +384,9 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   variable; only the build-time one actually lands in the client bundle.
   Changing the API URL requires a rebuild of the `web` image, not a restart.
 - **Web: the browser is outside the Docker network.** `NEXT_PUBLIC_API_URL`
-  must be the **host-visible** URL (`http://localhost:8000`), not the
-  Docker-internal hostname (`http://api:8000`). The worker and API see each
-  other via `api:8000`; the browser cannot resolve that.
+  must be the **host-visible** URL (`http://localhost:8001`), not the
+  Docker-internal hostname (`http://api:8001`). The worker and API see each
+  other via `api:8001`; the browser cannot resolve that.
 - **Web: Next.js 14 params are plain objects, not Promises.** The spec
   draft's `params: Promise<…>` + `use(params)` pattern is Next.js 15. On 14,
   declare `params: { projectId: string }` and access directly. Using `use()`
@@ -348,7 +405,7 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
 ## Phase 0 acceptance criteria (passing as of this commit)
 - `docker compose build` succeeds on a clean machine.
 - `docker compose up -d redis api worker` → all three healthy within ~30 s.
-- `curl http://localhost:8000/health` returns 200 with the documented shape.
+- `curl http://localhost:8001/health` returns 200 with the documented shape.
 - `./reelforge probe /data/inbox/<file>` prints the probe table.
 - `docker compose down` leaves `./data` and `whisper_models` intact.
 
@@ -524,21 +581,21 @@ passing in ~5 min** (293 + 21 new). New tests cover:
   rejects missing reels / un-composed reels; happy-path montage creation
   produces a Reel row with `child_reel_ids` and a queued job.
 
-**Not run in this turn**: live-stack smoke against `:8000` (the host's
+**Not run in this turn**: live-stack smoke against `:8001` (the host's
 port was held by an unrelated container). All wiring is verified via the
 test suite. To smoke against the live stack on a free host:
 `docker compose up -d` →
-`curl -s http://localhost:8000/api/v1/openapi.json | jq '.paths | keys | map(select(contains("montage")))'`.
+`curl -s http://localhost:8001/api/v1/openapi.json | jq '.paths | keys | map(select(contains("montage")))'`.
 
 ## Phase 6 acceptance status
 - `docker compose build web` produces a 153 MB image (well under the 300 MB
   target). `docker compose up` starts the full stack with `web` depending
   on `api` being healthy; `web` has its own `wget` spider healthcheck.
-- `NEXT_PUBLIC_API_URL=http://localhost:8000` flows through the
+- `NEXT_PUBLIC_API_URL=http://localhost:8001` flows through the
   `docker/Dockerfile.web` `ARG`/`ENV` pair and the compose `build.args`, and
   grep of the client bundles confirms it's inlined into the JS (required for
   the browser, which runs on the host, to reach the API at the host-mapped
-  port — not at the Docker internal `api:8000`).
+  port — not at the Docker internal `api:8001`).
 - Four routes render 200:
   - `/` → home / project list + "New project" dialog.
   - `/projects/{id}` → three-zone: source (uploader or AssetSummary) +
@@ -549,7 +606,7 @@ test suite. To smoke against the live stack on a free host:
     composed reel + compose config panel + export grid (4 preset rows with
     Download / Re-export once they complete). Compose + export use
     `JobProgress` with SSE.
-- CORS preflight from `http://localhost:3000` works against `api:8000`; the
+- CORS preflight from `http://localhost:3000` works against `api:8001`; the
   API echoes `Access-Control-Allow-Origin`. Browser-side `fetch` from the
   client bundle reaches the API directly (no proxy needed).
 - Sub-300 MB image check passes; `<video>` uses Range via the existing API

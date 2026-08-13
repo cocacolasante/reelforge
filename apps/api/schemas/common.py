@@ -36,6 +36,9 @@ class AssetOut(BaseModel):
     has_audio: bool
     size_bytes: int
     created_at: datetime
+    # True once analysis.json exists on disk — lets the UI show readiness
+    # without probing GET /assets/{id}/analysis (which 404s pre-analysis).
+    analysis_ready: bool = False
 
 
 class AssetList(BaseModel):
@@ -63,12 +66,15 @@ class UploadSessionOut(BaseModel):
     status: Literal["active", "completed", "aborted"]
     asset_id: str | None = None
     created_at: datetime
+    # Exact chunk indices present on disk. Chunks upload in parallel, so
+    # received_bytes alone can't tell a resuming client WHICH chunks to skip.
+    received_chunk_indices: list[int] = []
 
 
 # --------- jobs ----------
 
 
-JobKindLit = Literal["analyze", "select", "compose", "export"]
+JobKindLit = Literal["analyze", "select", "compose", "export", "publish"]
 JobStatusLit = Literal["queued", "running", "done", "failed"]
 
 

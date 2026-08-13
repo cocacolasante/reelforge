@@ -48,6 +48,8 @@ export function useJobStream(jobId: string | null | undefined): JobLive {
     let closed = false;
     let es: EventSource | null = null;
 
+    let warned = false;
+
     async function pollOnce() {
       try {
         const job = await api<Job>(`/jobs/${jobId}`, { schema: JobSchema });
@@ -62,6 +64,9 @@ export function useJobStream(jobId: string | null | undefined): JobLive {
 
     function startPolling() {
       if (pollingRef.current || closed) return;
+      // Streaming failed — don't keep the broken EventSource around or we'd
+      // poll AND stream simultaneously once the connection flaps back.
+      es?.close();
       void pollOnce();
       pollingRef.current = setInterval(pollOnce, 1500);
     }
@@ -102,8 +107,9 @@ export function useJobStream(jobId: string | null | undefined): JobLive {
         es?.close();
       });
       es.onerror = () => {
-        // Fall back to polling once, keep the EventSource attempt open (browser may recover).
-        if (!state.fellBackToPolling) {
+        // `state` here is a stale closure — track the warning locally instead.
+        if (!warned) {
+          warned = true;
           // eslint-disable-next-line no-console
           console.warn('[reelforge] SSE errored; falling back to polling');
         }

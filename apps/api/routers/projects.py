@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -21,6 +25,7 @@ from apps.api.schemas.common import (
 from apps.api.schemas.errors import ApiError
 
 router = APIRouter(tags=["projects"])
+log = logging.getLogger(__name__)
 
 
 def _to_project_out(p: dbmod.Project) -> ProjectOut:
@@ -30,6 +35,13 @@ def _to_project_out(p: dbmod.Project) -> ProjectOut:
         created_at=p.created_at,
         source_asset_id=p.source_asset_id,
     )
+
+
+def _analysis_ready(asset_id: str) -> bool:
+    # Deliberately NOT working_dir_for(): that helper mkdirs as a side effect.
+    from apps.api.settings import settings
+
+    return (settings.data_dir / "working" / asset_id / "analysis.json").exists()
 
 
 def _to_asset_out(a: dbmod.Asset) -> AssetOut:
@@ -45,6 +57,7 @@ def _to_asset_out(a: dbmod.Asset) -> AssetOut:
         has_audio=a.has_audio,
         size_bytes=a.size_bytes,
         created_at=a.created_at,
+        analysis_ready=_analysis_ready(a.id),
     )
 
 
@@ -96,6 +109,30 @@ async def delete_project(
     p = await db.get(dbmod.Project, project_id)
     if p is None:
         raise ApiError(404, "PROJECT_NOT_FOUND", f"project {project_id} not found")
+    # Collect filesystem targets BEFORE deleting the rows that point at them.
+    assets = (
+        await db.execute(
+            select(dbmod.Asset).where(dbmod.Asset.project_id == project_id)
+        )
+    ).scalars().all()
+    sessions = (
+        await db.execute(
+            select(dbmod.UploadSession).where(
+                dbmod.UploadSession.project_id == project_id
+            )
+        )
+    ).scalars().all()
+    from apps.api.settings import settings
+
+    paths_to_remove: list[Path] = []
+    for a in assets:
+        paths_to_remove.append(settings.data_dir / "working" / a.id)
+        paths_to_remove.append(settings.data_dir / "outputs" / a.id)
+        paths_to_remove.append(Path(a.path))
+    for s in sessions:
+        if s.parts_dir:
+            paths_to_remove.append(Path(s.parts_dir))
+
     # Cascade: delete dependent rows first (SQLite FK cascade isn't reliable
     # across SQLModel versions without ON DELETE CASCADE DDL).
     await db.execute(
@@ -113,6 +150,21 @@ async def delete_project(
     await db.execute(delete(dbmod.Asset).where(dbmod.Asset.project_id == project_id))
     await db.delete(p)
     await db.commit()
+
+    # Remove the project's files off the event loop. Runs after the commit so
+    # a failed DB delete never half-removes data; multi-GB uploads make this
+    # worth doing properly rather than leaking forever.
+    def _rm_all(paths: list[Path]) -> None:
+        for target in paths:
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - best-effort cleanup
+                log.warning("could not remove %s during project delete", target)
+
+    await asyncio.to_thread(_rm_all, paths_to_remove)
 
 
 @router.get(
@@ -171,9 +223,49 @@ async def list_project_reels(
         try:
             sel = ReelSelection.model_validate_json(reels_path.read_text())
         except Exception:
+            log.warning(
+                "skipping unparseable reels.json for asset %s", asset.id, exc_info=True
+            )
             continue
         for r in sel.reels:
             mezz = wd / "reels" / r.candidate_id / "mezzanine.mp4"
+            # Upsert the Reel row: everything downstream (GET /reels/{id},
+            # compose, export, preview) resolves reels through the DB, and
+            # this aggregation is the only reel-listing path the UI uses —
+            # without the upsert every reel link 404s. Re-selects refresh
+            # rank/title in place; stale rows for dropped candidates are kept
+            # (exports may reference them) but never surface here.
+            existing = await db.get(dbmod.Reel, r.candidate_id)
+            mezz_path = str(mezz) if mezz.exists() else None
+            if existing is None:
+                db.add(
+                    dbmod.Reel(
+                        id=r.candidate_id,
+                        project_id=project_id,
+                        asset_id=asset.id,
+                        rank=r.rank,
+                        title=r.title,
+                        hook=r.hook,
+                        justification=r.justification,
+                        start_sec=r.start_sec,
+                        end_sec=r.end_sec,
+                        duration_sec=r.duration_sec,
+                        overall_score=r.overall,
+                        suggested_mood=r.suggested_mood,
+                        scene_indices_json=_json.dumps(r.scene_indices),
+                        scores_json=_json.dumps(r.scores.model_dump()),
+                        mezzanine_path=mezz_path,
+                    )
+                )
+            else:
+                existing.rank = r.rank
+                existing.title = r.title
+                existing.hook = r.hook
+                existing.justification = r.justification
+                existing.overall_score = r.overall
+                existing.suggested_mood = r.suggested_mood
+                if mezz_path:
+                    existing.mezzanine_path = mezz_path
             merged.append(
                 {
                     "id": r.candidate_id,
@@ -196,6 +288,7 @@ async def list_project_reels(
             )
     # Re-rank merged set by overall score so the UI shows the best content first
     # regardless of which source clip it came from.
+    await db.commit()
     merged.sort(key=lambda r: r["overall_score"], reverse=True)
     for i, r in enumerate(merged, 1):
         r["project_rank"] = i

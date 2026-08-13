@@ -28,6 +28,7 @@ export const AssetSchema = z.object({
   has_audio: z.boolean(),
   size_bytes: z.number(),
   created_at: z.string(),
+  analysis_ready: z.boolean(),
 });
 export const AssetListSchema = z.object({ assets: z.array(AssetSchema) });
 export type Asset = z.infer<typeof AssetSchema>;
@@ -45,6 +46,7 @@ export const UploadSessionSchema = z.object({
   status: z.enum(['active', 'completed', 'aborted']),
   asset_id: z.string().nullable(),
   created_at: z.string(),
+  received_chunk_indices: z.array(z.number()),
 });
 export type UploadSession = z.infer<typeof UploadSessionSchema>;
 
@@ -123,7 +125,7 @@ export type Reel = z.infer<typeof ReelSchema>;
 
 export const JobSchema = z.object({
   id: z.string(),
-  kind: z.enum(['analyze', 'select', 'compose', 'export']),
+  kind: z.enum(['analyze', 'select', 'compose', 'export', 'publish']),
   status: z.enum(['queued', 'running', 'done', 'failed']),
   progress: z.number(),
   stage: z.string().nullable(),
@@ -177,3 +179,35 @@ export const HealthSchema = z.object({
   data_dir: z.string().optional(),
   environment: z.string().optional(),
 });
+
+// --- Social publishing ------------------------------------------------------
+
+export const SocialAccountSchema = z.object({
+  platform: z.string(),
+  display_name: z.string().nullable(),
+  connected_at: z.string(),
+});
+export const SocialAccountListSchema = z.object({
+  accounts: z.array(SocialAccountSchema),
+});
+export type SocialAccount = z.infer<typeof SocialAccountSchema>;
+
+export const PublicationSchema = z.object({
+  id: z.string(),
+  reel_id: z.string(),
+  platform: z.string(),
+  preset_id: z.string(),
+  title: z.string(),
+  privacy: z.string(),
+  status: z.string(),
+  publish_job_id: z.string().nullable(),
+  video_id: z.string().nullable(),
+  video_url: z.string().nullable(),
+  error_message: z.string().nullable(),
+  created_at: z.string(),
+  completed_at: z.string().nullable(),
+});
+export const PublicationListSchema = z.object({
+  publications: z.array(PublicationSchema),
+});
+export type Publication = z.infer<typeof PublicationSchema>;

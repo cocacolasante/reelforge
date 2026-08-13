@@ -118,24 +118,25 @@ def build_final_command(
             )
         )
         if clip.scene_index in low_energy_by_idx and config.effects.ken_burns_on_low_energy:
-            # z ramps from 1.0 to ken_burns_zoom over d frames
-            d_frames = max(1, int(round(clip.duration * fps)))
-            target_zoom = config.effects.ken_burns_zoom
-            # Step per frame to land near target_zoom at the last frame
-            step = (target_zoom - 1.0) / max(1, d_frames - 1)
-            # Raw string — zoompan expression syntax uses commas and colons that
-            # must not be escaped by our DSL (the whole z value is one arg).
-            zoompan_args = {
-                "z": f"min(zoom+{step:.6f}\\,{target_zoom:.3f})",
-                "d": str(d_frames),
-                "s": f"{width}x{height}",
-            }
+            # Ken Burns-style motion as constant-zoom + animated crop: scale
+            # the clip up ONCE, then drift a target-sized window diagonally
+            # across the margin. Orders of magnitude cheaper than zoompan
+            # (which re-resamples every frame and made renders ~10x slower);
+            # visually it reads the same "slow deliberate camera move".
+            zoom = max(1.01, config.effects.ken_burns_zoom)
+            sw = int(width * zoom / 2) * 2
+            sh = int(height * zoom / 2) * 2
+            dur = max(0.1, clip.duration)
+            drift = f"min(t/{dur:.3f}\\,1)"
             graph.add(
                 FilterNode(
-                    filter_name="zoompan",
+                    filter_name=(
+                        f"scale={sw}:{sh},"
+                        f"crop={width}:{height}:"
+                        f"x='(iw-ow)*{drift}':y='(ih-oh)*{drift}'"
+                    ),
                     inputs=[v_prep_out],
                     outputs=[v_out],
-                    args=zoompan_args,
                 )
             )
         else:
@@ -325,7 +326,7 @@ def build_final_command(
             FilterNode(
                 filter_name="amix",
                 inputs=["[voice_mix]", "[music_ducked]"],
-                outputs=["[afinal]"],
+                outputs=["[amixed]"],
                 args={
                     "inputs": 2,
                     "duration": "first",
@@ -333,11 +334,51 @@ def build_final_command(
                 },
             )
         )
+        a_pre_final = "[amixed]"
+    else:
+        a_pre_final = "[voice]"
+
+    # Final-bus loudness normalization. The per-stem loudnorms above set the
+    # *balance* (voice vs music); this pass pins the finished mix to the
+    # social-platform target so amix's input scaling and stem summing can't
+    # push the output quiet or hot.
+    if config.normalize_loudness:
+        graph.add(
+            FilterNode(
+                filter_name="loudnorm",
+                inputs=[a_pre_final],
+                outputs=["[anorm]"],
+                args={
+                    "I": f"{config.loudness_target_lufs:.1f}",
+                    "LRA": 11,
+                    "TP": f"{config.loudness_true_peak_db:.1f}",
+                },
+            )
+        )
+        # loudnorm upsamples to 192 kHz internally and emits at that rate —
+        # bring the bus back to the mezzanine's 48 kHz before AAC encode.
+        # The trailing alimiter is load-bearing: loudnorm's dynamic mode can
+        # overshoot its TP ceiling by several dB while its gain smoothing
+        # settles during the first seconds; the brick-wall keeps sample peaks
+        # at the configured true-peak ceiling. latency=1 compensates the
+        # limiter's lookahead delay so audio stays in sync with video.
+        limit_linear = 10 ** (config.loudness_true_peak_db / 20.0)
+        graph.add(
+            FilterNode(
+                filter_name=(
+                    "aresample=48000,"
+                    "aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"alimiter=limit={limit_linear:.4f}:level=false:latency=true"
+                ),
+                inputs=["[anorm]"],
+                outputs=["[afinal]"],
+            )
+        )
     else:
         graph.add(
             FilterNode(
                 filter_name="anull",
-                inputs=["[voice]"],
+                inputs=[a_pre_final],
                 outputs=["[afinal]"],
             )
         )
@@ -356,9 +397,9 @@ def build_final_command(
         "-c:v",
         "libx264",
         "-preset",
-        config.video_preset,
+        config.effective_mezz_preset,
         "-crf",
-        str(config.video_crf),
+        str(config.effective_mezz_crf),
         "-pix_fmt",
         "yuv420p",
         "-r",

@@ -21,6 +21,15 @@ class Settings(BaseSettings):
     ]
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    # Social publishing (YouTube). Credentials come from the user's Google
+    # Cloud project — see docs/publishing.md for setup.
+    google_client_id: str = Field(default="", alias="GOOGLE_CLIENT_ID")
+    google_client_secret: str = Field(default="", alias="GOOGLE_CLIENT_SECRET")
+    # Host-visible bases used to build the OAuth redirect + post-connect hop.
+    public_api_base: str = Field(
+        default="http://localhost:8001", alias="REELFORGE_PUBLIC_API_BASE"
+    )
+    web_base: str = Field(default="http://localhost:3000", alias="REELFORGE_WEB_BASE")
     caption_preview_timeout_s: float = 10.0
     caption_preview_rpm_per_ip: int = 30
 

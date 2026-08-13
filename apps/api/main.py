@@ -188,6 +188,10 @@ def create_app() -> FastAPI:
 
     app.include_router(montages_router.router, prefix=api_v1)
 
+    from apps.api.routers import social as social_router  # noqa: E402
+
+    app.include_router(social_router.router, prefix=api_v1)
+
     # Exception handlers
     @app.exception_handler(ApiError)
     async def _api_error_handler(request: Request, exc: ApiError) -> JSONResponse:

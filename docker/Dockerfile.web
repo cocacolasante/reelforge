@@ -7,7 +7,7 @@ RUN corepack enable && corepack prepare pnpm@9.12.2 --activate
 
 # NEXT_PUBLIC_* values must be present at build time — they're inlined into the
 # client bundle. Pass via `build.args` in compose.
-ARG NEXT_PUBLIC_API_URL=http://localhost:8000
+ARG NEXT_PUBLIC_API_URL=http://localhost:8001
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 
 # Copy manifest first for better layer caching. Lockfile is optional on first build.

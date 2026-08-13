@@ -2,13 +2,15 @@
 
 import * as React from 'react';
 import Link from 'next/link';
-import { Download, Film, Play, RotateCcw, Sparkles, Wand2 } from 'lucide-react';
+import { useQueryClient } from '@tanstack/react-query';
+import { Download, Film, Play, RotateCcw, Sparkles, Upload, Wand2 } from 'lucide-react';
 import { AppShell } from '@/components/layouts/app-shell';
 import { JobProgress } from '@/components/app/job-progress';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Progress } from '@/components/ui/progress';
 import {
@@ -27,7 +29,10 @@ import {
   useEnqueueExport,
   useExports,
   useMusicLibrary,
+  usePublications,
+  usePublishReel,
   useReel,
+  useSocialAccounts,
 } from '@/lib/api/hooks';
 
 const PRESETS = [
@@ -77,6 +82,7 @@ export default function ReelDetailPage({
 }
 
 function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
+  const queryClient = useQueryClient();
   const reel = useReel(reelId);
   const exportsQ = useExports(reelId);
   const music = useMusicLibrary();
@@ -86,12 +92,16 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
   // Local compose-config state (intentionally not persisted across reload).
   const [smart, setSmart] = React.useState(true);
   const [aspect, setAspect] = React.useState<'9:16' | '16:9' | '1:1'>('9:16');
-  const [captionMode, setCaptionMode] = React.useState<'off' | 'static' | 'karaoke'>('static');
+  const [captionMode, setCaptionMode] = React.useState<'off' | 'static' | 'karaoke'>('karaoke');
   const [transition, setTransition] = React.useState('fade');
   const [transitionDur, setTransitionDur] = React.useState<number[]>([0.4]);
   const [musicTrack, setMusicTrack] = React.useState<string>('__auto__');
   const [noEffects, setNoEffects] = React.useState(false);
   const [crf, setCrf] = React.useState<number[]>([18]);
+  const [quality, setQuality] = React.useState<'draft' | 'standard' | 'high'>('standard');
+  // Max output duration (in seconds). `null` means "no cap" — render the full reel.
+  // Mapped to `trim_end_offset_sec = reel_duration - maxDuration` on submit.
+  const [maxDuration, setMaxDuration] = React.useState<number[] | null>(null);
 
   if (reel.isLoading) {
     return <div className="container py-10"><div className="h-8 w-48 animate-pulse rounded bg-card/40" /></div>;
@@ -103,16 +113,27 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
       </div>
     );
   }
-  const r = reel.data!;
+  if (!reel.data) {
+    return <div className="container py-10"><div className="h-8 w-48 animate-pulse rounded bg-card/40" /></div>;
+  }
+  const r = reel.data;
   const previewSrc = r.mezzanine_ready ? `${API_BASE}/api/v1/reels/${r.id}/preview` : null;
   const mezzanineBytesGuess = 1_500_000; // worst-case default for size estimates before we know
+  const cappedDuration = maxDuration?.[0] ?? r.duration_sec;
+  const trimEndOffset = Math.max(0, r.duration_sec - cappedDuration);
+  // Only send trim keys the user actually set — the API falls back to the
+  // reel's saved trim offsets for missing keys, so sending explicit zeros
+  // would silently wipe a trim saved via PATCH /reels/{id}/trim.
+  const trimOffsets: Record<string, number> =
+    maxDuration !== null ? { trim_end_offset_sec: trimEndOffset } : {};
 
   const triggerCompose = async () => {
-    const config = smart
+    const baseConfig = smart
       ? {
           aspect,
           target_fps: 30,
           video_crf: crf[0],
+          quality,
           captions: { mode: captionMode },
           smart_mode: true,
           transition: { kind: 'auto', duration_sec: 0.4 },
@@ -128,6 +149,7 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
           aspect,
           target_fps: 30,
           video_crf: crf[0],
+          quality,
           captions: { mode: captionMode },
           smart_mode: false,
           transition: { kind: transition, duration_sec: transitionDur[0] },
@@ -139,6 +161,7 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
           music_track_id: musicTrack === '__auto__' ? null : musicTrack,
           no_music: musicTrack === '__none__',
         };
+    const config = { ...baseConfig, ...trimOffsets };
     try {
       const job = await compose.mutateAsync({ reelId, config });
       setComposeJobId(job.id);
@@ -185,6 +208,13 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
                   onDone={() => {
                     setComposeJobId(null);
                     void reel.refetch();
+                    // The reels list and export grid key off compose state too.
+                    void queryClient.invalidateQueries({
+                      queryKey: ['project-reels', projectId],
+                    });
+                    void queryClient.invalidateQueries({
+                      queryKey: ['exports', reelId],
+                    });
                   }}
                   onFail={() => setComposeJobId(null)}
                 />
@@ -209,11 +239,21 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
           </Card>
 
           {r.mezzanine_ready && !composeJobId ? (
-            <ExportList
-              reelId={reelId}
-              mezzanineBytesGuess={mezzanineBytesGuess}
-              existing={exportsQ.data?.exports ?? []}
-            />
+            <>
+              <ExportList
+                reelId={reelId}
+                mezzanineBytesGuess={mezzanineBytesGuess}
+                existing={exportsQ.data?.exports ?? []}
+              />
+              <PublishPanel
+                reelId={reelId}
+                defaultTitle={r.title}
+                defaultDescription={r.hook}
+                socialExportReady={(exportsQ.data?.exports ?? []).some(
+                  (e) => e.preset_id === 'mp4_h264_social' && e.output_path,
+                )}
+              />
+            </>
           ) : null}
         </div>
 
@@ -256,6 +296,37 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
                 </div>
               ) : null}
             </section>
+
+            {/* Max length — hidden for reels too short to meaningfully cap
+                (Radix Slider misbehaves when min > max). */}
+            {r.duration_sec > 6 ? (
+            <section className="space-y-2">
+              <div className="flex items-baseline justify-between">
+                <Label>
+                  Max length · {formatDuration(cappedDuration)}
+                </Label>
+                {cappedDuration < r.duration_sec ? (
+                  <button
+                    onClick={() => setMaxDuration(null)}
+                    className="text-xs text-muted-foreground hover:text-foreground"
+                  >
+                    reset
+                  </button>
+                ) : null}
+              </div>
+              <Slider
+                value={maxDuration ?? [r.duration_sec]}
+                min={5}
+                max={r.duration_sec}
+                step={1}
+                onValueChange={(v) => setMaxDuration(v as number[])}
+              />
+              <p className="text-xs text-muted-foreground">
+                Full reel is {r.duration_sec.toFixed(1)}s. Lower this to render a
+                shorter clip from the start of the reel.
+              </p>
+            </section>
+            ) : null}
 
             {/* Aspect */}
             <section className="space-y-2">
@@ -362,14 +433,44 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
               </>
             ) : null}
 
+            {/* Quality */}
+            <section className="space-y-2">
+              <Label>Render quality</Label>
+              <div className="flex gap-2">
+                {([
+                  ['draft', 'Draft'],
+                  ['standard', 'Standard'],
+                  ['high', 'High'],
+                ] as const).map(([key, label]) => (
+                  <button
+                    key={key}
+                    onClick={() => setQuality(key)}
+                    className={
+                      'rounded-md border px-3 py-1 text-sm transition ' +
+                      (quality === key
+                        ? 'border-primary bg-primary/10 text-foreground'
+                        : 'border-border text-muted-foreground hover:border-muted-foreground/60')
+                    }
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Draft renders fastest; High uses slower, higher-fidelity encoding
+                for final delivery.
+              </p>
+            </section>
+
             {/* Advanced */}
             <section className="space-y-1.5">
               <Label className="text-xs text-muted-foreground">
-                Quality (CRF): {crf[0]}
+                Advanced (CRF): {crf[0]}
               </Label>
               <Slider value={crf} min={15} max={28} step={1} onValueChange={setCrf} />
               <p className="text-xs text-muted-foreground">
-                Lower CRF = larger, higher quality. 18 is the default.
+                Lower CRF = larger, higher quality. 18 = auto (quality preset
+                decides); other values override the preset.
               </p>
             </section>
 
@@ -407,7 +508,14 @@ function ExportList({
   existing: Array<{ id: string; preset_id: string; output_path: string | null; file_size_bytes: number | null; created_at: string }>;
 }) {
   const enqueue = useEnqueueExport();
+  const queryClient = useQueryClient();
   const [exportJob, setExportJob] = React.useState<{ id: string; presetId: string } | null>(null);
+
+  const onExportSettled = () => {
+    setExportJob(null);
+    // Refetch so the Download button appears without a manual reload.
+    void queryClient.invalidateQueries({ queryKey: ['exports', reelId] });
+  };
 
   const trigger = async (presetId: string, force = false) => {
     try {
@@ -450,8 +558,8 @@ function ExportList({
                     <JobProgress
                       jobId={exportJob!.id}
                       variant="export"
-                      onDone={() => setExportJob(null)}
-                      onFail={() => setExportJob(null)}
+                      onDone={onExportSettled}
+                      onFail={onExportSettled}
                     />
                   </div>
                 ) : null}
@@ -492,6 +600,192 @@ function ExportList({
             <AlertTitle>Export error</AlertTitle>
             <AlertDescription>{humanMessage(enqueue.error)}</AlertDescription>
           </Alert>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---------- Publish (YouTube) ----------
+
+function PublishPanel({
+  reelId,
+  defaultTitle,
+  defaultDescription,
+  socialExportReady,
+}: {
+  reelId: string;
+  defaultTitle: string;
+  defaultDescription: string;
+  socialExportReady: boolean;
+}) {
+  const accounts = useSocialAccounts();
+  const pubs = usePublications(reelId);
+  const publish = usePublishReel();
+  const queryClient = useQueryClient();
+  const [title, setTitle] = React.useState(defaultTitle);
+  const [description, setDescription] = React.useState(defaultDescription);
+  const [privacy, setPrivacy] = React.useState<'private' | 'unlisted' | 'public'>('private');
+  const [publishJobId, setPublishJobId] = React.useState<string | null>(null);
+
+  const youtube = accounts.data?.accounts.find((a) => a.platform === 'youtube');
+  const publications = pubs.data?.publications ?? [];
+
+  const onSettled = () => {
+    setPublishJobId(null);
+    void queryClient.invalidateQueries({ queryKey: ['publications', reelId] });
+  };
+
+  const trigger = async () => {
+    try {
+      const job = await publish.mutateAsync({
+        reelId,
+        body: {
+          platform: 'youtube',
+          preset_id: 'mp4_h264_social',
+          title,
+          description,
+          privacy,
+        },
+      });
+      setPublishJobId(job.id);
+    } catch {
+      /* surfaced inline */
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Publish</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {!youtube ? (
+          <div className="space-y-2">
+            <p className="text-sm text-muted-foreground">
+              Connect your YouTube channel to publish this reel directly.
+            </p>
+            <a href={`${API_BASE}/api/v1/social/youtube/connect`}>
+              <Button variant="secondary" size="sm">
+                Connect YouTube
+              </Button>
+            </a>
+            <p className="text-xs text-muted-foreground">
+              Requires GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET in your .env —
+              see docs/publishing.md.
+            </p>
+          </div>
+        ) : (
+          <>
+            <p className="text-xs text-muted-foreground">
+              Publishing as{' '}
+              <span className="font-medium text-foreground">
+                {youtube.display_name ?? 'YouTube'}
+              </span>{' '}
+              · uses the MP4 (social) export
+            </p>
+            {!socialExportReady ? (
+              <Alert>
+                <AlertDescription>
+                  Export “MP4 · H.264 (social)” first — publishing uploads that
+                  file.
+                </AlertDescription>
+              </Alert>
+            ) : null}
+            <div className="space-y-1.5">
+              <Label>Title</Label>
+              <Input
+                value={title}
+                maxLength={100}
+                onChange={(e) => setTitle(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Description</Label>
+              <textarea
+                value={description}
+                rows={3}
+                maxLength={4900}
+                onChange={(e) => setDescription(e.target.value)}
+                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Visibility</Label>
+              <div className="flex gap-2">
+                {(['private', 'unlisted', 'public'] as const).map((p) => (
+                  <button
+                    key={p}
+                    onClick={() => setPrivacy(p)}
+                    className={
+                      'rounded-md border px-3 py-1 text-sm capitalize transition ' +
+                      (privacy === p
+                        ? 'border-primary bg-primary/10 text-foreground'
+                        : 'border-border text-muted-foreground hover:border-muted-foreground/60')
+                    }
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {publish.error ? (
+              <Alert variant="destructive">
+                <AlertDescription>{humanMessage(publish.error)}</AlertDescription>
+              </Alert>
+            ) : null}
+            {publishJobId ? (
+              <JobProgress
+                jobId={publishJobId}
+                variant="publish"
+                onDone={onSettled}
+                onFail={onSettled}
+              />
+            ) : (
+              <Button
+                onClick={trigger}
+                disabled={publish.isPending || !socialExportReady || !title.trim()}
+              >
+                <Upload className="h-4 w-4" />
+                {publish.isPending ? 'Starting…' : 'Publish to YouTube'}
+              </Button>
+            )}
+          </>
+        )}
+
+        {publications.length > 0 ? (
+          <div className="space-y-2 border-t pt-3">
+            {publications.map((p) => (
+              <div
+                key={p.id}
+                className="flex items-center justify-between gap-3 text-sm"
+              >
+                <div className="min-w-0">
+                  <div className="truncate">{p.title}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {p.platform} · {p.privacy} ·{' '}
+                    {p.status === 'failed' ? (
+                      <span className="text-destructive">{p.error_message ?? 'failed'}</span>
+                    ) : (
+                      p.status
+                    )}
+                  </div>
+                </div>
+                {p.video_url ? (
+                  <a
+                    href={p.video_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="shrink-0"
+                  >
+                    <Button variant="secondary" size="sm">
+                      View
+                    </Button>
+                  </a>
+                ) : null}
+              </div>
+            ))}
+          </div>
         ) : null}
       </CardContent>
     </Card>

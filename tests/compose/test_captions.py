@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from reelforge_core.compose.captions import (
-    _source_to_mezz_time,
     build_captions,
     words_in_reel,
 )
@@ -103,19 +102,67 @@ def test_slice_words_to_reel_span() -> None:
 
 
 def test_mezzanine_time_subtracts_xfade_overlap() -> None:
+    import tempfile
+
     # 3 scenes of [0-10], [10-20], [20-30]. Reel covers all three. xfade=0.4.
+    # A word at source 12s (scene position 1): mezz = 12 - 1*0.4 = 11.6.
     scenes = [_scene(0, 0, 10), _scene(1, 10, 20), _scene(2, 20, 30)]
-    analysis = _analysis_with_transcript([], scenes)
+    words = [TranscriptWord(start=12.0, end=12.5, word=" hey", probability=0.9)]
+    analysis = _analysis_with_transcript(words, scenes)
     reel = _reel([0, 1, 2], 0.0, 30.0)
+    with tempfile.TemporaryDirectory() as td:
+        out = build_captions(
+            reel, analysis, ComposeConfig(captions=CaptionStyle(mode="static")), Path(td)
+        )
+        dialogues = [
+            line for line in out.read_text().splitlines() if line.startswith("Dialogue:")
+        ]
+        assert len(dialogues) == 1
+        assert dialogues[0].split(",")[1] == "0:00:11.60"
+        assert dialogues[0].split(",")[2] == "0:00:12.10"
 
-    # A word at source time 12s falls into scene 1 at position 1 in the reel.
-    # Mezz time = offset_into_reel(12) - 1 * 0.4 = 12 - 0.4 = 11.6
-    t = _source_to_mezz_time(12.0, reel, analysis, 0.4)
-    assert abs(t - 11.6) < 1e-6
 
-    # A word at 22s falls into scene 2 at position 2. Mezz = 22 - 2*0.4 = 21.2
-    t2 = _source_to_mezz_time(22.0, reel, analysis, 0.4)
-    assert abs(t2 - 21.2) < 1e-6
+def test_beat_trims_shift_caption_times() -> None:
+    import tempfile
+
+    # Same 3-scene reel; beat sync trims 0.5s off clip 0's end. A word in
+    # scene 1 shifts 0.5s earlier: 12 - 0.5 - 0.4 = 11.1.
+    scenes = [_scene(0, 0, 10), _scene(1, 10, 20), _scene(2, 20, 30)]
+    words = [TranscriptWord(start=12.0, end=12.5, word=" hey", probability=0.9)]
+    analysis = _analysis_with_transcript(words, scenes)
+    reel = _reel([0, 1, 2], 0.0, 30.0)
+    with tempfile.TemporaryDirectory() as td:
+        out = build_captions(
+            reel,
+            analysis,
+            ComposeConfig(captions=CaptionStyle(mode="static")),
+            Path(td),
+            end_trims=[0.5, 0.0],
+        )
+        dialogues = [
+            line for line in out.read_text().splitlines() if line.startswith("Dialogue:")
+        ]
+        assert len(dialogues) == 1
+        assert dialogues[0].split(",")[1] == "0:00:11.10"
+
+
+def test_words_in_trimmed_tail_are_dropped() -> None:
+    import tempfile
+
+    # Word at 9.8s sits in the 0.5s tail trimmed off clip 0 -> dropped.
+    scenes = [_scene(0, 0, 10), _scene(1, 10, 20)]
+    words = [TranscriptWord(start=9.7, end=9.95, word=" gone", probability=0.9)]
+    analysis = _analysis_with_transcript(words, scenes)
+    reel = _reel([0, 1], 0.0, 20.0)
+    with tempfile.TemporaryDirectory() as td:
+        out = build_captions(
+            reel,
+            analysis,
+            ComposeConfig(captions=CaptionStyle(mode="static")),
+            Path(td),
+            end_trims=[0.5],
+        )
+        assert "gone" not in out.read_text()
 
 
 def test_build_captions_off_writes_empty_ass() -> None:
@@ -175,3 +222,85 @@ def test_build_captions_karaoke_one_event_per_word() -> None:
             line for line in out.read_text().splitlines() if line.startswith("Dialogue:")
         ]
         assert len(dialogue_lines) == 3
+
+
+def test_karaoke_full_line_visible_with_moving_highlight() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        rd = Path(td)
+        scenes = [_scene(0, 0, 30)]
+        analysis = _analysis_with_transcript(
+            [
+                TranscriptWord(start=1, end=1.5, word=" hi", probability=0.9),
+                TranscriptWord(start=1.6, end=2.2, word=" there", probability=0.9),
+                TranscriptWord(start=2.3, end=3.0, word=" friend", probability=0.9),
+            ],
+            scenes,
+        )
+        reel = _reel([0], 0, 30)
+        cfg = ComposeConfig(captions=CaptionStyle(mode="karaoke"))
+        out = build_captions(reel, analysis, cfg, rd)
+        dialogues = [
+            line for line in out.read_text().splitlines() if line.startswith("Dialogue:")
+        ]
+        assert len(dialogues) == 3
+        # Every event shows the complete line, not just the active word.
+        for d in dialogues:
+            for tok in ("hi", "there", "friend"):
+                assert tok in d
+        # The highlight override moves: event k wraps token k.
+        assert "{\\c&H00FFFF&\\b1}hi{\\r} there friend" in dialogues[0]
+        assert "hi {\\c&H00FFFF&\\b1}there{\\r} friend" in dialogues[1]
+        assert "hi there {\\c&H00FFFF&\\b1}friend{\\r}" in dialogues[2]
+
+
+def test_karaoke_events_are_contiguous_within_line() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        rd = Path(td)
+        scenes = [_scene(0, 0, 30)]
+        analysis = _analysis_with_transcript(
+            [
+                TranscriptWord(start=1, end=1.5, word=" hi", probability=0.9),
+                # 0.4s pause before "there" — the line must not flicker.
+                TranscriptWord(start=1.9, end=2.2, word=" there", probability=0.9),
+            ],
+            scenes,
+        )
+        reel = _reel([0], 0, 30)
+        cfg = ComposeConfig(captions=CaptionStyle(mode="karaoke"))
+        out = build_captions(reel, analysis, cfg, rd)
+        dialogues = [
+            line for line in out.read_text().splitlines() if line.startswith("Dialogue:")
+        ]
+        assert len(dialogues) == 2
+        end_first = dialogues[0].split(",")[2]
+        start_second = dialogues[1].split(",")[1]
+        assert end_first == start_second
+
+
+def test_karaoke_long_text_splits_into_short_lines() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        rd = Path(td)
+        scenes = [_scene(0, 0, 30)]
+        words = [
+            TranscriptWord(start=1 + i * 0.5, end=1.3 + i * 0.5, word=f" word{i}", probability=0.9)
+            for i in range(8)
+        ]
+        analysis = _analysis_with_transcript(words, scenes)
+        reel = _reel([0], 0, 30)
+        cfg = ComposeConfig(captions=CaptionStyle(mode="karaoke", karaoke_max_chars=12))
+        out = build_captions(reel, analysis, cfg, rd)
+        dialogues = [
+            line for line in out.read_text().splitlines() if line.startswith("Dialogue:")
+        ]
+        # Still one event per word...
+        assert len(dialogues) == 8
+        # ...but no event carries more than 2 tokens (12 chars fits "word0 word1").
+        for d in dialogues:
+            text = d.split(",,", 1)[1]
+            assert text.count("word") <= 2

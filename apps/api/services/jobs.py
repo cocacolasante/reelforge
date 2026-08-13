@@ -69,7 +69,10 @@ async def enqueue_job(
         config_json=config.model_dump_json() if config is not None else None,
     )
     db.add(row)
-    await db.flush()
+    # Commit BEFORE enqueueing: the worker can pick the job up immediately,
+    # and its mark_job_running update silently no-ops if our row isn't
+    # committed yet (the job would then appear stuck at "queued").
+    await db.commit()
 
     arq_job = await arq_pool.enqueue_job(
         function_name,

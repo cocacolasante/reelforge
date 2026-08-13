@@ -906,7 +906,7 @@ def cleanup(
     import urllib.error
     import json as _json
 
-    base = os.environ.get("REELFORGE_API_URL", "http://api:8000")
+    base = os.environ.get("REELFORGE_API_URL", "http://api:8001")
     url = f"{base}/api/v1/projects/{project}/cleanup"
     payload = _json.dumps({"mode": mode}).encode()
     if dry_run:

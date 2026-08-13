@@ -3,7 +3,7 @@
 ## Service topology
 
 ```
-       host:3000              host:8000
+       host:3000              host:8001
           │                       │
           ▼                       ▼
      +--------+   fetch     +-----------+    arq   +-----------+

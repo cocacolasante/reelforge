@@ -78,6 +78,12 @@ def select_track(
         matches = [t for t in library if t.mood == "neutral"]
     if not matches:
         return None
+    # Real tracks beat bundled placeholders: the bundled set is synthesized
+    # waveform filler, so whenever the user library covers this mood, pick
+    # only from it.
+    user_matches = [t for t in matches if t.source == "user"]
+    if user_matches:
+        matches = user_matches
     # Stable pick by reel.candidate_id + config.seed
     key = f"{reel.candidate_id}|{config.seed}".encode("utf-8")
     idx = int(hashlib.sha256(key).hexdigest(), 16) % len(matches)

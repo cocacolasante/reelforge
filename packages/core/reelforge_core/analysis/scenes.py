@@ -95,6 +95,53 @@ def _extract_thumb(source: Path, out_path: Path, midpoint_sec: float, width: int
         )
 
 
+def build_scene_models(
+    intervals: list[tuple[float, float]], fps: float
+) -> list[Scene]:
+    """Build re-indexed Scene models (with thumbnail paths) from raw intervals."""
+    return [
+        Scene(
+            index=i,
+            start_sec=start,
+            end_sec=end,
+            start_frame=int(round(start * fps)),
+            end_frame=int(round(end * fps)),
+            thumbnail_path=f"thumbs/scene_{i:04d}.jpg",
+        )
+        for i, (start, end) in enumerate(intervals)
+    ]
+
+
+async def extract_thumbnails(
+    asset: MediaAsset,
+    scenes: list[Scene],
+    working_dir: Path,
+    config: AnalysisConfig,
+    progress: ProgressCallback | None = None,
+) -> None:
+    """Extract one midpoint thumbnail per scene, bounded concurrency."""
+    (working_dir / "thumbs").mkdir(parents=True, exist_ok=True)
+    total = len(scenes)
+    done_count = 0
+    sem = asyncio.Semaphore(4)
+
+    async def _run_one(s: Scene) -> None:
+        midpoint = (s.start_sec + s.end_sec) / 2
+        out_path = working_dir / s.thumbnail_path
+        async with sem:
+            await asyncio.to_thread(
+                _extract_thumb, asset.path, out_path, midpoint, config.thumbnail_width
+            )
+
+    tasks = [asyncio.create_task(_run_one(s)) for s in scenes]
+    for coro in asyncio.as_completed(tasks):
+        await coro
+        done_count += 1
+        if progress is not None:
+            frac = done_count / total if total else 1.0
+            await progress(ProgressEvent("scenes", frac, compute_overall("scenes", frac)))
+
+
 async def detect_scenes(
     asset: MediaAsset,
     working_dir: Path,
@@ -130,39 +177,11 @@ async def detect_scenes(
 
     intervals = merge_short_scenes(intervals, config.min_scene_duration)
 
-    scenes: list[Scene] = []
-    for i, (start, end) in enumerate(intervals):
-        scenes.append(
-            Scene(
-                index=i,
-                start_sec=start,
-                end_sec=end,
-                start_frame=int(round(start * asset.fps)),
-                end_frame=int(round(end * asset.fps)),
-                thumbnail_path=f"thumbs/scene_{i:04d}.jpg",
-            )
-        )
+    scenes = build_scene_models(intervals, asset.fps)
 
     # Parallel thumbnail extraction, bounded concurrency.
-    total = len(scenes)
-    done_count = 0
-    sem = asyncio.Semaphore(4)
     await progress(ProgressEvent("scenes", 0.05, compute_overall("scenes", 0.05)))
-
-    async def _run_one(s: Scene) -> None:
-        midpoint = (s.start_sec + s.end_sec) / 2
-        out_path = working_dir / s.thumbnail_path
-        async with sem:
-            await asyncio.to_thread(
-                _extract_thumb, asset.path, out_path, midpoint, config.thumbnail_width
-            )
-
-    tasks = [asyncio.create_task(_run_one(s)) for s in scenes]
-    for coro in asyncio.as_completed(tasks):
-        await coro
-        done_count += 1
-        frac = done_count / total if total else 1.0
-        await progress(ProgressEvent("scenes", frac, compute_overall("scenes", frac)))
+    await extract_thumbnails(asset, scenes, working_dir, config, progress)
 
     write_json_atomic(working_dir / "scenes.json", [s.model_dump() for s in scenes])
     await progress(ProgressEvent("scenes", 1.0, compute_overall("scenes", 1.0)))

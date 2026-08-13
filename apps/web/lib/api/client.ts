@@ -3,7 +3,7 @@ import { APIError } from './errors';
 
 export const API_BASE =
   (typeof process !== 'undefined' && process.env.NEXT_PUBLIC_API_URL) ||
-  'http://localhost:8000';
+  'http://localhost:8001';
 
 function randomId(): string {
   if (

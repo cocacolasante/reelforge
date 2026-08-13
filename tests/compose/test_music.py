@@ -107,3 +107,41 @@ def test_music_prep_command_has_loop_and_trim() -> None:
     assert "afade=t=in:st=0:d=0.5" in af
     assert "afade=t=out:st=44.000:d=1.0" in af
     assert "volume=" in af
+
+
+def test_select_track_prefers_user_tracks_over_bundled() -> None:
+    """When both a bundled placeholder and a user-library track match the
+    mood, the user track must always win — the bundled set is synthesized
+    filler audio."""
+    bundled = _track("joyful-01", "joyful")
+    user = MusicTrack(
+        id="joyful-oga-bossa",
+        path="/data/music/joyful-oga-bossa.mp3",
+        source="user",
+        bpm=129,
+        mood="joyful",
+        duration_sec=59.6,
+        license="CC0",
+        attribution="8bit Bossa by Joth (OpenGameArt.org, CC0)",
+    )
+    for seed in range(5):
+        picked = select_track(
+            [bundled, user], ComposeConfig(seed=seed), _reel("joyful", cid=f"c{seed}")
+        )
+        assert picked is not None and picked.id == "joyful-oga-bossa"
+
+
+def test_select_track_uses_bundled_when_no_user_match() -> None:
+    bundled = _track("somber-01", "somber")
+    user_other_mood = MusicTrack(
+        id="joyful-oga-bossa",
+        path="/data/music/joyful-oga-bossa.mp3",
+        source="user",
+        bpm=129,
+        mood="joyful",
+        duration_sec=59.6,
+        license="CC0",
+        attribution=None,
+    )
+    picked = select_track([bundled, user_other_mood], ComposeConfig(), _reel("somber"))
+    assert picked is not None and picked.id == "somber-01"

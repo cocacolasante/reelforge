@@ -31,7 +31,7 @@ export default function HomePage() {
           <div>
             <h1 className="text-3xl font-semibold tracking-tight">Projects</h1>
             <p className="text-sm text-muted-foreground">
-              Each project holds one source video and the reels you extract from it.
+              Each project holds your source footage — one clip or many — and the reels you extract from it.
             </p>
           </div>
           <NewProjectButton />

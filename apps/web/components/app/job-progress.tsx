@@ -8,7 +8,7 @@ import { Progress } from '@/components/ui/progress';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 
-export type JobVariant = 'analyze' | 'select' | 'compose' | 'export';
+export type JobVariant = 'analyze' | 'select' | 'compose' | 'export' | 'publish';
 
 const ANALYZE_STAGES = ['probe', 'scenes', 'transcribe', 'loudness', 'semantics'];
 const COMPOSE_STAGES = ['prepare', 'clips', 'captions', 'music', 'render', 'finalize'];

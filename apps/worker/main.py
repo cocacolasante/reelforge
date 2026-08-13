@@ -12,6 +12,7 @@ from apps.worker.jobs import (
     compile_montage_job,
     compose_reel_job,
     export_reel_job,
+    publish_reel_job,
     select_reels_job,
 )
 from apps.worker.logging_config import configure_logging
@@ -71,6 +72,7 @@ class WorkerSettings:
         compose_reel_job,
         export_reel_job,
         compile_montage_job,
+        publish_reel_job,
     ]
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
     # analyze_asset legitimately runs up to an hour on long sources; compose +

@@ -155,9 +155,13 @@ def test_build_command_low_energy_scenes_get_kenburns() -> None:
         ),
         output_path=Path("/tmp/out.mp4"),
     )
-    assert "zoompan=" in plan.filter_complex
-    # Expect one zoompan per low-energy clip
-    assert plan.filter_complex.count("zoompan=") == 2
+    fc = plan.filter_complex
+    # Ken Burns is now constant-zoom + animated crop (zoompan was ~10x
+    # slower). One scale+crop pair per low-energy clip; 1080x1920 * 1.10
+    # rounds to 1188x2112.
+    assert "zoompan" not in fc
+    assert fc.count("scale=1188:2112,crop=1080:1920:") == 2
+    assert "x='(iw-ow)*min(t/10.000\\,1)'" in fc
 
 
 def test_build_command_includes_deterministic_flags() -> None:
@@ -175,3 +179,58 @@ def test_build_command_includes_deterministic_flags() -> None:
     joined = " ".join(plan.args)
     assert "+bitexact" in joined
     assert "creation_time=1970-01-01T00:00:00Z" in joined
+
+
+def test_final_bus_loudnorm_present_by_default() -> None:
+    clips = [_clip(0, 15.0)]
+    plan = build_final_command(
+        clips=clips,
+        analysis=_analysis(1),
+        music_path=Path("/tmp/music.wav"),
+        captions_path=None,
+        config=ComposeConfig(effects=EffectsConfig(unsharp=False, ken_burns_on_low_energy=False)),
+        output_path=Path("/tmp/mezz.mp4"),
+    )
+    fc = plan.filter_complex
+    # Three loudnorms: voice stem, music stem, and the final mixed bus.
+    assert fc.count("loudnorm=") == 3
+    # Final bus targets the social-platform level and resamples back to 48k.
+    assert "I=-14.0" in fc
+    assert "[anorm]" in fc
+    assert "[afinal]" in fc
+
+
+def test_final_bus_loudnorm_disabled() -> None:
+    clips = [_clip(0, 15.0)]
+    plan = build_final_command(
+        clips=clips,
+        analysis=_analysis(1),
+        music_path=None,
+        captions_path=None,
+        config=ComposeConfig(
+            normalize_loudness=False,
+            effects=EffectsConfig(unsharp=False, ken_burns_on_low_energy=False),
+        ),
+        output_path=Path("/tmp/mezz.mp4"),
+    )
+    fc = plan.filter_complex
+    # Only the voice-stem loudnorm remains; the bus passes through anull.
+    assert fc.count("loudnorm=") == 1
+    assert "[anorm]" not in fc
+    assert "anull" in fc
+    assert "[afinal]" in fc
+
+
+def test_final_bus_has_brickwall_limiter() -> None:
+    clips = [_clip(0, 15.0)]
+    plan = build_final_command(
+        clips=clips,
+        analysis=_analysis(1),
+        music_path=None,
+        captions_path=None,
+        config=ComposeConfig(effects=EffectsConfig(unsharp=False, ken_burns_on_low_energy=False)),
+        output_path=Path("/tmp/mezz.mp4"),
+    )
+    fc = plan.filter_complex
+    # -1.5 dBTP -> 10^(-1.5/20) = 0.8414 linear
+    assert "alimiter=limit=0.8414:level=false:latency=true" in fc

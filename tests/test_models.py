@@ -109,3 +109,24 @@ def test_analysis_report_json_roundtrip() -> None:
         anthropic_usage={"input_tokens": 0, "output_tokens": 0, "cache_hits": 0},
     )
     assert AnalysisReport.model_validate_json(r.model_dump_json()) == r
+
+
+def test_quality_presets_map_both_encode_stages():
+    from reelforge_core.models import ComposeConfig
+
+    high = ComposeConfig(quality="high")
+    assert (high.effective_mezz_preset, high.effective_mezz_crf) == ("slow", 16)
+    assert (high.clip_preset, high.clip_crf) == ("fast", 16)
+    draft = ComposeConfig(quality="draft")
+    assert (draft.effective_mezz_preset, draft.effective_mezz_crf) == ("veryfast", 20)
+    std = ComposeConfig()
+    assert (std.effective_mezz_preset, std.effective_mezz_crf) == ("medium", 18)
+    assert (std.clip_preset, std.clip_crf) == ("ultrafast", 18)
+
+
+def test_quality_explicit_crf_and_preset_override():
+    from reelforge_core.models import ComposeConfig
+
+    cfg = ComposeConfig(quality="high", video_crf=22, video_preset="veryfast")
+    assert cfg.effective_mezz_crf == 22
+    assert cfg.effective_mezz_preset == "veryfast"

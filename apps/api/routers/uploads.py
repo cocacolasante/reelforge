@@ -38,6 +38,21 @@ def _final_path(asset_id: str, filename: str) -> Path:
     return settings.data_dir / "uploads" / f"{asset_id}.{ext}"
 
 
+def _received_chunk_indices(s: dbmod.UploadSession) -> list[int]:
+    if s.status != "active":
+        return []
+    parts_dir = Path(s.parts_dir)
+    if not parts_dir.is_dir():
+        return []
+    out: list[int] = []
+    for p in parts_dir.glob("chunk_*.bin"):
+        try:
+            out.append(int(p.stem.split("_")[-1]))
+        except ValueError:  # pragma: no cover - foreign file in parts dir
+            continue
+    return sorted(out)
+
+
 def _to_session_out(s: dbmod.UploadSession) -> UploadSessionOut:
     return UploadSessionOut(
         id=s.id,
@@ -50,6 +65,7 @@ def _to_session_out(s: dbmod.UploadSession) -> UploadSessionOut:
         status=s.status,  # type: ignore[arg-type]
         asset_id=s.asset_id,
         created_at=s.created_at,
+        received_chunk_indices=_received_chunk_indices(s),
     )
 
 
@@ -152,6 +168,10 @@ async def put_chunk(
             f"chunk size mismatch: got {declared}, expected {expected}",
         )
 
+    # The parts dir can vanish out from under an active session (manual
+    # cleanup, crash between purge steps). Recreate it so a resuming client
+    # re-uploads gracefully instead of hitting an unhandled 500.
+    Path(s.parts_dir).mkdir(parents=True, exist_ok=True)
     chunk_path = Path(s.parts_dir) / f"chunk_{chunk_index:08d}.bin"
     tmp_path = chunk_path.with_suffix(".tmp")
 
@@ -191,13 +211,19 @@ async def complete_upload(
         raise ApiError(404, "UPLOAD_SESSION_NOT_FOUND", f"upload {upload_id} not found")
     if s.status != "active":
         raise ApiError(409, "UPLOAD_ALREADY_COMPLETED", f"upload status={s.status}")
-    if s.received_bytes != s.total_bytes:
+    # Recompute from disk rather than trusting the stored counter: parallel
+    # chunk PUTs can race their sum-then-commit and persist a short total even
+    # though every chunk landed. Disk is the source of truth.
+    received = sum(
+        p.stat().st_size for p in Path(s.parts_dir).glob("chunk_*.bin")
+    )
+    if received != s.total_bytes:
         raise ApiError(
             400,
             "UPLOAD_CHUNK_OUT_OF_ORDER",
-            f"expected {s.total_bytes} bytes; received {s.received_bytes}",
+            f"expected {s.total_bytes} bytes; received {received}",
             total_bytes=s.total_bytes,
-            received_bytes=s.received_bytes,
+            received_bytes=received,
         )
 
     parts_dir = Path(s.parts_dir)
@@ -282,6 +308,10 @@ async def abort_upload(
     s = await db.get(dbmod.UploadSession, upload_id)
     if s is None:
         raise ApiError(404, "UPLOAD_SESSION_NOT_FOUND", f"upload {upload_id} not found")
+    if s.status == "completed":
+        # Aborting a finished upload must not clobber its status — the asset
+        # already exists and the parts dir was consumed by assembly.
+        raise ApiError(409, "UPLOAD_ALREADY_COMPLETED", "upload already completed")
     shutil.rmtree(Path(s.parts_dir), ignore_errors=True)
     s.status = "aborted"
     s.completed_at = datetime.now(timezone.utc)

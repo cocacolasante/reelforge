@@ -479,6 +479,7 @@ async def _rank_batched(
     all_reels: list[RankedReel] = []
     usage = UsageTotals()
     all_raw: list[dict] = []
+    seen_raw_ids: set[str] = set()
 
     step = BATCH_SIZE - BATCH_OVERLAP
     for start in range(0, len(candidates), step):
@@ -492,9 +493,16 @@ async def _rank_batched(
                 continue
             seen_ids.add(reel.candidate_id)
             all_reels.append(reel)
-        all_raw.extend(
-            r for r in result.raw_rankings if r.get("candidate_id") not in seen_ids
-        )
+        # Dedup raw rankings across overlapping batches with their own seen-set.
+        # (Filtering against seen_ids here would drop nearly everything — it
+        # was just updated with this batch's ids above.)
+        for r in result.raw_rankings:
+            cid = r.get("candidate_id")
+            if cid in seen_raw_ids:
+                continue
+            if cid is not None:
+                seen_raw_ids.add(cid)
+            all_raw.append(r)
         usage.input_tokens += result.usage.input_tokens
         usage.output_tokens += result.usage.output_tokens
         if start + BATCH_SIZE >= len(candidates):

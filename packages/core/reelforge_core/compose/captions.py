@@ -2,8 +2,12 @@
 
 Two caption modes:
 - static: multi-word lines, each displayed for the full line duration.
-- karaoke: per-word replacement — each `TranscriptWord` becomes its own Dialogue
-  event at the word's start/end. Simpler and more reliable than libass `\\k` tags.
+- karaoke: TikTok-style word highlight — words are grouped into short lines,
+  the whole line stays on screen for its duration, and the currently-spoken
+  word is re-colored via an inline override. Implemented as one Dialogue per
+  word interval (each carrying the full line text) rather than libass `\\k`
+  tags, which keeps the timing under our control and renders identically
+  everywhere libass runs.
 
 Timeline: xfade overlaps clips, so the mezzanine is shorter than the sum of clip
 durations by `(n_clips - 1) * transition.duration_sec`. For each caption word at
@@ -105,6 +109,21 @@ def _event(start: float, end: float, text: str, *, layer: int = 0) -> str:
     )
 
 
+def _event_raw(start: float, end: float, text: str, *, layer: int = 0) -> str:
+    """Like _event, but `text` may contain ASS override tags — the caller is
+    responsible for escaping the literal tokens."""
+    return (
+        f"Dialogue: {layer},{_fmt_time(start)},{_fmt_time(end)},Default,,0,0,0,,"
+        f"{text}\n"
+    )
+
+
+def _inline_color(ass_color: str) -> str:
+    """Convert a style color (&HAABBGGRR) into an inline \\c override (&HBBGGRR&)."""
+    hexpart = ass_color.strip().removeprefix("&H").removesuffix("&")
+    return f"\\c&H{hexpart[-6:]}&"
+
+
 # ---------------------------------------------------------------------------
 # Transcript slicing + mezzanine-time mapping
 # ---------------------------------------------------------------------------
@@ -124,35 +143,6 @@ def words_in_reel(
                 continue
             out.append(w)
     return out
-
-
-def _source_to_mezz_time(
-    t: float, reel: RankedReel, analysis: AnalysisReport, xfade_dur: float
-) -> float:
-    """Map a source timestamp `t` into the mezzanine timeline.
-
-    Scenes in the reel are concatenated with xfade overlaps: every transition
-    "reclaims" `xfade_dur` from the timeline. Find which scene `t` falls in
-    (by reel position), then subtract `position * xfade_dur` from the offset
-    into the reel span.
-    """
-    local = t - reel.start_sec
-    # Walk the reel's scenes and find the position of t
-    cumulative = 0.0
-    for position, scene_idx in enumerate(reel.scene_indices):
-        scene = analysis.scenes[scene_idx]
-        dur = scene.end_sec - scene.start_sec
-        if scene.start_sec <= t <= scene.end_sec + 1e-6:
-            offset_into_scene = max(0.0, t - scene.start_sec)
-            # Subtract xfade from the cumulative of earlier transitions,
-            # plus the half-overlap the current scene starts being drawn early by.
-            return max(0.0, cumulative + offset_into_scene - position * xfade_dur)
-        cumulative += dur
-    # Fallback: clamp to reel span minus overlap.
-    return max(
-        0.0,
-        local - max(0, len(reel.scene_indices) - 1) * xfade_dur,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +224,7 @@ def build_captions(
     analysis: AnalysisReport,
     config: ComposeConfig,
     reel_dir: Path,
+    end_trims: list[float] | None = None,
 ) -> Path:
     """Produce `captions.ass` on disk. Always writes a valid ASS file.
 
@@ -267,19 +258,77 @@ def build_captions(
         config.transition.duration_sec if config.transition.kind != "cut" else 0.0
     )
 
-    def _mt(t: float) -> float:
-        return _source_to_mezz_time(t, reel, analysis, xfade_dur)
+    # Build the source→mezzanine mapping from the ACTUAL rendered clip
+    # bounds: clip_bounds folds in user trims + speech-safe snapping (against
+    # the ORIGINAL transcript — the one clip extraction saw), and `end_trims`
+    # carries the beat-sync shortenings. Words falling in content that was
+    # trimmed away are dropped.
+    from reelforge_core.compose.clips import clip_bounds
+
+    n = len(reel.scene_indices)
+    segments_map: list[tuple[float, float, float]] = []  # (src_start, src_end, mezz_start)
+    cum = 0.0
+    for position, idx in enumerate(reel.scene_indices):
+        scene = analysis.scenes[idx]
+        s, e = clip_bounds(position, n, scene, config, analysis)
+        if end_trims is not None and position < n - 1 and position < len(end_trims):
+            e = max(s + 0.5, e - end_trims[position])
+        segments_map.append((s, e, cum - position * xfade_dur))
+        cum += e - s
+
+    def _mt(t: float) -> float | None:
+        for s, e, mezz_start in segments_map:
+            if s <= t <= e + 1e-6:
+                return max(0.0, mezz_start + (t - s))
+        return None
+
+    words = [w for w in words if _mt((w.start + w.end) / 2.0) is not None]
+    if not words:
+        write_text_atomic(out_path, EMPTY_ASS.format(w=width, h=height))
+        return out_path
+
+    def _mtw(t: float, w: TranscriptWord) -> float:
+        """Map `t`, falling back to the word's midpoint (guaranteed mapped —
+        words whose midpoints don't map were filtered above)."""
+        v = _mt(t)
+        if v is None:
+            v = _mt((w.start + w.end) / 2.0)
+        return v if v is not None else 0.0
 
     buf = [_header(width, height, config.captions)]
 
     if mode == "karaoke":
-        # One event per word; position identical (default Dialogue alignment).
-        for w in words:
-            start = _mt(w.start)
-            end = _mt(w.end)
-            if end <= start:
-                end = start + 0.15
-            buf.append(_event(start, end, w.word.strip()))
+        # TikTok-style word highlight: group words into short single lines;
+        # the full line stays visible for its whole duration and each word
+        # gets an inline color override while it's being spoken. One Dialogue
+        # per word interval — event k ends exactly when event k+1 starts, so
+        # the line never flickers.
+        highlight = _inline_color(config.captions.highlight_color)
+        chunks = _chunk_words_to_lines(
+            words, config.captions.karaoke_max_chars, max_lines=1
+        )
+        for chunk in chunks:
+            cw = [w for w in chunk if w.word.strip()]
+            if not cw:
+                continue
+            tokens = [_escape_text(w.word.strip()) for w in cw]
+            for k, w in enumerate(cw):
+                # First event starts at the line's first word; middle events
+                # hand off at the NEXT word's start so pauses inside the line
+                # hold the current highlight instead of dropping the caption.
+                start = _mtw(cw[0].start, cw[0]) if k == 0 else _mtw(w.start, w)
+                end = (
+                    _mtw(cw[k + 1].start, cw[k + 1])
+                    if k + 1 < len(cw)
+                    else _mtw(cw[-1].end, cw[-1])
+                )
+                if end <= start:
+                    end = start + 0.15
+                line = " ".join(
+                    f"{{{highlight}\\b1}}{tok}{{\\r}}" if j == k else tok
+                    for j, tok in enumerate(tokens)
+                )
+                buf.append(_event_raw(start, end, line))
     else:
         # Static mode: group words into multi-line events.
         events = _chunk_words_to_lines(
@@ -288,8 +337,8 @@ def build_captions(
         for ev in events:
             if not ev:
                 continue
-            start = _mt(ev[0].start)
-            end = _mt(ev[-1].end)
+            start = _mtw(ev[0].start, ev[0])
+            end = _mtw(ev[-1].end, ev[-1])
             if end <= start:
                 end = start + 0.3
             text = _event_text(ev, config.captions.max_chars_per_line)

@@ -10,7 +10,7 @@ compose up` to downloaded MP4 in under 15 minutes.
 2. Start stopwatch at `git clone`.
 3. `cp .env.example .env` + paste `ANTHROPIC_API_KEY`.
 4. `docker compose up -d` — build images, bring up stack.
-5. Wait until `curl -fsS http://localhost:8000/health | jq .status` returns
+5. Wait until `curl -fsS http://localhost:8001/health | jq .status` returns
    `"ok"`.
 6. Open `http://localhost:3000/`, create a project.
 7. Drop in a ~2-minute test video (we use the synthetic 120-s fixture
