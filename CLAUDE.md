@@ -22,8 +22,17 @@ in Docker; the only host requirement is Docker Engine ≥ 24 + Compose v2.
       -14 LUFS loudness, karaoke captions, speech-safe cuts, beat sync,
       auto-reframe, encode-quality knob (2026-08-12/13)
 - [x] Phase 9 — YouTube publishing: OAuth connect + resumable upload job + UI
-      (`docs/publishing.md`; needs user's GOOGLE_CLIENT_ID/SECRET in .env)
-- [ ] Phase 10+ — not started (next: Instagram/TikTok publishing)
+      (`docs/publishing.md`; needs user's GOOGLE_CLIENT_ID/SECRET in .env).
+      Verified live 2026-08-14 (multi-channel picker; first publish landed).
+- [x] Phase 10 — Instagram + TikTok publishing. Instagram: Reels container
+      flow — Meta FETCHES the video, so it needs the cloudflared tunnel
+      (`--profile tunnel`) + REELFORGE_PUBLIC_MEDIA_BASE + tokened
+      `/public/media/{token}` route. TikTok: FILE_UPLOAD to the user's
+      TikTok INBOX (unaudited apps can't direct-post; user finishes in-app);
+      access tokens rotate on refresh — always persist the returned
+      refresh_token. Platform dispatch in `publish_reel_job`; per-platform
+      OAuth in `routers/social.py`; UI platform tabs in PublishPanel.
+- [ ] Phase 11+ — not started
 
 ## Topology
 ```
@@ -249,6 +258,12 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   Logged at WARNING so it's visible in `docker compose logs worker`.
 - **SQLite WAL on a bind mount** creates `reelforge.db-wal` and
   `reelforge.db-shm` next to the DB. `.gitignore` excludes both.
+- **NEVER open /data/reelforge.db from the macOS host while containers run.**
+  WAL mode requires all connections to share one kernel's shm mapping;
+  host-side reads through Docker's VirtioFS corrupted the DB on 2026-08-14
+  ("database disk image is malformed"). Inspect via
+  `docker exec reelforge-api-1 python -c ...` instead. Recovery if it ever
+  recurs: stop everything, `sqlite3 db ".recover" | sqlite3 new.db`, swap in.
 - **Two worker replicas** share `/data/reelforge.db`. WAL mode handles
   concurrent reads; writes are serialized per-connection by SQLite. That's
   fine for this workload (semantics upserts are rare and small).

@@ -87,6 +87,22 @@ services:
       - whisper_models:/models/whisper
     networks: [reelforge_net]
 
+  # Public tunnel for Instagram publishing: Meta's servers must FETCH the
+  # video, so the API needs a public HTTPS URL. Quick tunnels need no
+  # Cloudflare account; the random URL is printed in this service's logs:
+  #   docker compose --profile tunnel up -d tunnel
+  #   docker compose logs tunnel | grep trycloudflare
+  # Put that URL in .env as REELFORGE_PUBLIC_MEDIA_BASE and restart the
+  # worker. The URL changes each time the tunnel restarts.
+  tunnel:
+    image: cloudflare/cloudflared:2025.8.1
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate --url http://api:8001
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [reelforge_net]
+
 volumes:
   whisper_models:
 

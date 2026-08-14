@@ -29,6 +29,7 @@ from reelforge_core.models import (
     AnalysisConfig,
     AnalysisReport,
     ComposeConfig,
+    ProgressEvent,
     ReelSelection,
     SelectionConfig,
 )
@@ -375,8 +376,20 @@ async def export_reel_job(
     return result
 
 
+# ---------------------------------------------------------------------------
+# publish_reel_job (Phase 9+) — YouTube / Instagram / TikTok
+# ---------------------------------------------------------------------------
+
+
 async def publish_reel_job(ctx: dict, publication_id: str) -> dict:
-    """Upload a finished export to the connected social account."""
+    """Upload a finished export to the publication's connected account.
+
+    Dispatches on the publication's platform:
+    - youtube:   resumable upload -> public watch URL
+    - instagram: Meta fetches our tokened public media URL -> permalink
+    - tiktok:    direct file upload to the user's TikTok inbox (they finish
+                 captioning/posting in the TikTok app)
+    """
     import asyncio
 
     from reelforge_core.publish import store as pub_store
@@ -389,21 +402,33 @@ async def publish_reel_job(ctx: dict, publication_id: str) -> dict:
 
     await db.record_job_start(job_id, kind="publish_reel", asset_id=None)
     on_progress = make_throttled_progress_writer(redis, job_id)
+    loop = asyncio.get_running_loop()
+
+    def _cb(frac: float) -> None:
+        fut = asyncio.run_coroutine_threadsafe(
+            on_progress(ProgressEvent("upload", frac, frac)), loop
+        )
+        try:
+            fut.result(timeout=5)
+        except Exception:
+            pass
 
     try:
         pub = await asyncio.to_thread(pub_store.get_publication, publication_id)
         if pub is None:
             raise RuntimeError(f"publication {publication_id} not found")
-        account = await asyncio.to_thread(pub_store.get_account, pub["platform"])
+        platform = pub["platform"]
+        if pub.get("account_id"):
+            account = await asyncio.to_thread(
+                pub_store.get_account_by_id, pub["account_id"]
+            )
+        else:  # pre-multi-channel rows
+            account = await asyncio.to_thread(pub_store.get_account, platform)
         if account is None:
-            raise RuntimeError(f"no {pub['platform']} account connected")
+            raise RuntimeError(
+                f"the {platform} account for this publication is no longer connected"
+            )
 
-        client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
-        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-        if not client_id or not client_secret:
-            raise RuntimeError("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not configured")
-
-        # Reels row -> asset id for the output path.
         from reelforge_core.publish.store import _conn  # reuse the sync conn
 
         def _asset_id() -> str | None:
@@ -425,37 +450,101 @@ async def publish_reel_job(ctx: dict, publication_id: str) -> dict:
         await asyncio.to_thread(pub_store.mark_publication_running, publication_id)
         await on_progress(ProgressEvent("upload", 0.02, 0.02))
 
-        access_token = await asyncio.to_thread(
-            youtube.refresh_access_token,
-            client_id,
-            client_secret,
-            account["refresh_token"],
-        )
-        await asyncio.to_thread(
-            pub_store.update_account_access_token, pub["platform"], access_token
-        )
-
-        loop = asyncio.get_running_loop()
-
-        def _cb(frac: float) -> None:
-            fut = asyncio.run_coroutine_threadsafe(
-                on_progress(ProgressEvent("upload", frac, frac)), loop
+        if platform == "youtube":
+            client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+            client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+            if not client_id or not client_secret:
+                raise RuntimeError("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not configured")
+            access_token = await asyncio.to_thread(
+                youtube.refresh_access_token,
+                client_id,
+                client_secret,
+                account["refresh_token"],
             )
-            try:
-                fut.result(timeout=5)
-            except Exception:
-                pass
+            await asyncio.to_thread(
+                pub_store.update_account_access_token, account["id"], access_token
+            )
+            video_id = await asyncio.to_thread(
+                youtube.upload_video,
+                access_token,
+                video_path,
+                title=pub["title"],
+                description=pub["description"] or "",
+                privacy=pub["privacy"] or "private",
+                progress_cb=_cb,
+            )
+            url = youtube.video_url(video_id)
 
-        video_id = await asyncio.to_thread(
-            youtube.upload_video,
-            access_token,
-            video_path,
-            title=pub["title"],
-            description=pub["description"] or "",
-            privacy=pub["privacy"] or "private",
-            progress_cb=_cb,
-        )
-        url = youtube.video_url(video_id)
+        elif platform == "instagram":
+            from reelforge_core.publish import instagram
+
+            public_base = os.environ.get("REELFORGE_PUBLIC_MEDIA_BASE", "").rstrip("/")
+            if not public_base:
+                raise RuntimeError(
+                    "REELFORGE_PUBLIC_MEDIA_BASE not configured — Instagram needs "
+                    "a public tunnel to fetch the video (docs/publishing.md)"
+                )
+            if not pub.get("public_token"):
+                raise RuntimeError("publication has no public media token")
+            access_token = account["access_token"]
+            # Long-lived tokens self-refresh (>=24h old). Best effort: on
+            # success persist; on failure keep the stored token (it may still
+            # be valid for weeks).
+            try:
+                refreshed = await asyncio.to_thread(instagram.refresh_token, access_token)
+                access_token = refreshed["access_token"]
+                await asyncio.to_thread(
+                    pub_store.update_account_tokens, account["id"], access_token
+                )
+            except Exception:
+                log.info("instagram token refresh skipped (token too new or transient)")
+            extra_data = json.loads(account.get("extra_json") or "{}")
+            ig_user_id = extra_data.get("user_id") or account["external_id"]
+            video_url = f"{public_base}/api/v1/public/media/{pub['public_token']}"
+            caption = pub["title"]
+            if pub.get("description"):
+                caption = f"{pub['title']}\n\n{pub['description']}"
+            video_id, permalink = await asyncio.to_thread(
+                instagram.publish_reel,
+                access_token,
+                ig_user_id,
+                video_url,
+                caption,
+                _cb,
+            )
+            url = permalink
+
+        elif platform == "tiktok":
+            from reelforge_core.publish import tiktok
+
+            client_key = os.environ.get("TIKTOK_CLIENT_KEY", "")
+            client_secret = os.environ.get("TIKTOK_CLIENT_SECRET", "")
+            if not client_key or not client_secret:
+                raise RuntimeError("TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET not configured")
+            tokens = await asyncio.to_thread(
+                tiktok.refresh_tokens,
+                client_key,
+                client_secret,
+                account["refresh_token"],
+            )
+            # TikTok rotates refresh tokens — persist whatever came back.
+            await asyncio.to_thread(
+                pub_store.update_account_tokens,
+                account["id"],
+                tokens["access_token"],
+                tokens.get("refresh_token"),
+            )
+            video_id = await asyncio.to_thread(
+                tiktok.upload_to_inbox,
+                tokens["access_token"],
+                video_path,
+                _cb,
+            )
+            url = None  # user finishes the post inside the TikTok app
+
+        else:
+            raise RuntimeError(f"unsupported platform {platform!r}")
+
         await asyncio.to_thread(
             pub_store.mark_publication_done, publication_id, video_id, url
         )
@@ -474,6 +563,7 @@ async def publish_reel_job(ctx: dict, publication_id: str) -> dict:
 
     result = {
         "publication_id": publication_id,
+        "platform": platform,
         "video_id": video_id,
         "video_url": url,
     }

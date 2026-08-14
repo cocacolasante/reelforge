@@ -235,6 +235,7 @@ export function usePublishReel() {
       reelId: string;
       body: {
         platform: string;
+        account_id: string;
         preset_id: string;
         title: string;
         description: string;

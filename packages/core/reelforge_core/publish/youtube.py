@@ -99,7 +99,13 @@ def refresh_access_token(client_id: str, client_secret: str, refresh_token: str)
     return resp.json()["access_token"]
 
 
-def fetch_channel_title(access_token: str) -> str:
+def fetch_channel_info(access_token: str) -> dict:
+    """Return {"id", "title"} for the channel this token is scoped to.
+
+    A Google login with multiple YouTube channels grants tokens for ONE
+    channel (whichever the user picked on Google's account-chooser screen),
+    so `mine=true` always resolves unambiguously.
+    """
     import httpx
 
     resp = httpx.get(
@@ -113,7 +119,7 @@ def fetch_channel_title(access_token: str) -> str:
     items = resp.json().get("items", [])
     if not items:
         raise PublishError("no YouTube channel found on this Google account")
-    return items[0]["snippet"]["title"]
+    return {"id": items[0]["id"], "title": items[0]["snippet"]["title"]}
 
 
 def upload_video(

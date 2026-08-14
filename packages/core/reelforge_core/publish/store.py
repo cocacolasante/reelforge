@@ -37,16 +37,48 @@ def _now() -> str:
 
 
 def get_account(platform: str) -> dict[str, Any] | None:
+    """First (oldest-connected) account for a platform — fallback for
+    publications created before multi-channel support."""
     row = _conn().execute(
-        "SELECT * FROM social_accounts WHERE platform = ?", (platform,)
+        "SELECT * FROM social_accounts WHERE platform = ? ORDER BY created_at LIMIT 1",
+        (platform,),
     ).fetchone()
     return dict(row) if row else None
 
 
-def update_account_access_token(platform: str, access_token: str) -> None:
+def get_account_by_id(account_id: str) -> dict[str, Any] | None:
+    row = _conn().execute(
+        "SELECT * FROM social_accounts WHERE id = ?", (account_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def update_account_access_token(account_id: str, access_token: str) -> None:
     _conn().execute(
-        "UPDATE social_accounts SET access_token = ? WHERE platform = ?",
-        (access_token, platform),
+        "UPDATE social_accounts SET access_token = ? WHERE id = ?",
+        (access_token, account_id),
+    )
+
+
+def update_account_tokens(
+    account_id: str,
+    access_token: str,
+    refresh_token: str | None = None,
+    token_expires_at: str | None = None,
+) -> None:
+    """Persist rotated tokens (TikTok rotates refresh tokens; Instagram
+    refreshes its single long-lived token)."""
+    sets = ["access_token = ?"]
+    params: list[Any] = [access_token]
+    if refresh_token is not None:
+        sets.append("refresh_token = ?")
+        params.append(refresh_token)
+    if token_expires_at is not None:
+        sets.append("token_expires_at = ?")
+        params.append(token_expires_at)
+    params.append(account_id)
+    _conn().execute(
+        f"UPDATE social_accounts SET {', '.join(sets)} WHERE id = ?", params
     )
 
 

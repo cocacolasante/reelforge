@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
-from sqlalchemy import event
+from sqlalchemy import UniqueConstraint, event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import Field, SQLModel
@@ -124,13 +124,23 @@ class Export(SQLModel, table=True):
 
 
 class SocialAccount(SQLModel, table=True):
+    """One row per connected channel/identity. A Google login with several
+    YouTube channels (brand accounts) authorizes ONE channel per OAuth grant,
+    so users connect each channel they want and pick one at publish time."""
+
     __tablename__ = "social_accounts"
+    __table_args__ = (UniqueConstraint("platform", "external_id"),)
 
     id: str = Field(default_factory=_uuid, primary_key=True)
-    platform: str = Field(index=True, unique=True)  # "youtube" | ...
+    platform: str = Field(index=True)  # "youtube" | "instagram" | "tiktok"
+    external_id: str = Field(index=True)  # channel id / ig user id / open_id
     access_token: str
+    # Instagram has no refresh token (the long-lived access token refreshes
+    # itself); stored as "" there.
     refresh_token: str
     display_name: Optional[str] = None  # channel / account title
+    token_expires_at: Optional[datetime] = None
+    extra_json: Optional[str] = None  # platform-specific ids (ig user_id, open_id)
     created_at: datetime = Field(default_factory=_now)
 
 
@@ -140,6 +150,11 @@ class Publication(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
     reel_id: str = Field(foreign_key="reels.id", index=True)
     platform: str = Field(index=True)
+    account_id: Optional[str] = Field(default=None, index=True)
+    channel_title: Optional[str] = None  # display snapshot at publish time
+    # Random token guarding the public media URL Meta fetches during an
+    # Instagram publish. Null for platforms that upload directly.
+    public_token: Optional[str] = None
     preset_id: str
     title: str
     description: str = ""
@@ -229,7 +244,50 @@ async def create_all(engine: AsyncEngine) -> None:
         col_names = {c[1] for c in cols}
         if cols and "id" not in col_names:
             await conn.execute(text("DROP TABLE jobs"))
+        # social_accounts gained external_id (multi-channel support) right
+        # after the feature shipped; no accounts could exist under the old
+        # single-channel schema, so drop-and-recreate is safe.
+        social_cols = {
+            c[1]
+            for c in (
+                await conn.execute(text("PRAGMA table_info(social_accounts)"))
+            ).fetchall()
+        }
+        if social_cols and "external_id" not in social_cols:
+            await conn.execute(text("DROP TABLE social_accounts"))
         await conn.run_sync(SQLModel.metadata.create_all)
+        # Additive publications columns (multi-channel support).
+        pub_cols = {
+            c[1]
+            for c in (
+                await conn.execute(text("PRAGMA table_info(publications)"))
+            ).fetchall()
+        }
+        if pub_cols and "account_id" not in pub_cols:
+            await conn.execute(text("ALTER TABLE publications ADD COLUMN account_id TEXT"))
+        if pub_cols and "channel_title" not in pub_cols:
+            await conn.execute(
+                text("ALTER TABLE publications ADD COLUMN channel_title TEXT")
+            )
+        if pub_cols and "public_token" not in pub_cols:
+            await conn.execute(
+                text("ALTER TABLE publications ADD COLUMN public_token TEXT")
+            )
+        # Additive social_accounts columns (Instagram/TikTok support).
+        social_cols2 = {
+            c[1]
+            for c in (
+                await conn.execute(text("PRAGMA table_info(social_accounts)"))
+            ).fetchall()
+        }
+        if social_cols2 and "token_expires_at" not in social_cols2:
+            await conn.execute(
+                text("ALTER TABLE social_accounts ADD COLUMN token_expires_at TIMESTAMP")
+            )
+        if social_cols2 and "extra_json" not in social_cols2:
+            await conn.execute(
+                text("ALTER TABLE social_accounts ADD COLUMN extra_json TEXT")
+            )
         # Idempotent additive migrations: add trim_* columns to reels if absent.
         reel_cols = {
             c[1]

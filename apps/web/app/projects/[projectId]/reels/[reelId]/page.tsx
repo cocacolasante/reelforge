@@ -246,6 +246,7 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
                 existing={exportsQ.data?.exports ?? []}
               />
               <PublishPanel
+                projectId={projectId}
                 reelId={reelId}
                 defaultTitle={r.title}
                 defaultDescription={r.hook}
@@ -606,14 +607,23 @@ function ExportList({
   );
 }
 
-// ---------- Publish (YouTube) ----------
+// ---------- Publish (YouTube / Instagram / TikTok) ----------
+
+const PLATFORMS = [
+  { id: 'youtube', label: 'YouTube' },
+  { id: 'instagram', label: 'Instagram' },
+  { id: 'tiktok', label: 'TikTok' },
+] as const;
+type PlatformId = (typeof PLATFORMS)[number]['id'];
 
 function PublishPanel({
+  projectId,
   reelId,
   defaultTitle,
   defaultDescription,
   socialExportReady,
 }: {
+  projectId: string;
   reelId: string;
   defaultTitle: string;
   defaultDescription: string;
@@ -623,12 +633,59 @@ function PublishPanel({
   const pubs = usePublications(reelId);
   const publish = usePublishReel();
   const queryClient = useQueryClient();
+  const [platform, setPlatform] = React.useState<PlatformId>('youtube');
   const [title, setTitle] = React.useState(defaultTitle);
   const [description, setDescription] = React.useState(defaultDescription);
   const [privacy, setPrivacy] = React.useState<'private' | 'unlisted' | 'public'>('private');
   const [publishJobId, setPublishJobId] = React.useState<string | null>(null);
+  const [channelId, setChannelId] = React.useState<string | null>(null);
+  // Result of an OAuth connect round-trip, delivered via query params by the
+  // API's callback redirect. Read once on mount, then strip from the URL.
+  const [connectNotice, setConnectNotice] = React.useState<
+    { kind: 'ok' | 'error'; text: string } | null
+  >(null);
 
-  const youtube = accounts.data?.accounts.find((a) => a.platform === 'youtube');
+  React.useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const connected = params.get('connected');
+    const err = params.get('youtube_error');
+    if (connected) {
+      setConnectNotice({ kind: 'ok', text: `Connected “${connected}”.` });
+    } else if (err) {
+      setConnectNotice({ kind: 'error', text: err });
+    }
+    if (connected || err) {
+      params.delete('connected');
+      params.delete('youtube_error');
+      const qs = params.toString();
+      window.history.replaceState(
+        null,
+        '',
+        window.location.pathname + (qs ? `?${qs}` : ''),
+      );
+    }
+  }, []);
+
+  const connectHref = (p: PlatformId) =>
+    `${API_BASE}/api/v1/social/${p}/connect?next=${encodeURIComponent(
+      `/projects/${projectId}/reels/${reelId}`,
+    )}`;
+
+  const channels = (accounts.data?.accounts ?? []).filter(
+    (a) => a.platform === platform,
+  );
+  // Auto-select when there's exactly one account on the active platform;
+  // otherwise the user must pick explicitly.
+  React.useEffect(() => {
+    if (channels.length === 1 && channelId !== channels[0].id) {
+      setChannelId(channels[0].id);
+    } else if (channelId && !channels.some((c) => c.id === channelId)) {
+      setChannelId(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [platform, channels.map((c) => c.id).join(',')]);
+
+  const selectedChannel = channels.find((c) => c.id === channelId) ?? null;
   const publications = pubs.data?.publications ?? [];
 
   const onSettled = () => {
@@ -636,12 +693,21 @@ function PublishPanel({
     void queryClient.invalidateQueries({ queryKey: ['publications', reelId] });
   };
 
+  const disconnect = async (accountId: string) => {
+    await fetch(`${API_BASE}/api/v1/social/accounts/${accountId}`, {
+      method: 'DELETE',
+    });
+    void queryClient.invalidateQueries({ queryKey: ['social-accounts'] });
+  };
+
   const trigger = async () => {
+    if (!channelId) return;
     try {
       const job = await publish.mutateAsync({
         reelId,
         body: {
-          platform: 'youtube',
+          platform,
+          account_id: channelId,
           preset_id: 'mp4_h264_social',
           title,
           description,
@@ -654,36 +720,101 @@ function PublishPanel({
     }
   };
 
+  const platformLabel = PLATFORMS.find((p) => p.id === platform)!.label;
+
   return (
     <Card>
       <CardHeader>
         <CardTitle>Publish</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
-        {!youtube ? (
+        {connectNotice ? (
+          <Alert variant={connectNotice.kind === 'error' ? 'destructive' : 'info'}>
+            <AlertTitle>
+              {connectNotice.kind === 'error' ? "Couldn't connect account" : 'Account connected'}
+            </AlertTitle>
+            <AlertDescription>{connectNotice.text}</AlertDescription>
+          </Alert>
+        ) : null}
+
+        {/* Platform tabs */}
+        <div className="flex gap-2">
+          {PLATFORMS.map((p) => (
+            <button
+              key={p.id}
+              onClick={() => setPlatform(p.id)}
+              className={
+                'rounded-md border px-3 py-1 text-sm transition ' +
+                (platform === p.id
+                  ? 'border-primary bg-primary/10 text-foreground'
+                  : 'border-border text-muted-foreground hover:border-muted-foreground/60')
+              }
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+
+        {channels.length === 0 ? (
           <div className="space-y-2">
             <p className="text-sm text-muted-foreground">
-              Connect your YouTube channel to publish this reel directly.
+              Connect your {platformLabel} account to publish this reel directly.
             </p>
-            <a href={`${API_BASE}/api/v1/social/youtube/connect`}>
+            <a href={connectHref(platform)}>
               <Button variant="secondary" size="sm">
-                Connect YouTube
+                Connect {platformLabel}
               </Button>
             </a>
             <p className="text-xs text-muted-foreground">
-              Requires GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET in your .env —
-              see docs/publishing.md.
+              {platform === 'youtube'
+                ? 'Requires GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET in your .env. Multiple channels? Connect them one at a time.'
+                : platform === 'instagram'
+                ? 'Requires INSTAGRAM_APP_ID / INSTAGRAM_APP_SECRET in .env, an Instagram Business/Creator account, and the tunnel (REELFORGE_PUBLIC_MEDIA_BASE).'
+                : 'Requires TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET in .env.'}{' '}
+              See docs/publishing.md.
             </p>
           </div>
         ) : (
           <>
-            <p className="text-xs text-muted-foreground">
-              Publishing as{' '}
-              <span className="font-medium text-foreground">
-                {youtube.display_name ?? 'YouTube'}
-              </span>{' '}
-              · uses the MP4 (social) export
-            </p>
+            <div className="space-y-1.5">
+              <Label>Account</Label>
+              <div className="flex flex-wrap items-center gap-2">
+                {channels.map((c) => (
+                  <span key={c.id} className="inline-flex items-center">
+                    <button
+                      onClick={() => setChannelId(c.id)}
+                      className={
+                        'rounded-l-md border px-3 py-1 text-sm transition ' +
+                        (channelId === c.id
+                          ? 'border-primary bg-primary/10 text-foreground'
+                          : 'border-border text-muted-foreground hover:border-muted-foreground/60')
+                      }
+                    >
+                      {c.display_name ?? c.external_id}
+                    </button>
+                    <button
+                      title="Disconnect this account"
+                      onClick={() => void disconnect(c.id)}
+                      className="rounded-r-md border border-l-0 border-border px-1.5 py-1 text-xs text-muted-foreground hover:text-destructive"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+                <a
+                  href={connectHref(platform)}
+                  className="text-xs text-muted-foreground underline hover:text-foreground"
+                >
+                  + connect another
+                </a>
+              </div>
+              {channels.length > 1 && !selectedChannel ? (
+                <p className="text-xs text-amber-500">
+                  Pick which account this video posts to.
+                </p>
+              ) : null}
+            </div>
+
             {!socialExportReady ? (
               <Alert>
                 <AlertDescription>
@@ -692,43 +823,63 @@ function PublishPanel({
                 </AlertDescription>
               </Alert>
             ) : null}
-            <div className="space-y-1.5">
-              <Label>Title</Label>
-              <Input
-                value={title}
-                maxLength={100}
-                onChange={(e) => setTitle(e.target.value)}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label>Description</Label>
-              <textarea
-                value={description}
-                rows={3}
-                maxLength={4900}
-                onChange={(e) => setDescription(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label>Visibility</Label>
-              <div className="flex gap-2">
-                {(['private', 'unlisted', 'public'] as const).map((p) => (
-                  <button
-                    key={p}
-                    onClick={() => setPrivacy(p)}
-                    className={
-                      'rounded-md border px-3 py-1 text-sm capitalize transition ' +
-                      (privacy === p
-                        ? 'border-primary bg-primary/10 text-foreground'
-                        : 'border-border text-muted-foreground hover:border-muted-foreground/60')
-                    }
-                  >
-                    {p}
-                  </button>
-                ))}
+
+            {platform !== 'tiktok' ? (
+              <>
+                <div className="space-y-1.5">
+                  <Label>{platform === 'instagram' ? 'Caption (first line)' : 'Title'}</Label>
+                  <Input
+                    value={title}
+                    maxLength={100}
+                    onChange={(e) => setTitle(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label>{platform === 'instagram' ? 'Caption (rest)' : 'Description'}</Label>
+                  <textarea
+                    value={description}
+                    rows={3}
+                    maxLength={2000}
+                    onChange={(e) => setDescription(e.target.value)}
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                  />
+                </div>
+              </>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                TikTok uploads land in your <span className="font-medium text-foreground">TikTok inbox</span> —
+                open the TikTok app, tap the notification, and add your caption
+                there before posting. (Direct public posting needs TikTok’s app
+                audit; the inbox flow works immediately.)
+              </p>
+            )}
+
+            {platform === 'youtube' ? (
+              <div className="space-y-1.5">
+                <Label>Visibility</Label>
+                <div className="flex gap-2">
+                  {(['private', 'unlisted', 'public'] as const).map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => setPrivacy(p)}
+                      className={
+                        'rounded-md border px-3 py-1 text-sm capitalize transition ' +
+                        (privacy === p
+                          ? 'border-primary bg-primary/10 text-foreground'
+                          : 'border-border text-muted-foreground hover:border-muted-foreground/60')
+                      }
+                    >
+                      {p}
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
+            ) : platform === 'instagram' ? (
+              <p className="text-xs text-amber-500">
+                Instagram Reels publish publicly to your profile immediately.
+              </p>
+            ) : null}
+
             {publish.error ? (
               <Alert variant="destructive">
                 <AlertDescription>{humanMessage(publish.error)}</AlertDescription>
@@ -744,10 +895,19 @@ function PublishPanel({
             ) : (
               <Button
                 onClick={trigger}
-                disabled={publish.isPending || !socialExportReady || !title.trim()}
+                disabled={
+                  publish.isPending ||
+                  !socialExportReady ||
+                  (platform !== 'tiktok' && !title.trim()) ||
+                  !selectedChannel
+                }
               >
                 <Upload className="h-4 w-4" />
-                {publish.isPending ? 'Starting…' : 'Publish to YouTube'}
+                {publish.isPending
+                  ? 'Starting…'
+                  : selectedChannel
+                  ? `${platform === 'tiktok' ? 'Send to' : 'Publish to'} ${selectedChannel.display_name ?? platformLabel}`
+                  : `Publish to ${platformLabel}`}
               </Button>
             )}
           </>
@@ -763,9 +923,11 @@ function PublishPanel({
                 <div className="min-w-0">
                   <div className="truncate">{p.title}</div>
                   <div className="text-xs text-muted-foreground">
-                    {p.platform} · {p.privacy} ·{' '}
+                    {p.channel_title ?? p.platform} · {p.platform === 'youtube' ? `${p.privacy} · ` : ''}
                     {p.status === 'failed' ? (
                       <span className="text-destructive">{p.error_message ?? 'failed'}</span>
+                    ) : p.status === 'done' && p.platform === 'tiktok' && !p.video_url ? (
+                      'sent to TikTok inbox — finish in the app'
                     ) : (
                       p.status
                     )}

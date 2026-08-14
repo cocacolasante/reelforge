@@ -21,10 +21,18 @@ class Settings(BaseSettings):
     ]
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    # Social publishing (YouTube). Credentials come from the user's Google
-    # Cloud project — see docs/publishing.md for setup.
+    # Social publishing. Credentials come from the user's own developer
+    # apps on each platform — see docs/publishing.md for setup.
     google_client_id: str = Field(default="", alias="GOOGLE_CLIENT_ID")
     google_client_secret: str = Field(default="", alias="GOOGLE_CLIENT_SECRET")
+    instagram_app_id: str = Field(default="", alias="INSTAGRAM_APP_ID")
+    instagram_app_secret: str = Field(default="", alias="INSTAGRAM_APP_SECRET")
+    tiktok_client_key: str = Field(default="", alias="TIKTOK_CLIENT_KEY")
+    tiktok_client_secret: str = Field(default="", alias="TIKTOK_CLIENT_SECRET")
+    # Public HTTPS base that reaches this API from the internet (cloudflared
+    # tunnel). Instagram requires Meta's servers to FETCH the video from a
+    # public URL, so IG publishing is disabled until this is set.
+    public_media_base: str = Field(default="", alias="REELFORGE_PUBLIC_MEDIA_BASE")
     # Host-visible bases used to build the OAuth redirect + post-connect hop.
     public_api_base: str = Field(
         default="http://localhost:8001", alias="REELFORGE_PUBLIC_API_BASE"

@@ -183,7 +183,9 @@ export const HealthSchema = z.object({
 // --- Social publishing ------------------------------------------------------
 
 export const SocialAccountSchema = z.object({
+  id: z.string(),
   platform: z.string(),
+  external_id: z.string(),
   display_name: z.string().nullable(),
   connected_at: z.string(),
 });
@@ -196,6 +198,7 @@ export const PublicationSchema = z.object({
   id: z.string(),
   reel_id: z.string(),
   platform: z.string(),
+  channel_title: z.string().nullable(),
   preset_id: z.string(),
   title: z.string(),
   privacy: z.string(),
