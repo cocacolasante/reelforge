@@ -225,6 +225,7 @@ def build_captions(
     config: ComposeConfig,
     reel_dir: Path,
     end_trims: list[float] | None = None,
+    clips: list | None = None,
 ) -> Path:
     """Produce `captions.ass` on disk. Always writes a valid ASS file.
 
@@ -258,23 +259,38 @@ def build_captions(
         config.transition.duration_sec if config.transition.kind != "cut" else 0.0
     )
 
-    # Build the source→mezzanine mapping from the ACTUAL rendered clip
-    # bounds: clip_bounds folds in user trims + speech-safe snapping (against
-    # the ORIGINAL transcript — the one clip extraction saw), and `end_trims`
-    # carries the beat-sync shortenings. Words falling in content that was
-    # trimmed away are dropped.
-    from reelforge_core.compose.clips import clip_bounds
+    # Build the source→mezzanine mapping from the ACTUAL rendered shot list.
+    # Every shot occupies mezzanine time; only video shots map back to a span
+    # of source footage, so an inserted photo simply pushes later captions
+    # later. When `clips` isn't supplied the shot list is reconstructed from
+    # the reel's scenes: clip_bounds folds in user trims + speech-safe
+    # snapping (against the ORIGINAL transcript — the one clip extraction
+    # saw) and `end_trims` carries the beat-sync shortenings.
+    # (src_start, src_end, duration) — src bounds are None for photo shots.
+    shots: list[tuple[float | None, float | None, float]] = []
+    if clips is not None:
+        for c in clips:
+            if c.is_photo:
+                shots.append((None, None, c.duration))
+            else:
+                shots.append((c.in_ts, c.out_ts, c.duration))
+    else:
+        from reelforge_core.compose.clips import clip_bounds
 
-    n = len(reel.scene_indices)
+        n = len(reel.scene_indices)
+        for position, idx in enumerate(reel.scene_indices):
+            scene = analysis.scenes[idx]
+            s, e = clip_bounds(position, n, scene, config, analysis)
+            if end_trims is not None and position < n - 1 and position < len(end_trims):
+                e = max(s + 0.5, e - end_trims[position])
+            shots.append((s, e, e - s))
+
     segments_map: list[tuple[float, float, float]] = []  # (src_start, src_end, mezz_start)
     cum = 0.0
-    for position, idx in enumerate(reel.scene_indices):
-        scene = analysis.scenes[idx]
-        s, e = clip_bounds(position, n, scene, config, analysis)
-        if end_trims is not None and position < n - 1 and position < len(end_trims):
-            e = max(s + 0.5, e - end_trims[position])
-        segments_map.append((s, e, cum - position * xfade_dur))
-        cum += e - s
+    for position, (src_start, src_end, dur) in enumerate(shots):
+        if src_start is not None and src_end is not None:
+            segments_map.append((src_start, src_end, cum - position * xfade_dur))
+        cum += dur
 
     def _mt(t: float) -> float | None:
         for s, e, mezz_start in segments_map:

@@ -250,3 +250,39 @@ async def get_scene_thumbnail(
         media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+
+@router.get("/assets/{asset_id}/photo")
+async def get_photo(
+    asset_id: str, request: Request, db: AsyncSession = Depends(get_db)
+) -> Response:
+    """Serve a photo asset itself (for pickers and previews).
+
+    Photos have no scene thumbnails — they never go through analysis — so the
+    original file is what the UI displays.
+    """
+    a = await db.get(dbmod.Asset, asset_id)
+    if a is None:
+        raise ApiError(404, "ASSET_NOT_FOUND", f"asset {asset_id} not found")
+    if a.kind != "photo":
+        raise ApiError(400, "INVALID_CONFIG", f"asset {asset_id} is not a photo")
+    path = Path(a.path)
+    if not path.exists():
+        raise ApiError(404, "NOT_FOUND", "photo file missing on disk")
+    suffix = path.suffix.lower().lstrip(".")
+    media_type = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+        "gif": "image/gif",
+        "bmp": "image/bmp",
+        "tif": "image/tiff",
+        "tiff": "image/tiff",
+    }.get(suffix, "application/octet-stream")
+    return await stream_file_with_range(
+        path,
+        request,
+        media_type=media_type,
+        cache_control="public, max-age=86400",
+    )

@@ -4,7 +4,7 @@ import * as React from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowRight, Plus, Sparkles, Wand2 } from 'lucide-react';
+import { ArrowRight, Plus, Sparkles, Trash2, Wand2 } from 'lucide-react';
 import { AppShell } from '@/components/layouts/app-shell';
 import { Uploader } from '@/components/app/uploader';
 import { JobProgress } from '@/components/app/job-progress';
@@ -31,6 +31,7 @@ import { Slider } from '@/components/ui/slider';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import {
+  useDeleteAsset,
   useEnqueueAnalyze,
   useEnqueueSelect,
   useProject,
@@ -38,7 +39,8 @@ import {
 } from '@/lib/api/hooks';
 import { humanMessage } from '@/lib/api/errors';
 import { APIError } from '@/lib/api/errors';
-import { api } from '@/lib/api/client';
+import { resetUploaderStore } from '@/lib/upload/uploader';
+import { api, API_BASE } from '@/lib/api/client';
 import { formatBytes, formatDuration } from '@/lib/format';
 
 export default function ProjectDetailPage({
@@ -131,7 +133,11 @@ function ProjectDetail({ projectId }: { projectId: string }) {
     );
   }
 
-  const assetList = assets.data?.assets ?? [];
+  const allAssets = assets.data?.assets ?? [];
+  // Footage drives analysis and reel selection; photos are stills that get
+  // woven into a reel at compose time, so they're listed separately.
+  const assetList = allAssets.filter((a) => a.kind !== 'photo');
+  const photoList = allAssets.filter((a) => a.kind === 'photo');
   const reelCount = (projectReels.data?.reels as unknown[] | undefined)?.length ?? 0;
 
   return (
@@ -157,19 +163,24 @@ function ProjectDetail({ projectId }: { projectId: string }) {
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle>Source clips</CardTitle>
-          {assetList.length > 0 ? (
+          {allAssets.length > 0 ? (
             <Button
               size="sm"
               variant="outline"
-              onClick={() => setShowUploader((v) => !v)}
+              onClick={() => {
+                // Clear any finished/failed upload left in the per-project
+                // store before reopening, so the dropzone is always live.
+                resetUploaderStore(projectId);
+                setShowUploader((v) => !v);
+              }}
             >
               <Plus className="h-4 w-4" />
-              {showUploader ? 'Cancel' : 'Add another clip'}
+              {showUploader ? 'Cancel' : 'Add clip or photo'}
             </Button>
           ) : null}
         </CardHeader>
         <CardContent className="space-y-4">
-          {assetList.length === 0 || showUploader ? (
+          {allAssets.length === 0 || showUploader ? (
             <Uploader projectId={projectId} onComplete={onUploadComplete} />
           ) : null}
           {assetList.length > 0 ? (
@@ -177,8 +188,15 @@ function ProjectDetail({ projectId }: { projectId: string }) {
               {assetList.map((a) => (
                 <AssetRow
                   key={a.id}
+                  projectId={projectId}
                   asset={a}
                   activeJobId={jobIds[a.id] ?? null}
+                  onDeleted={() =>
+                    setJobIds((prev) => {
+                      const { [a.id]: _omit, ...rest } = prev;
+                      return rest;
+                    })
+                  }
                   onQueued={(jid) =>
                     setJobIds((prev) => ({ ...prev, [a.id]: jid }))
                   }
@@ -199,6 +217,26 @@ function ProjectDetail({ projectId }: { projectId: string }) {
           ) : null}
         </CardContent>
       </Card>
+
+      {/* Photos */}
+      {photoList.length > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Photos</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-sm text-muted-foreground">
+              Add these as still shots when composing a reel — open a reel and
+              pick them in the Photos section.
+            </p>
+            <div className="flex flex-wrap gap-3">
+              {photoList.map((p) => (
+                <PhotoTile key={p.id} projectId={projectId} photo={p} />
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
 
       {/* Selection panel */}
       <Card>
@@ -242,17 +280,23 @@ function ProjectDetail({ projectId }: { projectId: string }) {
 // ---- per-asset row ------------------------------------------------------
 
 function AssetRow({
+  projectId,
   asset,
   activeJobId,
   onQueued,
   onSettled,
+  onDeleted,
 }: {
+  projectId: string;
   asset: NonNullable<ReturnType<typeof useProjectAssets>['data']>['assets'][number];
   activeJobId: string | null;
   onQueued: (jobId: string) => void;
   onSettled: () => void;
+  onDeleted: () => void;
 }) {
   const enqueue = useEnqueueAnalyze();
+  const remove = useDeleteAsset(projectId);
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
   const ready = asset.analysis_ready;
 
   const trigger = async () => {
@@ -261,6 +305,16 @@ function AssetRow({
       onQueued(job.id);
     } catch {
       /* surfaced */
+    }
+  };
+
+  const confirmDelete = async () => {
+    try {
+      await remove.mutateAsync(asset.id);
+      setConfirmOpen(false);
+      onDeleted();
+    } catch {
+      /* surfaced inline */
     }
   };
 
@@ -282,6 +336,17 @@ function AssetRow({
           Analyze
         </Button>
       ) : null}
+      <Button
+        size="sm"
+        variant="ghost"
+        title="Delete this clip"
+        onClick={() => setConfirmOpen(true)}
+        disabled={remove.isPending}
+        className="text-muted-foreground hover:text-destructive"
+      >
+        <Trash2 className="h-4 w-4" />
+        {remove.isPending ? 'Deleting…' : null}
+      </Button>
       {activeJobId ? (
         <div className="w-full">
           <JobProgress
@@ -297,6 +362,40 @@ function AssetRow({
           <AlertDescription>{humanMessage(enqueue.error)}</AlertDescription>
         </Alert>
       ) : null}
+      {remove.error ? (
+        <Alert variant="destructive">
+          <AlertDescription>{humanMessage(remove.error)}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete this clip?</DialogTitle>
+            <DialogDescription>
+              <span className="font-semibold text-foreground">
+                {asset.original_filename}
+              </span>{' '}
+              and everything derived from it — analysis, reels, composed videos
+              and exports — will be permanently removed from disk.
+              {activeJobId ? ' Any processing still running will be stopped.' : ''}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button variant="outline" onClick={() => setConfirmOpen(false)}>
+              Keep it
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => void confirmDelete()}
+              disabled={remove.isPending}
+            >
+              <Trash2 className="h-4 w-4" />
+              {remove.isPending ? 'Deleting…' : 'Delete clip'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -539,6 +638,42 @@ function SelectionPanel({
           ))}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+// ---- photo tile ---------------------------------------------------------
+
+function PhotoTile({
+  projectId,
+  photo,
+}: {
+  projectId: string;
+  photo: NonNullable<ReturnType<typeof useProjectAssets>['data']>['assets'][number];
+}) {
+  const remove = useDeleteAsset(projectId);
+  return (
+    <div className="group relative">
+      <img
+        alt={photo.original_filename}
+        src={`${API_BASE}/api/v1/assets/${photo.id}/photo`}
+        className="h-24 w-24 rounded-md border object-cover bg-muted"
+        loading="lazy"
+        onError={(e) => {
+          (e.target as HTMLImageElement).style.visibility = 'hidden';
+        }}
+      />
+      <button
+        title={`Delete ${photo.original_filename}`}
+        onClick={() => void remove.mutateAsync(photo.id).catch(() => {})}
+        disabled={remove.isPending}
+        className="absolute -right-2 -top-2 rounded-full border bg-background p-1 text-muted-foreground opacity-0 transition group-hover:opacity-100 hover:text-destructive"
+      >
+        <Trash2 className="h-3.5 w-3.5" />
+      </button>
+      <div className="mt-1 max-w-24 truncate text-[10px] text-muted-foreground">
+        {photo.original_filename}
+      </div>
     </div>
   );
 }

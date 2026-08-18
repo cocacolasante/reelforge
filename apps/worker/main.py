@@ -75,6 +75,9 @@ class WorkerSettings:
         publish_reel_job,
     ]
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
+    # Lets the API abort in-flight jobs (e.g. when a source clip is deleted
+    # mid-analysis) instead of leaving FFmpeg/Whisper working on dead files.
+    allow_abort_jobs = True
     # analyze_asset legitimately runs up to an hour on long sources; compose +
     # export are FFmpeg-heavy (CPU-bound). Cap concurrent jobs at 2 so we don't
     # thrash. Scale horizontally with `docker compose up --scale worker=N` for

@@ -27,6 +27,7 @@ class ProjectList(BaseModel):
 class AssetOut(BaseModel):
     id: str
     project_id: str
+    kind: str = "video"  # "video" | "photo"
     path: str
     original_filename: str
     duration_sec: float

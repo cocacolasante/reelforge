@@ -117,7 +117,11 @@ def build_final_command(
                 outputs=[v_prep_out],
             )
         )
-        if clip.scene_index in low_energy_by_idx and config.effects.ken_burns_on_low_energy:
+        if (
+            not clip.is_photo
+            and clip.scene_index in low_energy_by_idx
+            and config.effects.ken_burns_on_low_energy
+        ):
             # Ken Burns-style motion as constant-zoom + animated crop: scale
             # the clip up ONCE, then drift a target-sized window diagonally
             # across the margin. Orders of magnitude cheaper than zoompan

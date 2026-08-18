@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from reelforge_core.compose.captions import build_captions
-from reelforge_core.compose.clips import extract_clips
+from reelforge_core.compose.clips import ClipInfo, extract_clips
 from reelforge_core.compose.graph import ffmpeg_version, run_ffmpeg
 from reelforge_core.compose.graph_builder import build_final_command
 from reelforge_core.compose.music import (
@@ -236,13 +236,55 @@ async def compose(
         )
     except FFmpegError as exc:
         raise ComposeError(f"clip extraction failed: {exc}") from exc
+
+    # Still photos become shots of their own, spliced into the sequence at
+    # their configured positions. Rendered after the video clips so their
+    # positions refer to the final video clip count.
+    if config.photo_inserts:
+        from reelforge_core.compose.photos import (
+            interleave_photo_clips,
+            render_photo_clip,
+        )
+
+        photos_dir = reel_dir / "clips"
+        photos_dir.mkdir(parents=True, exist_ok=True)
+        rendered: list[tuple[int, ClipInfo]] = []
+        for i, insert in enumerate(config.photo_inserts):
+            out_path = photos_dir / f"photo_{i:04d}.mp4"
+            try:
+                await render_photo_clip(insert, out_path, config, log_file, pan_index=i)
+            except FileNotFoundError as exc:
+                raise ComposeError(str(exc)) from exc
+            except FFmpegError as exc:
+                raise ComposeError(
+                    f"could not render photo {insert.path}: {exc}"
+                ) from exc
+            rendered.append(
+                (
+                    insert.position,
+                    ClipInfo(
+                        path=out_path,
+                        scene_index=-1,
+                        in_ts=0.0,
+                        out_ts=insert.duration_sec,
+                        duration=insert.duration_sec,
+                        has_audio=True,  # silent bed, but a real audio stream
+                        effects_applied=["ken_burns"] if insert.ken_burns else [],
+                        is_photo=True,
+                        photo_asset_id=insert.asset_id,
+                    ),
+                )
+            )
+        clips = interleave_photo_clips(clips, rendered)
+        log.info("composed with %d photo insert(s)", len(rendered))
+
     await progress(_emit("clips", 1.0))
 
     # ----- captions -----
     await progress(_emit("captions", 0.0))
     try:
         captions_path = build_captions(
-            reel, analysis, config, reel_dir, end_trims=end_trims
+            reel, analysis, config, reel_dir, end_trims=end_trims, clips=clips
         )
     except Exception as exc:
         raise ComposeError(f"caption build failed: {exc}") from exc
@@ -304,6 +346,11 @@ async def compose(
                 "in_ts": c.in_ts,
                 "out_ts": c.out_ts,
                 "effects_applied": c.effects_applied,
+                **(
+                    {"kind": "photo", "photo_asset_id": c.photo_asset_id}
+                    if c.is_photo
+                    else {}
+                ),
             }
         )
 

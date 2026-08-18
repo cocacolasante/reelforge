@@ -28,6 +28,11 @@ class ClipInfo:
     duration: float
     has_audio: bool
     effects_applied: list[str]
+    # Photo shots carry no source timeline: they occupy mezzanine time but
+    # map to no span of the original footage (captions skip them), and their
+    # motion is already baked in (the render graph skips Ken Burns).
+    is_photo: bool = False
+    photo_asset_id: str | None = None
 
 
 def _video_filter_chain(

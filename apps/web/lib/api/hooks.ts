@@ -252,3 +252,25 @@ export function usePublishReel() {
     },
   });
 }
+
+export function useDeleteAsset(projectId: string | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (assetId: string) =>
+      api<void>(`/assets/${assetId}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['assets', projectId] });
+      qc.invalidateQueries({ queryKey: ['project-reels', projectId] });
+      qc.invalidateQueries({ queryKey: ['project', projectId] });
+    },
+  });
+}
+
+/** Photos belonging to a project — candidates for insertion into a reel. */
+export function useProjectPhotos(projectId: string | undefined) {
+  const q = useProjectAssets(projectId);
+  return {
+    ...q,
+    photos: (q.data?.assets ?? []).filter((a) => a.kind === 'photo'),
+  };
+}

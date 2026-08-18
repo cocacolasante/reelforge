@@ -26,6 +26,7 @@ import { humanMessage } from '@/lib/api/errors';
 import { formatBytes, formatDuration, formatTimestamp } from '@/lib/format';
 import {
   useEnqueueCompose,
+  useProjectPhotos,
   useEnqueueExport,
   useExports,
   useMusicLibrary,
@@ -99,6 +100,11 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
   const [noEffects, setNoEffects] = React.useState(false);
   const [crf, setCrf] = React.useState<number[]>([18]);
   const [quality, setQuality] = React.useState<'draft' | 'standard' | 'high'>('standard');
+  // Photo inserts: which project photos to weave in, where, and for how long.
+  const [photoIds, setPhotoIds] = React.useState<string[]>([]);
+  const [photoPlacement, setPhotoPlacement] =
+    React.useState<'start' | 'end' | 'spread'>('end');
+  const [photoSeconds, setPhotoSeconds] = React.useState<number[]>([3]);
   // Max output duration (in seconds). `null` means "no cap" — render the full reel.
   // Mapped to `trim_end_offset_sec = reel_duration - maxDuration` on submit.
   const [maxDuration, setMaxDuration] = React.useState<number[] | null>(null);
@@ -161,7 +167,26 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
           music_track_id: musicTrack === '__auto__' ? null : musicTrack,
           no_music: musicTrack === '__none__',
         };
-    const config = { ...baseConfig, ...trimOffsets };
+    // Positions index the shot sequence: 0 = before the first clip,
+    // sceneCount = after the last. "spread" distributes them between clips.
+    const sceneCount = r.scene_indices.length;
+    const photo_inserts = photoIds.map((assetId, i) => {
+      let position = sceneCount; // end
+      if (photoPlacement === 'start') position = 0;
+      else if (photoPlacement === 'spread') {
+        position = Math.max(
+          1,
+          Math.round(((i + 1) * sceneCount) / (photoIds.length + 1)),
+        );
+      }
+      return {
+        asset_id: assetId,
+        position,
+        duration_sec: photoSeconds[0],
+        ken_burns: true,
+      };
+    });
+    const config = { ...baseConfig, ...trimOffsets, photo_inserts };
     try {
       const job = await compose.mutateAsync({ reelId, config });
       setComposeJobId(job.id);
@@ -433,6 +458,21 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
                 </section>
               </>
             ) : null}
+
+            {/* Photos */}
+            <PhotoPicker
+              projectId={projectId}
+              selected={photoIds}
+              onToggle={(id) =>
+                setPhotoIds((prev) =>
+                  prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+                )
+              }
+              placement={photoPlacement}
+              onPlacement={setPhotoPlacement}
+              seconds={photoSeconds}
+              onSeconds={setPhotoSeconds}
+            />
 
             {/* Quality */}
             <section className="space-y-2">
@@ -951,5 +991,112 @@ function PublishPanel({
         ) : null}
       </CardContent>
     </Card>
+  );
+}
+
+// ---------- Photo picker (compose panel) ----------
+
+function PhotoPicker({
+  projectId,
+  selected,
+  onToggle,
+  placement,
+  onPlacement,
+  seconds,
+  onSeconds,
+}: {
+  projectId: string;
+  selected: string[];
+  onToggle: (assetId: string) => void;
+  placement: 'start' | 'end' | 'spread';
+  onPlacement: (p: 'start' | 'end' | 'spread') => void;
+  seconds: number[];
+  onSeconds: (v: number[]) => void;
+}) {
+  const { photos } = useProjectPhotos(projectId);
+  if (photos.length === 0) return null;
+
+  return (
+    <section className="space-y-2">
+      <Label>
+        Photos{selected.length > 0 ? ` · ${selected.length} selected` : ''}
+      </Label>
+      <div className="flex flex-wrap gap-2">
+        {photos.map((p) => {
+          const isOn = selected.includes(p.id);
+          const order = selected.indexOf(p.id) + 1;
+          return (
+            <button
+              key={p.id}
+              onClick={() => onToggle(p.id)}
+              title={p.original_filename}
+              className={
+                'relative h-16 w-16 overflow-hidden rounded-md border-2 transition ' +
+                (isOn ? 'border-primary' : 'border-transparent opacity-60 hover:opacity-100')
+              }
+            >
+              <img
+                alt=""
+                src={`${API_BASE}/api/v1/assets/${p.id}/photo`}
+                className="h-full w-full object-cover"
+                loading="lazy"
+              />
+              {isOn ? (
+                <span className="absolute right-0.5 top-0.5 rounded-full bg-primary px-1.5 text-[10px] font-semibold text-primary-foreground">
+                  {order}
+                </span>
+              ) : null}
+            </button>
+          );
+        })}
+      </div>
+      {selected.length > 0 ? (
+        <div className="space-y-2 rounded-md border bg-card/40 p-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs text-muted-foreground">Placement</Label>
+            <div className="flex gap-2">
+              {([
+                ['start', 'At start'],
+                ['end', 'At end'],
+                ['spread', 'Spread through'],
+              ] as const).map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => onPlacement(key)}
+                  className={
+                    'rounded-md border px-2.5 py-1 text-xs transition ' +
+                    (placement === key
+                      ? 'border-primary bg-primary/10 text-foreground'
+                      : 'border-border text-muted-foreground hover:border-muted-foreground/60')
+                  }
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs text-muted-foreground">
+              Each photo on screen: {seconds[0]}s
+            </Label>
+            <Slider
+              value={seconds}
+              min={1}
+              max={8}
+              step={0.5}
+              onValueChange={onSeconds}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Photos are added as still shots with a slow drift, and lengthen the
+            reel by {(selected.length * seconds[0]).toFixed(1)}s.
+          </p>
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          Tap a photo to weave it into this reel.
+        </p>
+      )}
+    </section>
   );
 }

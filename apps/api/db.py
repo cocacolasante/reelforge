@@ -44,6 +44,9 @@ class Asset(SQLModel, table=True):
 
     id: str = Field(primary_key=True)  # content-addressed sha256 of head+tail+size
     project_id: str = Field(foreign_key="projects.id", index=True)
+    # "video" (footage that gets analyzed into reels) or "photo" (a still,
+    # inserted into reels at compose time — never analyzed or selected).
+    kind: str = Field(default="video", index=True)
     path: str
     original_filename: str
     duration_sec: float
@@ -256,6 +259,15 @@ async def create_all(engine: AsyncEngine) -> None:
         if social_cols and "external_id" not in social_cols:
             await conn.execute(text("DROP TABLE social_accounts"))
         await conn.run_sync(SQLModel.metadata.create_all)
+        # Additive assets column (photo support).
+        asset_cols = {
+            c[1]
+            for c in (await conn.execute(text("PRAGMA table_info(assets)"))).fetchall()
+        }
+        if asset_cols and "kind" not in asset_cols:
+            await conn.execute(
+                text("ALTER TABLE assets ADD COLUMN kind TEXT NOT NULL DEFAULT 'video'")
+            )
         # Additive publications columns (multi-channel support).
         pub_cols = {
             c[1]

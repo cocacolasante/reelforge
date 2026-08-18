@@ -83,11 +83,12 @@ async def create_upload(
     if p is None:
         raise ApiError(404, "PROJECT_NOT_FOUND", f"project {project_id} not found")
 
-    if not body.content_type.lower().startswith("video/"):
+    ctype = body.content_type.lower()
+    if not (ctype.startswith("video/") or ctype.startswith("image/")):
         raise ApiError(
             400,
             "UPLOAD_UNSUPPORTED_TYPE",
-            f"content_type {body.content_type!r} is not a video/* MIME type",
+            f"content_type {body.content_type!r} is not a video/* or image/* MIME type",
         )
     limit_bytes = int(settings.max_upload_gb * (1024**3))
     if body.total_bytes <= 0 or body.total_bytes > limit_bytes:
@@ -246,7 +247,31 @@ async def complete_upload(
                 shutil.copyfileobj(src, out, length=64 * 1024)
 
     # Phase 0 content-addressed id = sha256(head 1 MiB + tail 1 MiB + size)
-    asset = probe(tmp_final)
+    try:
+        asset = probe(tmp_final)
+    except Exception as exc:
+        # Undecodable file (HEIC, a corrupt transfer, something that isn't
+        # media at all). Bin the assembled temp file rather than leaving GBs
+        # of garbage behind, and say something the user can act on.
+        tmp_final.unlink(missing_ok=True)
+        shutil.rmtree(parts_dir, ignore_errors=True)
+        s.status = "aborted"
+        s.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        suffix = Path(s.filename).suffix.lower().lstrip(".")
+        hint = (
+            " iPhone HEIC photos aren't supported yet — in Photos choose "
+            "File → Export → Export Photo and pick JPEG, or set Settings → "
+            "Camera → Formats → Most Compatible."
+            if suffix in {"heic", "heif"}
+            else ""
+        )
+        raise ApiError(
+            400,
+            "UPLOAD_UNSUPPORTED_TYPE",
+            f"could not read {s.filename!r} as media.{hint}",
+            detail=str(exc)[:200],
+        )
     final_path = _final_path(asset.id, s.filename)
     if final_path.exists():
         final_path.unlink()
@@ -262,6 +287,7 @@ async def complete_upload(
         a = dbmod.Asset(
             id=asset.id,
             project_id=s.project_id,
+            kind="photo" if asset.is_photo else "video",
             path=str(asset.path),
             original_filename=s.filename,
             duration_sec=asset.probe.duration_s,

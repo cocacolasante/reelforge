@@ -15,6 +15,61 @@ const DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024;
 const PARALLELISM = 3;
 const MAX_RETRIES_PER_CHUNK = 3;
 const STORAGE_KEY_PREFIX = 'reelforge:upload:';
+// Mirrors the server's max_upload_gb (5 GB) so oversized files fail fast with
+// a useful message instead of a 413 after the session handshake.
+export const MAX_UPLOAD_BYTES = 5 * 1024 ** 3;
+
+// Browsers derive File.type from the OS extension registry, and it comes back
+// empty (or application/octet-stream) for plenty of real video files —
+// camera-card footage, uncommon containers, files copied off network shares.
+// Extension is the reliable signal; ffprobe on the server is the real gate.
+const VIDEO_EXTENSIONS = new Set([
+  'mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi', 'mpg', 'mpeg', 'm2v',
+  'wmv', 'flv', '3gp', '3g2', 'mts', 'm2ts', 'ts', 'mxf', 'ogv',
+  '360', 'insv', 'lrv',
+]);
+
+// Photos become still shots inside a reel. HEIC/HEIF are deliberately absent:
+// the bundled FFmpeg can't decode them, so they're caught early with advice
+// rather than failing after a full upload.
+const PHOTO_EXTENSIONS = new Set([
+  'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'tif', 'tiff',
+]);
+const UNSUPPORTED_PHOTO_EXTENSIONS = new Set(['heic', 'heif']);
+
+export function fileExtension(name: string): string {
+  const i = name.lastIndexOf('.');
+  return i < 0 ? '' : name.slice(i + 1).toLowerCase();
+}
+
+export function looksLikeVideo(file: File): boolean {
+  if (file.type.startsWith('video/')) return true;
+  return VIDEO_EXTENSIONS.has(fileExtension(file.name));
+}
+
+export function looksLikePhoto(file: File): boolean {
+  const ext = fileExtension(file.name);
+  if (UNSUPPORTED_PHOTO_EXTENSIONS.has(ext)) return false;
+  if (file.type.startsWith('image/') && !file.type.includes('hei')) return true;
+  return PHOTO_EXTENSIONS.has(ext);
+}
+
+export function isUnsupportedPhoto(file: File): boolean {
+  return (
+    UNSUPPORTED_PHOTO_EXTENSIONS.has(fileExtension(file.name)) ||
+    file.type.includes('hei')
+  );
+}
+
+/** Content-type to advertise to the API, which requires video/* or image/*. */
+function uploadContentType(file: File): string {
+  if (file.type.startsWith('video/') || file.type.startsWith('image/')) {
+    return file.type;
+  }
+  return PHOTO_EXTENSIONS.has(fileExtension(file.name))
+    ? 'image/jpeg'
+    : 'video/mp4';
+}
 
 type ChunkState = 'idle' | 'uploading' | 'done' | 'failed';
 
@@ -101,6 +156,21 @@ const stores = new Map<string, ReturnType<typeof makeStore>>();
 function storeFor(projectId: string) {
   if (!stores.has(projectId)) stores.set(projectId, makeStore());
   return stores.get(projectId)!;
+}
+
+/** Return a project's uploader to a clean slate from outside the hook.
+ *
+ * The store is module-level so it survives the panel unmounting, which means
+ * a finished/failed upload can otherwise leave the next one stuck. Callers
+ * that (re)open the uploader use this instead of relying on mount-time state
+ * heuristics. */
+export function resetUploaderStore(projectId: string): void {
+  const store = stores.get(projectId);
+  if (!store) return;
+  const snap = store.getState();
+  if (snap.status === 'uploading' || snap.status === 'creatingSession') return;
+  for (const ac of Object.values(snap.abortControllers)) ac.abort();
+  snap.reset();
 }
 
 // ---------- helpers ----------
@@ -241,13 +311,53 @@ export function useUploader(projectId: string) {
   }, [projectId]);
 
   function selectFile(file: File) {
-    if (!file.type.startsWith('video/')) {
+    if (isUnsupportedPhoto(file)) {
       store.setState({
         status: 'failed',
         error: new APIError(
           'UPLOAD_UNSUPPORTED_TYPE',
           400,
-          `Selected file has type ${file.type || 'unknown'}; only video files are supported.`,
+          `“${file.name}” is an Apple HEIC photo, which can't be decoded yet. ` +
+            `In Photos use File → Export → Export Photo and choose JPEG, or ` +
+            `switch Settings → Camera → Formats to “Most Compatible”.`,
+        ),
+      });
+      return;
+    }
+    if (!looksLikeVideo(file) && !looksLikePhoto(file)) {
+      store.setState({
+        status: 'failed',
+        error: new APIError(
+          'UPLOAD_UNSUPPORTED_TYPE',
+          400,
+          `“${file.name}” doesn't look like a video or photo (type ${
+            file.type || 'unknown'
+          }). Video: MP4, MOV, M4V, WebM, MKV, AVI, MTS/M2TS. ` +
+            `Photos: JPEG, PNG, WebP, GIF, TIFF.`,
+        ),
+      });
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      store.setState({
+        status: 'failed',
+        error: new APIError(
+          'UPLOAD_TOO_LARGE',
+          413,
+          `“${file.name}” is ${(file.size / 1024 ** 3).toFixed(1)} GB — the ` +
+            `limit is 5 GB. Trim the clip first, or raise MAX_UPLOAD_GB in .env.`,
+        ),
+      });
+      return;
+    }
+    if (file.size === 0) {
+      store.setState({
+        status: 'failed',
+        error: new APIError(
+          'UPLOAD_UNSUPPORTED_TYPE',
+          400,
+          `“${file.name}” is empty (0 bytes). If it lives on a camera card or ` +
+            `cloud drive, copy it to local disk first.`,
         ),
       });
       return;
@@ -280,7 +390,7 @@ export function useUploader(projectId: string) {
           method: 'POST',
           body: {
             filename: snap.file.name,
-            content_type: snap.file.type || 'video/mp4',
+            content_type: uploadContentType(snap.file),
             total_bytes: snap.file.size,
             chunk_size: DEFAULT_CHUNK_BYTES,
           },

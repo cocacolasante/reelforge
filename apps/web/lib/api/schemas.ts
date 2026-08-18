@@ -19,6 +19,7 @@ export type Project = z.infer<typeof ProjectSchema>;
 export const AssetSchema = z.object({
   id: z.string(),
   project_id: z.string(),
+  kind: z.string(),
   path: z.string(),
   original_filename: z.string(),
   duration_sec: z.number(),

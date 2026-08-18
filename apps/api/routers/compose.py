@@ -40,6 +40,33 @@ async def enqueue_compose(
     body = dict(body)
     body.setdefault("trim_start_offset_sec", reel.trim_start_offset_sec)
     body.setdefault("trim_end_offset_sec", reel.trim_end_offset_sec)
+    # Photo inserts arrive as asset ids; resolve them to on-disk paths here so
+    # the compose pipeline never needs database access.
+    inserts = body.get("photo_inserts")
+    if inserts:
+        resolved: list[dict] = []
+        for raw in inserts:
+            item = dict(raw)
+            photo = await db.get(dbmod.Asset, item.get("asset_id", ""))
+            if photo is None:
+                raise ApiError(
+                    404, "ASSET_NOT_FOUND", f"photo {item.get('asset_id')!r} not found"
+                )
+            if photo.kind != "photo":
+                raise ApiError(
+                    400,
+                    "INVALID_CONFIG",
+                    f"asset {photo.id} is a {photo.kind}, not a photo",
+                )
+            if photo.project_id != reel.project_id:
+                raise ApiError(
+                    400,
+                    "INVALID_CONFIG",
+                    "photo belongs to a different project",
+                )
+            item["path"] = photo.path
+            resolved.append(item)
+        body["photo_inserts"] = resolved
     config = ComposeConfig(**body)
 
     job_row = await enqueue_job(

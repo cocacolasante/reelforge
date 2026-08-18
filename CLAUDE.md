@@ -321,6 +321,24 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   every frame (~10x slower renders); the current effect scales the clip up
   once by `ken_burns_zoom` and drifts a target-sized crop window
   diagonally. Do not reintroduce zoompan.
+- **Photos are shots, not sources.** An uploaded image becomes an Asset with
+  `kind="photo"` (detected by `ingest.is_photo_probe` — image container /
+  codec). Photos are never analyzed or selected; they're inserted at compose
+  time via `ComposeConfig.photo_inserts` (`PhotoInsert.position` indexes the
+  shot sequence: 0 = before the first clip, N = after the Nth). The API
+  resolves `asset_id` → `path` at enqueue so the compose pipeline needs no DB
+  access. `compose/photos.py` renders each still into a normalized clip with
+  a silent 48 kHz stereo bed (the xfade/acrossfade chain needs an audio
+  stream on every shot) and bakes the Ken Burns drift in — so
+  `graph_builder` skips its own Ken Burns for `clip.is_photo`.
+  **Anything that changes the shot list must flow into captions**:
+  `build_captions(clips=...)` builds the source→mezzanine map from the actual
+  ordered shots, and photo shots advance mezzanine time while mapping to no
+  source span.
+- **FFmpeg 5.1 here can't decode HEIC/HEIF.** iPhone photos in that format
+  are rejected client-side with export instructions, and `complete_upload`
+  turns any probe failure into a 400 (binning the assembled temp file)
+  instead of a 500.
 - **Speech-safe outer cuts.** `ComposeConfig.speech_safe_cuts` (default on):
   the reel's first/last cut points are snapped off the middle of spoken words
   via `compose/speech_snap.py` — extend up to
@@ -377,6 +395,13 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   shares one connection across tasks which breaks concurrent FastAPI
   requests (reads see stale / uncommitted writes). `NullPool` opens a fresh
   connection per checkout; WAL + `busy_timeout=5000` handles the contention.
+- **`DELETE /assets/{id}` aborts in-flight jobs, then cascades.** Order
+  matters: abort arq jobs (needs `allow_abort_jobs = True` on the worker,
+  else it's a harmless no-op) → mark them failed → delete publications →
+  exports → reels → jobs → upload_sessions → repoint `project.source_asset_id`
+  → delete the asset row → `rmtree` working/outputs + the upload file off the
+  event loop. Deleting mid-analysis is the common case (clip too big/wrong),
+  so skipping the abort leaves FFmpeg burning CPU on a deleted file.
 - **API: `DELETE /projects/{id}` leaves files on disk.** DB rows are
   cascaded manually (SQLite FK DELETE CASCADE isn't reliable across SQLModel
   versions without explicit DDL). Files under `/data/working/...` and

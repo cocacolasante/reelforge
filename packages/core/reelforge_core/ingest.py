@@ -13,6 +13,16 @@ log = logging.getLogger(__name__)
 
 HASH_WINDOW_BYTES = 1 * 1024 * 1024  # 1 MiB head + 1 MiB tail
 
+# ffprobe reports a still image as a one-frame video stream in an image
+# container, so these identify "this asset is a photo, not footage".
+PHOTO_CODECS = {
+    "mjpeg", "png", "webp", "bmp", "tiff", "gif", "jpeg2000", "ppm", "pgm",
+}
+PHOTO_CONTAINERS = {
+    "image2", "png_pipe", "webp_pipe", "jpeg_pipe", "mjpeg", "gif",
+    "bmp_pipe", "tiff_pipe", "image2pipe",
+}
+
 
 @dataclass(frozen=True)
 class ProbeResult:
@@ -42,6 +52,10 @@ class MediaAsset:
     def fps(self) -> float:
         return self.probe.fps
 
+    @property
+    def is_photo(self) -> bool:
+        return is_photo_probe(self.probe)
+
     @classmethod
     def from_path(cls, path: str | Path) -> "MediaAsset":
         """Probe and return a MediaAsset. Alias for `probe()` with a class-method face."""
@@ -50,6 +64,18 @@ class MediaAsset:
 
 class ProbeError(RuntimeError):
     """Raised when ffprobe fails or returns unparseable output."""
+
+
+def is_photo_probe(pr: "ProbeResult") -> bool:
+    """True when the probed file is a still image rather than footage.
+
+    Checks the container first (`image2` and friends) because a single-frame
+    MJPEG *video* is conceivable; a photo is always in an image container.
+    """
+    containers = {c.strip() for c in (pr.container or "").split(",")}
+    if containers & PHOTO_CONTAINERS:
+        return True
+    return pr.video_codec in PHOTO_CODECS and pr.audio_codec is None
 
 
 def _content_id(path: Path) -> str:

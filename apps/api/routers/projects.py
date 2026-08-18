@@ -9,12 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from arq.connections import ArqRedis
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api import db as dbmod
-from apps.api.deps import get_db
+from apps.api.deps import get_arq, get_db
 from apps.api.schemas.common import (
     AssetList,
     AssetOut,
@@ -48,6 +49,7 @@ def _to_asset_out(a: dbmod.Asset) -> AssetOut:
     return AssetOut(
         id=a.id,
         project_id=a.project_id,
+        kind=a.kind,
         path=a.path,
         original_filename=a.original_filename,
         duration_sec=a.duration_sec,
@@ -192,6 +194,120 @@ async def get_asset(asset_id: str, db: AsyncSession = Depends(get_db)) -> AssetO
     if a is None:
         raise ApiError(404, "ASSET_NOT_FOUND", f"asset {asset_id} not found")
     return _to_asset_out(a)
+
+
+@router.delete("/assets/{asset_id}", status_code=204)
+async def delete_asset(
+    asset_id: str,
+    db: AsyncSession = Depends(get_db),
+    arq: ArqRedis = Depends(get_arq),
+) -> None:
+    """Remove a source clip: stop its jobs, drop its rows, delete its files.
+
+    Deleting mid-analysis is the common case (a clip turns out to be too big
+    or simply wrong), so in-flight jobs are aborted first — otherwise FFmpeg
+    keeps burning CPU on a file that no longer exists.
+    """
+    asset = await db.get(dbmod.Asset, asset_id)
+    if asset is None:
+        raise ApiError(404, "ASSET_NOT_FOUND", f"asset {asset_id} not found")
+
+    # 1. Stop anything running on this asset.
+    live_jobs = (
+        await db.execute(
+            select(dbmod.Job).where(
+                dbmod.Job.asset_id == asset_id,
+                dbmod.Job.status.in_(("queued", "running")),
+            )
+        )
+    ).scalars().all()
+    for job in live_jobs:
+        try:
+            from arq.jobs import Job as ArqJob
+
+            await asyncio.wait_for(
+                ArqJob(job.id, redis=arq).abort(timeout=0.1), timeout=2.0
+            )
+        except Exception:
+            # Abort is best-effort: the worker may not be running, or may not
+            # have abort enabled. The DB row below still reflects reality.
+            log.info("could not abort job %s for deleted asset", job.id)
+        job.status = "failed"
+        job.error_message = "asset deleted"
+        job.finished_at = datetime.now(timezone.utc)
+
+    # 2. Collect file targets before the rows that name them are gone.
+    from apps.api.settings import settings
+
+    reel_ids = [
+        r
+        for (r,) in (
+            await db.execute(
+                select(dbmod.Reel.id).where(dbmod.Reel.asset_id == asset_id)
+            )
+        ).all()
+    ]
+    paths_to_remove: list[Path] = [
+        settings.data_dir / "working" / asset_id,
+        settings.data_dir / "outputs" / asset_id,
+        Path(asset.path),
+    ]
+    sessions = (
+        await db.execute(
+            select(dbmod.UploadSession).where(
+                dbmod.UploadSession.asset_id == asset_id
+            )
+        )
+    ).scalars().all()
+    for s in sessions:
+        if s.parts_dir:
+            paths_to_remove.append(Path(s.parts_dir))
+
+    # 3. Cascade the rows (children first — SQLite FK cascade isn't reliable
+    # across SQLModel versions without explicit DDL).
+    if reel_ids:
+        await db.execute(
+            delete(dbmod.Publication).where(dbmod.Publication.reel_id.in_(reel_ids))
+        )
+        await db.execute(
+            delete(dbmod.Export).where(dbmod.Export.reel_id.in_(reel_ids))
+        )
+    await db.execute(delete(dbmod.Reel).where(dbmod.Reel.asset_id == asset_id))
+    await db.execute(delete(dbmod.Job).where(dbmod.Job.asset_id == asset_id))
+    await db.execute(
+        delete(dbmod.UploadSession).where(dbmod.UploadSession.asset_id == asset_id)
+    )
+    # A project points at its first asset; clear the pointer if it was this one.
+    project = await db.get(dbmod.Project, asset.project_id)
+    if project is not None and project.source_asset_id == asset_id:
+        remaining = (
+            await db.execute(
+                select(dbmod.Asset.id)
+                .where(
+                    dbmod.Asset.project_id == asset.project_id,
+                    dbmod.Asset.id != asset_id,
+                )
+                .order_by(dbmod.Asset.created_at)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        project.source_asset_id = remaining
+    await db.delete(asset)
+    await db.commit()
+
+    # 4. Remove files off the event loop, after the commit.
+    def _rm_all(paths: list[Path]) -> None:
+        for target in paths:
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - best-effort cleanup
+                log.warning("could not remove %s during asset delete", target)
+
+    await asyncio.to_thread(_rm_all, paths_to_remove)
+    log.info("deleted asset %s (%s)", asset_id, asset.original_filename)
 
 
 @router.get("/projects/{project_id}/reels")

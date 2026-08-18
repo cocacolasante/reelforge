@@ -114,9 +114,12 @@ export function Uploader({ projectId, onComplete }: UploaderProps) {
           )}
         >
           <Upload className="h-10 w-10 text-muted-foreground" />
-          <div className="text-lg font-medium">Drop a video, or click to choose</div>
+          <div className="text-lg font-medium">
+            Drop a video or photo, or click to choose
+          </div>
           <p className="max-w-sm text-sm text-muted-foreground">
-            Supported: MP4, MOV, WebM. Up to 5 GB.
+            Video: MP4, MOV, MKV, AVI, MTS. Photos: JPEG, PNG, WebP — added as
+            still shots inside your reels. Up to 5 GB per file.
           </p>
           <Button
             variant="secondary"
@@ -129,10 +132,13 @@ export function Uploader({ projectId, onComplete }: UploaderProps) {
       ) : null}
 
       {/* Always mounted so the resume card can open the picker too. */}
+      {/* Extensions are listed alongside video/* because the OS reports no
+          MIME type for plenty of real camera files, and the picker greys out
+          anything the accept list doesn't match. */}
       <input
         ref={inputRef}
         type="file"
-        accept="video/*"
+        accept="video/*,image/*,.mp4,.m4v,.mov,.webm,.mkv,.avi,.mpg,.mpeg,.wmv,.flv,.3gp,.mts,.m2ts,.ts,.mxf,.360,.insv,.lrv,.jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff"
         className="hidden"
         onChange={onChoose}
       />

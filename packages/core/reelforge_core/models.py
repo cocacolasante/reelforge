@@ -316,6 +316,22 @@ def _resolution_for(aspect: Aspect) -> tuple[int, int]:
     }[aspect]
 
 
+class PhotoInsert(BaseModel):
+    """A still photo woven into a reel as its own shot.
+
+    `position` is an index into the reel's shot sequence: 0 places the photo
+    before the first video clip, N after the Nth clip (so N == clip count
+    puts it at the end). The API fills `path` from the asset id so the
+    compose pipeline never needs database access.
+    """
+
+    asset_id: str
+    path: str
+    position: int = 0
+    duration_sec: float = 3.0
+    ken_burns: bool = True
+
+
 class ComposeConfig(BaseModel):
     aspect: Aspect = "9:16"
     # target_resolution is derived from aspect if not overridden.
@@ -336,6 +352,8 @@ class ComposeConfig(BaseModel):
     effects: EffectsConfig = Field(default_factory=EffectsConfig)
     music_track_id: str | None = None
     no_music: bool = False
+    # Still photos inserted into the shot sequence (see PhotoInsert).
+    photo_inserts: list[PhotoInsert] = Field(default_factory=list)
     # Mid-scene trim offsets (Phase 7). Clamped to ±2s; the API enforces the
     # minimum-duration guard.
     trim_start_offset_sec: float = 0.0
