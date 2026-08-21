@@ -3,7 +3,7 @@
 import * as React from 'react';
 import Link from 'next/link';
 import { useQueryClient } from '@tanstack/react-query';
-import { Download, Film, Play, RotateCcw, Sparkles, Upload, Wand2 } from 'lucide-react';
+import { Download, Film, Pencil, Play, RotateCcw, Sparkles, Upload, Wand2 } from 'lucide-react';
 import { AppShell } from '@/components/layouts/app-shell';
 import { JobProgress } from '@/components/app/job-progress';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -105,6 +105,8 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
   const [photoPlacement, setPhotoPlacement] =
     React.useState<'start' | 'end' | 'spread'>('end');
   const [photoSeconds, setPhotoSeconds] = React.useState<number[]>([3]);
+  // When a saved edit exists it renders by default; this opts out per render.
+  const [renderAiCut, setRenderAiCut] = React.useState(false);
   // Max output duration (in seconds). `null` means "no cap" — render the full reel.
   // Mapped to `trim_end_offset_sec = reel_duration - maxDuration` on submit.
   const [maxDuration, setMaxDuration] = React.useState<number[] | null>(null);
@@ -186,7 +188,12 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
         ken_burns: true,
       };
     });
-    const config = { ...baseConfig, ...trimOffsets, photo_inserts };
+    const config = {
+      ...baseConfig,
+      ...trimOffsets,
+      photo_inserts,
+      ...(r.has_edits && renderAiCut ? { ignore_edits: true } : {}),
+    };
     try {
       const job = await compose.mutateAsync({ reelId, config });
       setComposeJobId(job.id);
@@ -211,6 +218,17 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
           <h1 className="text-2xl font-semibold tracking-tight">{r.title}</h1>
           <Badge variant="secondary">rank {r.rank}</Badge>
           <Badge variant="muted">{r.suggested_mood}</Badge>
+          {r.has_edits ? (
+            <Badge variant="secondary" title="A saved edit overrides the AI cut">
+              edited · {formatDuration(r.edited_duration_sec ?? r.duration_sec)}
+            </Badge>
+          ) : null}
+          <Link href={`/projects/${projectId}/reels/${reelId}/edit`}>
+            <Button size="sm" variant="outline">
+              <Pencil className="h-4 w-4" />
+              {r.has_edits ? 'Edit timeline' : 'Edit'}
+            </Button>
+          </Link>
           <span className="text-sm text-muted-foreground">
             score {r.overall_score.toFixed(0)} · {formatDuration(r.start_sec)} – {formatDuration(r.end_sec)}
           </span>
@@ -459,7 +477,27 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
               </>
             ) : null}
 
+            {r.has_edits ? (
+              <Alert>
+                <AlertTitle>This reel has edits</AlertTitle>
+                <AlertDescription>
+                  Rendering uses your edited timeline (shots, transitions, text).
+                  Photos are managed in the editor.
+                  <label className="mt-2 flex items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={renderAiCut}
+                      onChange={(e) => setRenderAiCut(e.target.checked)}
+                      className="h-3.5 w-3.5 accent-primary"
+                    />
+                    Render the original AI cut instead (keeps your edits saved)
+                  </label>
+                </AlertDescription>
+              </Alert>
+            ) : null}
+
             {/* Photos */}
+            {!r.has_edits ? (
             <PhotoPicker
               projectId={projectId}
               selected={photoIds}
@@ -473,6 +511,7 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
               seconds={photoSeconds}
               onSeconds={setPhotoSeconds}
             />
+            ) : null}
 
             {/* Quality */}
             <section className="space-y-2">

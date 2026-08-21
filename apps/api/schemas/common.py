@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Optional, Any, Literal
 
 from pydantic import BaseModel
 
@@ -117,6 +117,9 @@ class ReelOut(BaseModel):
     scene_indices: list[int]
     scores: dict[str, int]
     mezzanine_ready: bool
+    # Editor state: True when a saved timeline overrides the AI cut.
+    has_edits: bool = False
+    edited_duration_sec: Optional[float] = None
 
 
 class ReelList(BaseModel):

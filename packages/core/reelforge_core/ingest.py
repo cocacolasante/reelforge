@@ -56,6 +56,11 @@ class MediaAsset:
     def is_photo(self) -> bool:
         return is_photo_probe(self.probe)
 
+    @property
+    def is_audio(self) -> bool:
+        """Audio-only media (voiceover takes, music): no picture at all."""
+        return self.probe.video_codec == "none" and self.probe.audio_codec is not None
+
     @classmethod
     def from_path(cls, path: str | Path) -> "MediaAsset":
         """Probe and return a MediaAsset. Alias for `probe()` with a class-method face."""
@@ -137,14 +142,33 @@ def probe(path: str | Path) -> MediaAsset:
 
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
     audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if video is None and audio is None:
+        raise ProbeError(f"no video or audio stream in {p}")
+
+    bit_rate = int(fmt["bit_rate"]) if fmt.get("bit_rate") else None
     if video is None:
-        raise ProbeError(f"no video stream in {p}")
+        # Audio-only (voiceover take, music). Zero picture geometry; the
+        # rest of the pipeline keys off `video_codec == "none"`.
+        duration = float(fmt.get("duration") or (audio or {}).get("duration") or 0.0)
+        pr = ProbeResult(
+            duration_s=duration,
+            width=0,
+            height=0,
+            fps=0.0,
+            video_codec="none",
+            audio_codec=audio.get("codec_name") if audio else None,
+            bit_rate=bit_rate,
+            container=fmt.get("format_name", "unknown"),
+            color_transfer=None,
+        )
+        return MediaAsset(
+            id=_content_id(p), path=p.resolve(), size_bytes=p.stat().st_size, probe=pr
+        )
 
     duration = float(fmt.get("duration") or video.get("duration") or 0.0)
     width = int(video.get("width") or 0)
     height = int(video.get("height") or 0)
     fps = _parse_fps(video.get("avg_frame_rate") or video.get("r_frame_rate"))
-    bit_rate = int(fmt["bit_rate"]) if fmt.get("bit_rate") else None
 
     pr = ProbeResult(
         duration_s=duration,

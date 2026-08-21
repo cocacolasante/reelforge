@@ -40,6 +40,43 @@ async def enqueue_compose(
     body = dict(body)
     body.setdefault("trim_start_offset_sec", reel.trim_start_offset_sec)
     body.setdefault("trim_end_offset_sec", reel.trim_end_offset_sec)
+    # A saved edit (timeline) renders by default; `ignore_edits: true`
+    # renders the AI cut without touching the saved edit.
+    ignore_edits = bool(body.pop("ignore_edits", False))
+    if reel.edit_json and not ignore_edits and "timeline" not in body:
+        from reelforge_core.models import ReelTimeline
+
+        try:
+            tl = ReelTimeline.model_validate_json(reel.edit_json)
+        except Exception as exc:
+            raise ApiError(400, "INVALID_CONFIG", f"saved edit is unreadable: {exc}")
+        resolved_shots = []
+        for i, shot in enumerate(tl.shots):
+            a = await db.get(dbmod.Asset, shot.asset_id)
+            if a is None or a.project_id != reel.project_id:
+                raise ApiError(
+                    409,
+                    "ASSET_NOT_FOUND",
+                    f"shot {i + 1} of the saved edit references a clip that was "
+                    "deleted — open the editor to fix it.",
+                )
+            resolved_shots.append(shot.model_copy(update={"path": a.path}))
+        resolved_takes = []
+        for k, take in enumerate(tl.voiceovers):
+            a = await db.get(dbmod.Asset, take.asset_id)
+            if a is None or a.project_id != reel.project_id:
+                raise ApiError(
+                    409,
+                    "ASSET_NOT_FOUND",
+                    f"voiceover take {k + 1} of the saved edit was deleted — "
+                    "open the editor to remove it.",
+                )
+            resolved_takes.append(take.model_copy(update={"path": a.path}))
+        body["timeline"] = tl.model_copy(
+            update={"shots": resolved_shots, "voiceovers": resolved_takes}
+        ).model_dump()
+        # The timeline already carries its photos; stray inserts would double up.
+        body.pop("photo_inserts", None)
     # Photo inserts arrive as asset ids; resolve them to on-disk paths here so
     # the compose pipeline never needs database access.
     inserts = body.get("photo_inserts")

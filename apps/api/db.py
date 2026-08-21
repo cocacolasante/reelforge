@@ -111,6 +111,10 @@ class Reel(SQLModel, table=True):
     # the listed child reel_ids. The compose worker takes the montage path
     # instead of the normal extract → render path.
     child_reel_ids_json: Optional[str] = Field(default=None)
+    # Post-generation edits: a serialized ReelTimeline (shots, per-cut
+    # transitions, text overlays). When present, compose renders from it
+    # instead of the AI cut. Null = untouched AI cut.
+    edit_json: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=_now)
 
 
@@ -259,6 +263,13 @@ async def create_all(engine: AsyncEngine) -> None:
         if social_cols and "external_id" not in social_cols:
             await conn.execute(text("DROP TABLE social_accounts"))
         await conn.run_sync(SQLModel.metadata.create_all)
+        # Additive reels column (editable timeline).
+        reel_cols2 = {
+            c[1]
+            for c in (await conn.execute(text("PRAGMA table_info(reels)"))).fetchall()
+        }
+        if reel_cols2 and "edit_json" not in reel_cols2:
+            await conn.execute(text("ALTER TABLE reels ADD COLUMN edit_json TEXT"))
         # Additive assets column (photo support).
         asset_cols = {
             c[1]

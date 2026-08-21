@@ -160,3 +160,64 @@ async def transcribe(
 
 # Small helper so tests can inject a clock for throttle assertions.
 _monotonic = time.monotonic
+
+
+
+def transcribe_audio_file(path: Path, model_name: str = "base.en") -> Transcript | None:
+    """Sync: word-level transcript of any audio/video file (voiceover takes).
+
+    Extracts mono 16 kHz PCM next to nothing persistent (a temp wav beside
+    the caller's cache dir is the caller's business) and runs the same
+    Whisper settings the footage pipeline uses.
+    """
+    import tempfile
+
+    cfg = AnalysisConfig(whisper_model=model_name)
+    with tempfile.TemporaryDirectory(prefix="reelforge-vo-") as td:
+        wav = Path(td) / "audio.wav"
+        extract_audio(path, wav)
+        segments, language, language_prob, duration = _run_transcribe(wav, cfg)
+    if not any(seg.words for seg in segments):
+        return None
+    return Transcript(
+        language=language,
+        language_probability=language_prob,
+        duration=duration,
+        segments=segments,
+    )
+
+
+def ensure_take_transcript(
+    path: Path,
+    asset_id: str,
+    data_dir: Path,
+    model_name: str = "base.en",
+    *,
+    transcriber=transcribe_audio_file,
+) -> Transcript | None:
+    """Cached transcript for a voiceover take, keyed by content-addressed
+    asset id + model + file mtime. Lives at working/{asset_id}/transcript.json
+    so deleting the take (which rmtree's its working dir) drops the cache.
+    """
+    import json as _json
+
+    wd = data_dir / "working" / asset_id
+    wd.mkdir(parents=True, exist_ok=True)
+    out = wd / "transcript.json"
+    stamp_path = wd / "transcript.json.stamp"
+    try:
+        mtime = int(path.stat().st_mtime)
+    except OSError:
+        mtime = 0
+    stamp = {"model": model_name, "mtime": mtime, "kind": "voiceover"}
+    if out.exists() and stamp_path.exists():
+        try:
+            if _json.loads(stamp_path.read_text()) == stamp:
+                raw = _json.loads(out.read_text())
+                return None if raw.get("transcript") is None else Transcript.model_validate(raw["transcript"])
+        except Exception:
+            pass  # unreadable cache → regenerate
+    transcript = transcriber(path, model_name)
+    write_json_atomic(out, {"transcript": transcript.model_dump() if transcript else None})
+    stamp_path.write_text(_json.dumps(stamp, sort_keys=True), encoding="utf-8")
+    return transcript

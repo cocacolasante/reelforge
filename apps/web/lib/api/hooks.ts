@@ -14,6 +14,7 @@ import {
   ProjectListSchema,
   ProjectSchema,
   PublicationListSchema,
+  ReelEditSchema,
   ReelListSchema,
   ReelSchema,
   SocialAccountListSchema,
@@ -21,6 +22,9 @@ import {
   type Asset,
   type Job,
   type Project,
+  type ReelEdit,
+  type ReelTimeline,
+  AssetSchema as _AssetSchema,
 } from './schemas';
 
 // ---------- projects ----------
@@ -273,4 +277,65 @@ export function useProjectPhotos(projectId: string | undefined) {
     ...q,
     photos: (q.data?.assets ?? []).filter((a) => a.kind === 'photo'),
   };
+}
+
+
+// ---------- editable timeline ----------
+
+export function useReelEdit(reelId: string | undefined) {
+  return useQuery({
+    queryKey: ['reel-edit', reelId],
+    queryFn: () => api(`/reels/${reelId}/edit`, { schema: ReelEditSchema }),
+    enabled: !!reelId,
+  });
+}
+
+export function useSaveReelEdit(reelId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (timeline: ReelTimeline) =>
+      api<ReelEdit>(`/reels/${reelId}/edit`, {
+        method: 'PUT',
+        body: { timeline },
+        schema: ReelEditSchema,
+      }),
+    onSuccess: (data) => {
+      qc.setQueryData(['reel-edit', reelId], data);
+      qc.invalidateQueries({ queryKey: ['reel', reelId] });
+    },
+  });
+}
+
+export function useResetReelEdit(reelId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api<void>(`/reels/${reelId}/edit`, { method: 'DELETE' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['reel-edit', reelId] });
+      qc.invalidateQueries({ queryKey: ['reel', reelId] });
+    },
+  });
+}
+
+
+/** Upload a browser-recorded voiceover take (multipart) as an audio asset. */
+export function useUploadVoiceover(projectId: string) {
+  return useMutation({
+    mutationFn: async ({ blob, label }: { blob: Blob; label: string }) => {
+      const form = new FormData();
+      const ext = blob.type.includes('mp4') ? 'm4a' : blob.type.includes('ogg') ? 'ogg' : 'webm';
+      form.append('file', blob, `${label || 'take'}.${ext}`);
+      form.append('label', label);
+      const resp = await fetch(`${API_BASE}/api/v1/projects/${projectId}/voiceovers`, {
+        method: 'POST',
+        body: form,
+      });
+      const json = await resp.json();
+      if (!resp.ok) {
+        const err = (json as { error?: { code?: string; message?: string } }).error;
+        throw new Error(err?.message ?? `upload failed (${resp.status})`);
+      }
+      return _AssetSchema.parse(json) as Asset;
+    },
+  });
 }

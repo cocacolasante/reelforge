@@ -27,6 +27,7 @@ from reelforge_core.models import (
     CaptionStyle,
     ComposeConfig,
     RankedReel,
+    Transcript,
     TranscriptWord,
 )
 
@@ -95,6 +96,10 @@ def _header(width: int, height: int, style: CaptionStyle) -> str:
         f"{style.primary_color},{style.highlight_color},{style.outline_color},"
         "&H00000000,1,0,0,0,100,100,0,0,1,"
         f"{style.outline_width_px},0,{alignment},40,40,{margin_v},1\n"
+        # Text overlays (editor). Size/color/alignment are overridden inline
+        # per event; the style supplies font + a heavier outline + shadow.
+        f"Style: Overlay,{style.font_family},84,&H00FFFFFF,&H00FFFFFF,"
+        "&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,4,1,5,60,60,0,1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
@@ -219,6 +224,72 @@ def _event_text(words: list[TranscriptWord], max_chars: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _ass_color_to_inline(ass_color: str) -> str:
+    hexpart = ass_color.strip().removeprefix("&H").removesuffix("&")
+    return f"&H{hexpart[-6:]}&"
+
+
+def _overlay_event(o, width: int, height: int, style: CaptionStyle) -> str:
+    """One Dialogue line for a text overlay, drawn on layer 1 (above captions)."""
+    an = {"top": 8, "center": 5, "bottom": 2}[o.position]
+    if o.position == "top":
+        margin_v = int(height * 0.08)
+    elif o.position == "bottom":
+        # Sit above the caption band so the two never collide.
+        margin_v = int(height * style.safe_margin_pct) + int(style.font_size_px * 2.2)
+    else:
+        margin_v = 0
+    fad = f"\\fad({max(0, o.fade_ms)},{max(0, o.fade_ms)})" if o.fade_ms > 0 else ""
+    tags = (
+        f"{{\\an{an}{fad}\\fs{max(12, o.font_size_px)}"
+        f"\\c{_ass_color_to_inline(o.color)}\\3c{_ass_color_to_inline(o.outline_color)}"
+        f"\\b{1 if o.bold else 0}}}"
+    )
+    text = _escape_text(o.text).replace("\r", "").replace("\n", "\\N")
+    start = max(0.0, o.start_sec)
+    end = max(start + 0.1, o.end_sec)
+    return (
+        f"Dialogue: 1,{_fmt_time(start)},{_fmt_time(end)},Overlay,,0,0,{margin_v},,"
+        f"{tags}{text}\n"
+    )
+
+
+def _render_word_events(words: list[TranscriptWord], mt, config: ComposeConfig) -> list[str]:
+    """Caption events for one run of words, in the configured mode. `mt` maps
+    a word-local time to the mezzanine timeline."""
+    out: list[str] = []
+    if config.captions.mode == "karaoke":
+        highlight = _inline_color(config.captions.highlight_color)
+        chunks = _chunk_words_to_lines(words, config.captions.karaoke_max_chars, max_lines=1)
+        for chunk in chunks:
+            cw = [w for w in chunk if w.word.strip()]
+            if not cw:
+                continue
+            tokens = [_escape_text(w.word.strip()) for w in cw]
+            for k, w in enumerate(cw):
+                start = mt(cw[0].start) if k == 0 else mt(w.start)
+                end = mt(cw[k + 1].start) if k + 1 < len(cw) else mt(cw[-1].end)
+                if end <= start:
+                    end = start + 0.15
+                line = " ".join(
+                    f"{{{highlight}\\b1}}{tok}{{\\r}}" if j == k else tok
+                    for j, tok in enumerate(tokens)
+                )
+                out.append(_event_raw(start, end, line))
+    else:
+        for ev in _chunk_words_to_lines(
+            words, config.captions.max_chars_per_line, config.captions.max_lines
+        ):
+            if not ev:
+                continue
+            start = mt(ev[0].start)
+            end = mt(ev[-1].end)
+            if end <= start:
+                end = start + 0.3
+            out.append(_event(start, end, _event_text(ev, config.captions.max_chars_per_line)))
+    return out
+
+
 def build_captions(
     reel: RankedReel,
     analysis: AnalysisReport,
@@ -226,139 +297,152 @@ def build_captions(
     reel_dir: Path,
     end_trims: list[float] | None = None,
     clips: list | None = None,
+    analyses: "dict[str, AnalysisReport | None] | None" = None,
+    overlays: list | None = None,
+    xfades: list[float] | None = None,
+    voiceover_captions: "list[tuple[object, Transcript]] | None" = None,
 ) -> Path:
     """Produce `captions.ass` on disk. Always writes a valid ASS file.
 
-    Prefers the user-edited transcript (see `transcript_store.load_override_sync`)
-    when one exists for this asset.
+    The subtitle track carries two things: spoken-word captions (mapped from
+    each shot's source transcript onto the mezzanine timeline) and editor
+    text overlays (already in mezzanine seconds). Either may be empty.
+
+    Shot geometry comes from `clips` when given (the ACTUAL rendered shot
+    list — possibly mixing assets and photos) or is reconstructed from the
+    reel's scenes. `xfades` is the per-cut crossfade duration list; a single
+    reel-wide value is derived from config when omitted.
+
+    Prefers user-edited transcripts (`transcript_store.load_override_sync`)
+    per asset.
     """
     out_path = reel_dir / "captions.ass"
     width, height = config.resolution
-
     mode = config.captions.mode
-    effective_analysis = analysis
+
+    # Per-asset transcripts, with user overrides applied. Legacy single-asset
+    # callers get {reel asset: analysis}.
+    effective: dict[str, AnalysisReport | None] = dict(analyses or {})
+    effective.setdefault(analysis.asset_id, analysis)
     try:
         from reelforge_core.transcript_store import load_override_sync
 
-        override = load_override_sync(analysis.asset_id)
+        for aid, rep in list(effective.items()):
+            if rep is None:
+                continue
+            override = load_override_sync(aid)
+            if override is not None:
+                effective[aid] = rep.model_copy(update={"transcript": override})
     except Exception:  # pragma: no cover
-        override = None
-    if override is not None:
-        effective_analysis = analysis.model_copy(update={"transcript": override})
+        pass
 
-    if mode == "off" or effective_analysis.transcript is None:
-        write_text_atomic(out_path, EMPTY_ASS.format(w=width, h=height))
-        return out_path
-
-    words = words_in_reel(effective_analysis, reel)
-    if not words:
-        write_text_atomic(out_path, EMPTY_ASS.format(w=width, h=height))
-        return out_path
-
-    xfade_dur = (
-        config.transition.duration_sec if config.transition.kind != "cut" else 0.0
-    )
-
-    # Build the source→mezzanine mapping from the ACTUAL rendered shot list.
-    # Every shot occupies mezzanine time; only video shots map back to a span
-    # of source footage, so an inserted photo simply pushes later captions
-    # later. When `clips` isn't supplied the shot list is reconstructed from
-    # the reel's scenes: clip_bounds folds in user trims + speech-safe
-    # snapping (against the ORIGINAL transcript — the one clip extraction
-    # saw) and `end_trims` carries the beat-sync shortenings.
-    # (src_start, src_end, duration) — src bounds are None for photo shots.
-    shots: list[tuple[float | None, float | None, float]] = []
+    # ----- shot geometry: (asset_id, src_start, src_end, duration) -----
+    shots: list[tuple[str | None, float | None, float | None, float]] = []
     if clips is not None:
         for c in clips:
             if c.is_photo:
-                shots.append((None, None, c.duration))
+                shots.append((None, None, None, c.duration))
             else:
-                shots.append((c.in_ts, c.out_ts, c.duration))
+                shots.append((c.asset_id or analysis.asset_id, c.in_ts, c.out_ts, c.duration))
     else:
         from reelforge_core.compose.clips import clip_bounds
 
         n = len(reel.scene_indices)
         for position, idx in enumerate(reel.scene_indices):
             scene = analysis.scenes[idx]
-            s, e = clip_bounds(position, n, scene, config, analysis)
+            s_, e_ = clip_bounds(position, n, scene, config, analysis)
             if end_trims is not None and position < n - 1 and position < len(end_trims):
-                e = max(s + 0.5, e - end_trims[position])
-            shots.append((s, e, e - s))
+                e_ = max(s_ + 0.5, e_ - end_trims[position])
+            shots.append((analysis.asset_id, s_, e_, e_ - s_))
 
-    segments_map: list[tuple[float, float, float]] = []  # (src_start, src_end, mezz_start)
+    n_cuts = max(0, len(shots) - 1)
+    if xfades is None:
+        single = config.transition.duration_sec if config.transition.kind != "cut" else 0.04
+        xfades = [single] * n_cuts
+    xfades = list(xfades)[:n_cuts] + [0.0] * max(0, n_cuts - len(xfades))
+
+    segments: list[tuple[str, float, float, float]] = []  # (asset, src_start, src_end, mezz_start)
     cum = 0.0
-    for position, (src_start, src_end, dur) in enumerate(shots):
-        if src_start is not None and src_end is not None:
-            segments_map.append((src_start, src_end, cum - position * xfade_dur))
+    reclaimed = 0.0
+    for position, (aid, src_start, src_end, dur) in enumerate(shots):
+        if position > 0:
+            reclaimed += xfades[position - 1]
+        if aid is not None and src_start is not None and src_end is not None:
+            segments.append((aid, src_start, src_end, cum - reclaimed))
         cum += dur
 
-    def _mt(t: float) -> float | None:
-        for s, e, mezz_start in segments_map:
-            if s <= t <= e + 1e-6:
-                return max(0.0, mezz_start + (t - s))
-        return None
+    buf = [_header(width, height, config.captions)]
+    caption_events: list[str] = []
 
-    words = [w for w in words if _mt((w.start + w.end) / 2.0) is not None]
-    if not words:
+    # ----- voiceover captions -----
+    # Takes are already on the mezzanine timeline: a word at `w.start` in the
+    # take sits at `take.start_sec + w.start`. While a take plays it owns the
+    # caption band (footage audio is ducked beneath it), so footage words
+    # inside any take's span are suppressed below.
+    vo_spans: list[tuple[float, float]] = []
+    total_len = cum
+    if mode != "off":
+        for take, transcript in (voiceover_captions or []):
+            if transcript is None or getattr(take, "effective_gain", 1.0) <= 0:
+                continue
+            t0 = max(0.0, float(getattr(take, "start_sec", 0.0)))
+            words = [
+                w for seg in transcript.segments for w in seg.words
+                if w.word.strip() and t0 + (w.start + w.end) / 2.0 <= total_len + 1e-6
+            ]
+            if not words:
+                continue
+            vo_spans.append((t0, t0 + max(w.end for w in words)))
+            caption_events.extend(
+                _render_word_events(words, lambda t, _t0=t0: max(0.0, _t0 + t), config)
+            )
+
+    def _covered(t: float) -> bool:
+        return any(a - 1e-6 <= t <= b + 1e-6 for a, b in vo_spans)
+
+    # ----- spoken-word captions, per segment -----
+    if mode != "off":
+        for aid, src_start, src_end, mezz_start in segments:
+            rep = effective.get(aid)
+            if rep is None or rep.transcript is None:
+                continue
+            seg_words: list[TranscriptWord] = []
+            for seg in rep.transcript.segments:
+                if seg.end < src_start or seg.start > src_end:
+                    continue
+                for w in seg.words:
+                    mid = (w.start + w.end) / 2.0
+                    if src_start <= mid <= src_end + 1e-6:
+                        seg_words.append(w)
+            def _mt(t: float, _ms: float = mezz_start, _ss: float = src_start) -> float:
+                return max(0.0, _ms + (t - _ss))
+
+            # Footage words under a voiceover take yield to the take's captions.
+            seg_words = [w for w in seg_words if not _covered(_mt((w.start + w.end) / 2.0))]
+            if not seg_words:
+                continue
+            caption_events.extend(_render_word_events(seg_words, _mt, config))
+
+    # ----- text overlays (editor) -----
+    overlay_events = [
+        _overlay_event(o, width, height, config.captions)
+        for o in (overlays or [])
+        if o.text.strip() and o.end_sec > o.start_sec
+    ]
+
+    if not caption_events and not overlay_events:
         write_text_atomic(out_path, EMPTY_ASS.format(w=width, h=height))
         return out_path
 
-    def _mtw(t: float, w: TranscriptWord) -> float:
-        """Map `t`, falling back to the word's midpoint (guaranteed mapped —
-        words whose midpoints don't map were filtered above)."""
-        v = _mt(t)
-        if v is None:
-            v = _mt((w.start + w.end) / 2.0)
-        return v if v is not None else 0.0
-
-    buf = [_header(width, height, config.captions)]
-
-    if mode == "karaoke":
-        # TikTok-style word highlight: group words into short single lines;
-        # the full line stays visible for its whole duration and each word
-        # gets an inline color override while it's being spoken. One Dialogue
-        # per word interval — event k ends exactly when event k+1 starts, so
-        # the line never flickers.
-        highlight = _inline_color(config.captions.highlight_color)
-        chunks = _chunk_words_to_lines(
-            words, config.captions.karaoke_max_chars, max_lines=1
-        )
-        for chunk in chunks:
-            cw = [w for w in chunk if w.word.strip()]
-            if not cw:
-                continue
-            tokens = [_escape_text(w.word.strip()) for w in cw]
-            for k, w in enumerate(cw):
-                # First event starts at the line's first word; middle events
-                # hand off at the NEXT word's start so pauses inside the line
-                # hold the current highlight instead of dropping the caption.
-                start = _mtw(cw[0].start, cw[0]) if k == 0 else _mtw(w.start, w)
-                end = (
-                    _mtw(cw[k + 1].start, cw[k + 1])
-                    if k + 1 < len(cw)
-                    else _mtw(cw[-1].end, cw[-1])
-                )
-                if end <= start:
-                    end = start + 0.15
-                line = " ".join(
-                    f"{{{highlight}\\b1}}{tok}{{\\r}}" if j == k else tok
-                    for j, tok in enumerate(tokens)
-                )
-                buf.append(_event_raw(start, end, line))
-    else:
-        # Static mode: group words into multi-line events.
-        events = _chunk_words_to_lines(
-            words, config.captions.max_chars_per_line, config.captions.max_lines
-        )
-        for ev in events:
-            if not ev:
-                continue
-            start = _mtw(ev[0].start, ev[0])
-            end = _mtw(ev[-1].end, ev[-1])
-            if end <= start:
-                end = start + 0.3
-            text = _event_text(ev, config.captions.max_chars_per_line)
-            buf.append(_event(start, end, text))
-
+    buf.extend(caption_events)
+    buf.extend(overlay_events)
     write_text_atomic(out_path, "".join(buf))
     return out_path
+
+
+def has_dialogue(ass_path: Path) -> bool:
+    """True when the ASS file carries at least one event worth burning in."""
+    try:
+        return "Dialogue:" in ass_path.read_text(encoding="utf-8")
+    except OSError:
+        return False

@@ -106,7 +106,7 @@ def detect_beats(path: Path, analyze_sec: float = 60.0) -> BeatGrid | None:
 
 def compute_beat_end_trims(
     durations: list[float],
-    xfade_dur: float,
+    xfade_dur: float | list[float],
     grid: BeatGrid,
     max_trim: float,
     min_clip_sec: float = 1.0,
@@ -119,16 +119,19 @@ def compute_beat_end_trims(
     trims = [0.0] * max(0, n - 1)
     if n < 2:
         return trims
+    xfades = (
+        list(xfade_dur) if isinstance(xfade_dur, list) else [xfade_dur] * (n - 1)
+    )
     adjusted = list(durations)
     for k in range(n - 1):
         # Transition k midpoint on the mezzanine timeline (graph_builder's
-        # xfade offset + half the fade).
-        offset = sum(adjusted[: k + 1]) - (k + 1) * xfade_dur
-        center = offset + xfade_dur / 2.0
+        # xfade offset + half the fade). Per-cut durations are honored.
+        offset = sum(adjusted[: k + 1]) - sum(xfades[: k + 1])
+        center = offset + xfades[k] / 2.0
         trim = grid.phase_within_beat(center)
         if trim <= 1e-4 or trim > max_trim:
             continue
-        if adjusted[k] - trim < min_clip_sec + xfade_dur:
+        if adjusted[k] - trim < min_clip_sec + xfades[k]:
             continue
         trims[k] = round(trim, 3)
         adjusted[k] -= trims[k]

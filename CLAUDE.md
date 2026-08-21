@@ -321,6 +321,62 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   every frame (~10x slower renders); the current effect scales the clip up
   once by `ken_burns_zoom` and drifts a target-sized crop window
   diagonally. Do not reintroduce zoompan.
+- **Editable timeline (post-generation editing).** `Reel.edit_json` stores a
+  `ReelTimeline` (ordered `TimelineShot`s — arbitrary `[in,out]` ranges of
+  ANY project video or photos — plus per-cut `transition_after` and
+  `TextOverlay`s in mezzanine seconds). `GET/PUT/DELETE /reels/{id}/edit`
+  (GET returns the AI cut as a default timeline when nothing is saved, plus
+  the project's sources with scene thumbnails). The compose endpoint injects
+  the saved timeline (paths resolved from asset ids) unless
+  `ignore_edits: true`; `ComposeConfig.timeline` then REPLACES scene-derived
+  shots, trim offsets and photo_inserts. Pipeline: `extract_timeline_clips`
+  (multi-source, speech-snap on outer bounds, beat trims on interior),
+  `resolve_transitions` gives per-cut (kind, duration) and `_xfade_offsets`
+  / `compute_beat_end_trims` / captions all take per-cut lists. Captions are
+  built per shot from THAT shot's asset transcript (`analyses` dict) — two
+  shots from different assets may have overlapping source times. Overlays
+  render through the same ASS file (`Overlay` style, layer 1, inline
+  `\an`/`\fs`/`\c`/`\fad`), so `captions_for_render` is decided by
+  `has_dialogue()` — not by caption mode. UI: `/reels/{id}/edit` page with a
+  **scrubbable client-side preview** (`components/app/timeline-preview.tsx`):
+  plays source footage straight from `GET /assets/{id}/media` (Range
+  streaming), one `<video>` per distinct asset stacked + opacity-crossfaded
+  on a wall-clock master timeline, photos as `<img>`, overlays as DOM text
+  scaled by frameHeight/1920. `buildSegments()` mirrors the render graph's
+  xfade placement. Not previewed: captions, music, LUT, reframe. HEVC
+  sources can't decode in Chrome — surfaced as an in-frame warning.
+- **Audio controls + voiceover.** `TimelineShot.volume/muted` →
+  `ClipInfo.volume` → a per-clip `volume=` in the graph's audio prep (before
+  the crossfade chain). Voiceovers are `Asset.kind="audio"` rows (ingest now
+  accepts audio-only media: `video_codec="none"`, `MediaAsset.is_audio`)
+  uploaded via multipart `POST /projects/{id}/voiceovers` from the browser's
+  MediaRecorder (webm/opus in Chrome, mp4/aac in Safari — ffmpeg decodes
+  both). `ReelTimeline.voiceovers` = takes placed at mezzanine `start_sec`.
+  Render bus: takes → adelay+gain → amix → loudnorm(-12) = `[vo_ready]`;
+  footage audio `sidechaincompress`-ducks under it (config
+  `voiceover_ducking`), amix(normalize=0, duration=first) → `[voice_pre]` →
+  existing voice loudnorm — so music still ducks under footage+voiceover
+  together. Editor: "Record at playhead" plays the preview SILENCED
+  (`silenced` prop) so the mic doesn't capture footage; takes are placed
+  where recording started and can be nudged. Preview caps gain at 1.0 (HTML
+  media limit) while the render allows up to 3x.
+- **Voiceover auto-captions + waveforms.** At the captions stage the compose
+  pipeline transcribes every unmuted `VoiceoverTake` with faster-whisper
+  (`analysis/transcribe.py::ensure_take_transcript`, cached at
+  `/data/working/{take_asset_id}/transcript.json` + `.stamp` keyed on
+  `(model, mtime)`; `ComposeConfig.voiceover_whisper_model`, default
+  `base.en`) and passes `voiceover_captions=[(take, transcript)]` to
+  `build_captions`. Take words are emitted at `take.start_sec + word.start`
+  on the mezzanine timeline (no source→mezz mapping); footage words whose
+  mapped midpoint falls under a take are suppressed so two caption streams
+  never overlap. `CaptionStyle.caption_voiceover=False` turns it off.
+  `GET /assets/{id}/waveform?start&end&buckets` returns a normalized peak
+  envelope (ffmpeg → 8 kHz mono s16le → per-bucket max / 98th pct; in-memory
+  LRU, 900 s span cap) — `components/app/waveform-bar.tsx` draws it under
+  every shot and take in the editor with the preview playhead
+  (`TimelinePreview.onTimeChange`, ~15 Hz). Note the compose POST body IS
+  the `ComposeConfig` (no `config:` wrapper — unknown top-level keys are
+  silently ignored).
 - **Photos are shots, not sources.** An uploaded image becomes an Asset with
   `kind="photo"` (detected by `ingest.is_photo_probe` — image container /
   codec). Photos are never analyzed or selected; they're inserted at compose

@@ -278,6 +278,9 @@ class CaptionStyle(BaseModel):
     # Karaoke mode groups words into short single lines of at most this many
     # characters; the spoken word is highlighted within the visible line.
     karaoke_max_chars: int = 18
+    # Transcribe voiceover takes and caption them too. While a take plays,
+    # its words replace any footage captions (the footage is ducked anyway).
+    caption_voiceover: bool = True
     position: Literal["lower_third", "centered", "top"] = "lower_third"
     safe_margin_pct: float = 0.15
 
@@ -332,6 +335,104 @@ class PhotoInsert(BaseModel):
     ken_burns: bool = True
 
 
+# ---------------------------------------------------------------------------
+# Editable timeline (post-generation editing)
+# ---------------------------------------------------------------------------
+
+
+class TimelineShot(BaseModel):
+    """One shot in an edited reel.
+
+    video: an arbitrary [in_ts, out_ts] range of any project video — not
+           limited to detected scenes.
+    photo: a still held for duration_sec with a baked-in drift.
+
+    `path` is filled by the API at enqueue (asset id -> on-disk path) so the
+    compose pipeline never needs database access. `transition_after`
+    overrides the reel-wide transition for the cut that FOLLOWS this shot.
+    """
+
+    kind: Literal["video", "photo"]
+    asset_id: str
+    path: str = ""
+    in_ts: float = 0.0
+    out_ts: float = 0.0
+    duration_sec: float = 3.0
+    ken_burns: bool = True
+    transition_after: "TransitionStyle | None" = None
+    # Source-audio gain for this shot (1.0 = as recorded, 0..3). Muted shots
+    # keep their audio stream (the crossfade chain needs one) at zero gain.
+    volume: float = 1.0
+    muted: bool = False
+
+    @property
+    def effective_gain(self) -> float:
+        if self.muted:
+            return 0.0
+        return max(0.0, min(3.0, self.volume))
+
+    @property
+    def duration(self) -> float:
+        if self.kind == "photo":
+            return max(0.2, self.duration_sec)
+        return max(0.1, self.out_ts - self.in_ts)
+
+
+class TextOverlay(BaseModel):
+    """Burned-in text on the mezzanine timeline (seconds from reel start).
+
+    Colors use ASS &HAABBGGRR notation like CaptionStyle; the web UI converts
+    from hex. Rendered through the same subtitle pass as captions, so it
+    costs nothing extra at render time.
+    """
+
+    id: str = ""
+    text: str
+    start_sec: float
+    end_sec: float
+    position: Literal["top", "center", "bottom"] = "center"
+    font_size_px: int = 84
+    color: str = "&H00FFFFFF"
+    outline_color: str = "&H00000000"
+    bold: bool = True
+    fade_ms: int = 250
+
+
+class VoiceoverTake(BaseModel):
+    """One recorded voiceover take, placed on the mezzanine timeline.
+
+    Takes are audio-only assets (kind="audio") uploaded from the browser's
+    recorder. `path` is resolved by the API at enqueue. Several takes can
+    cover different parts of a reel ("record in cuts"); they're mixed under
+    the footage audio, which ducks beneath them.
+    """
+
+    id: str = ""
+    asset_id: str
+    path: str = ""
+    start_sec: float = 0.0
+    duration_sec: float = 0.0
+    volume: float = 1.0
+    muted: bool = False
+    label: str = ""
+
+    @property
+    def effective_gain(self) -> float:
+        if self.muted:
+            return 0.0
+        return max(0.0, min(3.0, self.volume))
+
+
+class ReelTimeline(BaseModel):
+    shots: list[TimelineShot] = Field(default_factory=list)
+    overlays: list[TextOverlay] = Field(default_factory=list)
+    voiceovers: list[VoiceoverTake] = Field(default_factory=list)
+
+    @property
+    def total_duration(self) -> float:
+        return sum(s.duration for s in self.shots)
+
+
 class ComposeConfig(BaseModel):
     aspect: Aspect = "9:16"
     # target_resolution is derived from aspect if not overridden.
@@ -354,6 +455,10 @@ class ComposeConfig(BaseModel):
     no_music: bool = False
     # Still photos inserted into the shot sequence (see PhotoInsert).
     photo_inserts: list[PhotoInsert] = Field(default_factory=list)
+    # Edited timeline. When set it is the complete shot list (video ranges,
+    # photos, per-cut transitions, text overlays) and replaces the
+    # scene-derived shots, trim offsets and photo_inserts entirely.
+    timeline: ReelTimeline | None = None
     # Mid-scene trim offsets (Phase 7). Clamped to ±2s; the API enforces the
     # minimum-duration guard.
     trim_start_offset_sec: float = 0.0
@@ -375,6 +480,11 @@ class ComposeConfig(BaseModel):
     normalize_loudness: bool = True
     loudness_target_lufs: float = -14.0
     loudness_true_peak_db: float = -1.5
+    # Footage audio ducks beneath voiceover takes (sidechain keyed on the
+    # voiceover mix); music already ducks beneath the whole voice bus.
+    voiceover_ducking: bool = True
+    voiceover_volume_db: float = -12.0
+    voiceover_whisper_model: str = "base.en"
     ducking_threshold_db: float = -20.0
     ducking_ratio: float = 8.0
     ducking_attack_ms: float = 5.0

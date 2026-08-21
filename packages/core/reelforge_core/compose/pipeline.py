@@ -15,10 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from reelforge_core.compose.captions import build_captions
+from reelforge_core.compose.captions import build_captions, has_dialogue
 from reelforge_core.compose.clips import ClipInfo, extract_clips
 from reelforge_core.compose.graph import ffmpeg_version, run_ffmpeg
-from reelforge_core.compose.graph_builder import build_final_command
+from reelforge_core.compose.graph_builder import build_final_command, resolve_transitions
 from reelforge_core.compose.music import (
     load_music_library,
     prepare_music,
@@ -153,6 +153,19 @@ async def _run_ffmpeg_with_progress(
         )
 
 
+def _load_analysis(data_dir: Path, asset_id: str) -> AnalysisReport | None:
+    """analysis.json for a timeline source, or None if it was never analyzed
+    (captions/speech-snapping simply don't apply to that shot)."""
+    path = data_dir / "working" / asset_id / "analysis.json"
+    if not path.exists():
+        return None
+    try:
+        return AnalysisReport.model_validate_json(path.read_text())
+    except Exception:
+        log.warning("unreadable analysis.json for %s; ignoring", asset_id)
+        return None
+
+
 async def compose(
     asset: MediaAsset,
     reel: RankedReel,
@@ -180,6 +193,54 @@ async def compose(
     library = load_music_library()
     track = select_track(library, config, reel)
 
+    # ----- shot plan -----
+    # Timeline mode (post-generation editing): the config carries the complete
+    # shot list — arbitrary ranges of any project video, photos, per-cut
+    # transitions and text overlays — and replaces scene-derived shots, trim
+    # offsets and photo_inserts entirely.
+    timeline = config.timeline if (config.timeline and config.timeline.shots) else None
+    sources: dict[str, MediaAsset] = {asset.id: asset}
+    analyses: dict[str, AnalysisReport | None] = {analysis.asset_id: analysis}
+    per_cut: list[tuple[str, float] | None] | None = None
+    planned_durations: list[float]
+    if timeline is not None:
+        from reelforge_core.ingest import probe as _probe
+
+        for shot in timeline.shots:
+            if shot.asset_id in sources:
+                continue
+            path = Path(shot.path) if shot.path else None
+            if path is None or not path.exists():
+                raise ComposeError(
+                    f"timeline references asset {shot.asset_id} with missing file {shot.path!r}"
+                )
+            sources[shot.asset_id] = await asyncio.to_thread(_probe, path)
+            if shot.kind == "video":
+                analyses[shot.asset_id] = _load_analysis(data_dir, shot.asset_id)
+        per_cut = [
+            (
+                (s.transition_after.kind, s.transition_after.duration_sec)
+                if s.transition_after is not None
+                else None
+            )
+            for s in timeline.shots[:-1]
+        ]
+        planned_durations = [s.duration for s in timeline.shots]
+    else:
+        from reelforge_core.compose.clips import clip_bounds
+
+        n = len(reel.scene_indices)
+        planned_durations = [
+            (lambda b: b[1] - b[0])(
+                clip_bounds(pos, n, analysis.scenes[idx], config, analysis)
+            )
+            for pos, idx in enumerate(reel.scene_indices)
+        ]
+    # Per-cut (xfade name, duration) for the planned shots. Photo inserts in
+    # scene mode are added later and get the reel-wide transition.
+    transitions = resolve_transitions(config, len(planned_durations), per_cut)
+    xfade_durs = [d for _, d in transitions]
+
     # Beat sync: analyze the chosen track (tempo + phase) and compute the
     # per-clip end trims that put each crossfade midpoint on a beat. Must
     # happen before clip extraction — the trims change clip bounds.
@@ -188,23 +249,16 @@ async def compose(
     if (
         track is not None
         and config.beat_sync
-        and len(reel.scene_indices) > 1
+        and len(planned_durations) > 1
         and config.transition.kind != "cut"
     ):
         from reelforge_core.compose.beats import compute_beat_end_trims, detect_beats
-        from reelforge_core.compose.clips import clip_bounds
 
         beat_grid = await asyncio.to_thread(detect_beats, Path(track.path))
         if beat_grid is not None:
-            n = len(reel.scene_indices)
-            planned = [
-                clip_bounds(pos, n, analysis.scenes[idx], config, analysis)
-                for pos, idx in enumerate(reel.scene_indices)
-            ]
-            durations = [out - in_ for in_, out in planned]
             end_trims = compute_beat_end_trims(
-                durations,
-                config.transition.duration_sec,
+                planned_durations,
+                xfade_durs,
                 beat_grid,
                 config.beat_sync_max_adjust_sec,
             )
@@ -224,23 +278,39 @@ async def compose(
 
     await progress(_emit("clips", 0.0))
     try:
-        clips = await extract_clips(
-            asset,
-            reel,
-            analysis,
-            config,
-            reel_dir,
-            log_file,
-            _clip_progress,
-            end_trims=end_trims,
-        )
+        if timeline is not None:
+            from reelforge_core.compose.clips import extract_timeline_clips
+
+            clips = await extract_timeline_clips(
+                timeline.shots,
+                sources,
+                analyses,
+                config,
+                reel_dir,
+                log_file,
+                _clip_progress,
+                end_trims=end_trims,
+            )
+        else:
+            clips = await extract_clips(
+                asset,
+                reel,
+                analysis,
+                config,
+                reel_dir,
+                log_file,
+                _clip_progress,
+                end_trims=end_trims,
+            )
     except FFmpegError as exc:
         raise ComposeError(f"clip extraction failed: {exc}") from exc
+    except FileNotFoundError as exc:
+        raise ComposeError(str(exc)) from exc
 
-    # Still photos become shots of their own, spliced into the sequence at
-    # their configured positions. Rendered after the video clips so their
-    # positions refer to the final video clip count.
-    if config.photo_inserts:
+    # Still photos become shots of their own (scene mode only — a timeline
+    # already carries its photos as shots), spliced into the sequence at
+    # their configured positions.
+    if timeline is None and config.photo_inserts:
         from reelforge_core.compose.photos import (
             interleave_photo_clips,
             render_photo_clip,
@@ -277,34 +347,73 @@ async def compose(
             )
         clips = interleave_photo_clips(clips, rendered)
         log.info("composed with %d photo insert(s)", len(rendered))
+        # The shot count changed; recompute per-cut transitions (reel-wide
+        # default for every cut — photos never carry overrides).
+        transitions = resolve_transitions(config, len(clips))
+        xfade_durs = [d for _, d in transitions]
 
     await progress(_emit("clips", 1.0))
 
     # ----- captions -----
     await progress(_emit("captions", 0.0))
+    # Voiceover takes get their own captions: transcribe each unmuted take
+    # (cached per take under working/{take_asset_id}) before building the
+    # subtitle track.
+    voiceover_captions: list[tuple[object, object]] = []
+    if (
+        timeline is not None
+        and timeline.voiceovers
+        and config.captions.mode != "off"
+        and config.captions.caption_voiceover
+    ):
+        from reelforge_core.analysis.transcribe import ensure_take_transcript
+
+        live_takes = [t for t in timeline.voiceovers if t.effective_gain > 0 and t.path]
+        for i, take in enumerate(live_takes):
+            await progress(
+                _emit("captions", 0.1 + 0.7 * (i / max(1, len(live_takes))),
+                      f"transcribing voiceover {i + 1}/{len(live_takes)}")
+            )
+            try:
+                transcript = await asyncio.to_thread(
+                    ensure_take_transcript,
+                    Path(take.path),
+                    take.asset_id,
+                    data_dir,
+                    config.voiceover_whisper_model,
+                )
+            except Exception:
+                log.warning("voiceover transcription failed for %s; no captions for it",
+                            take.asset_id, exc_info=True)
+                continue
+            if transcript is not None:
+                voiceover_captions.append((take, transcript))
     try:
         captions_path = build_captions(
-            reel, analysis, config, reel_dir, end_trims=end_trims, clips=clips
+            reel,
+            analysis,
+            config,
+            reel_dir,
+            end_trims=end_trims,
+            clips=clips,
+            analyses=analyses,
+            overlays=list(timeline.overlays) if timeline is not None else [],
+            xfades=xfade_durs,
+            voiceover_captions=voiceover_captions,
         )
     except Exception as exc:
         raise ComposeError(f"caption build failed: {exc}") from exc
-    captions_for_render: Path | None
-    if config.captions.mode == "off" or analysis.transcript is None:
-        captions_for_render = None
-    else:
-        captions_for_render = captions_path
+    # Burn the subtitle track in when it carries anything at all — spoken
+    # captions and/or editor text overlays.
+    captions_for_render: Path | None = (
+        captions_path if has_dialogue(captions_path) else None
+    )
     await progress(_emit("captions", 1.0))
 
     # ----- music -----
     await progress(_emit("music", 0.0))
     music_path: Path | None = None
-    xfade_dur = (
-        config.transition.duration_sec if config.transition.kind != "cut" else 0.04
-    )
-    target_duration = max(
-        0.1,
-        sum(c.duration for c in clips) - max(0, len(clips) - 1) * xfade_dur,
-    )
+    target_duration = max(0.1, sum(c.duration for c in clips) - sum(xfade_durs))
     if track is not None:
         try:
             music_path = prepare_music(track, target_duration, config, reel_dir, log_file)
@@ -315,6 +424,17 @@ async def compose(
     # ----- render -----
     await progress(_emit("render", 0.0))
     mezzanine_path = reel_dir / "mezzanine.mp4"
+    voiceovers: list[tuple[Path, float, float]] = []
+    if timeline is not None:
+        for take in timeline.voiceovers:
+            if take.effective_gain <= 0:
+                continue
+            vo_path = Path(take.path) if take.path else None
+            if vo_path is None or not vo_path.exists():
+                raise ComposeError(
+                    f"voiceover take {take.label or take.asset_id} is missing on disk ({take.path!r})"
+                )
+            voiceovers.append((vo_path, max(0.0, take.start_sec), take.effective_gain))
     plan = build_final_command(
         clips=clips,
         analysis=analysis,
@@ -322,6 +442,8 @@ async def compose(
         captions_path=captions_for_render,
         config=config,
         output_path=mezzanine_path,
+        transitions=transitions,
+        voiceovers=voiceovers,
     )
 
     try:

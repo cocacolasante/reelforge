@@ -33,6 +33,11 @@ class ClipInfo:
     # motion is already baked in (the render graph skips Ken Burns).
     is_photo: bool = False
     photo_asset_id: str | None = None
+    # Which source the video shot came from (timeline mode can mix assets).
+    asset_id: str | None = None
+    # Linear gain applied to this shot's own audio in the render graph
+    # (editor per-shot volume/mute). 1.0 = untouched.
+    volume: float = 1.0
 
 
 def _video_filter_chain(
@@ -313,3 +318,168 @@ async def extract_clips(
         assert r is not None
         out.append(r)
     return out
+
+
+
+# ---------------------------------------------------------------------------
+# Timeline mode: arbitrary shots from any project asset
+# ---------------------------------------------------------------------------
+
+
+async def extract_timeline_clips(
+    shots: list,
+    sources: dict[str, MediaAsset],
+    analyses: dict[str, "AnalysisReport | None"],
+    config: ComposeConfig,
+    reel_dir: Path,
+    log_file: Path,
+    progress_cb: Callable[[int, int], Awaitable[None]] | None = None,
+    end_trims: list[float] | None = None,
+) -> list[ClipInfo]:
+    """Render an edited timeline's shots into normalized clips, in order.
+
+    Video shots are arbitrary [in, out] ranges of any source (not limited to
+    detected scenes); photos come from `compose.photos`. Speech-safe snapping
+    applies to the reel's outer bounds when the source has a transcript;
+    beat-sync `end_trims` shorten interior shots exactly as in scene mode.
+    """
+    from reelforge_core.compose.photos import render_photo_clip
+    from reelforge_core.compose.reframe import estimate_pan, should_crop
+    from reelforge_core.compose.speech_snap import flatten_words, snap_end, snap_start
+
+    clips_dir = reel_dir / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    w, h = config.resolution
+    n = len(shots)
+    total = n
+    done = 0
+    sem: asyncio.Semaphore = asyncio.Semaphore(4)
+
+    async def _video(position: int, shot) -> ClipInfo:
+        asset = sources[shot.asset_id]
+        analysis = analyses.get(shot.asset_id)
+        src_dur = asset.probe.duration_s or float("inf")
+        in_ts = max(0.0, min(shot.in_ts, src_dur))
+        out_ts = max(in_ts + 0.1, min(shot.out_ts, src_dur))
+        # Outer-bound speech snapping, same rule as scene mode.
+        if config.speech_safe_cuts and analysis is not None and analysis.transcript:
+            words = flatten_words(analysis.transcript)
+            nudge = config.speech_safe_max_nudge_sec
+            if position == 0:
+                in_ts = max(0.0, snap_start(in_ts, words, nudge))
+            if position == n - 1:
+                out_ts = max(in_ts + 0.1, snap_end(out_ts, words, nudge))
+        if end_trims is not None and position < n - 1 and position < len(end_trims):
+            out_ts = max(in_ts + 0.5, out_ts - end_trims[position])
+
+        is_hdr = (asset.probe.color_transfer or "") in HDR_TRANSFERS
+        crop_track = should_crop(
+            asset.probe.width or 0, asset.probe.height or 0, w, h, config.effects.reframe
+        )
+        pan = None
+        if crop_track:
+            pan = await asyncio.to_thread(estimate_pan, asset.path, in_ts, out_ts)
+        out_path = clips_dir / f"clip_{position:04d}.mp4"
+        source_mtime = int(asset.path.stat().st_mtime)
+        cache_key = file_cache.compute_key(
+            "clip",
+            {
+                "asset_id": asset.id,
+                "scene_idx": -1,
+                "source_mtime": source_mtime,
+                "in_ts": f"{in_ts:.3f}",
+                "out_ts": f"{out_ts:.3f}",
+                "width": w,
+                "height": h,
+                "fps": config.target_fps,
+                "has_audio": int(asset.has_audio),
+                "hdr": int(is_hdr),
+                "crf": config.clip_crf,
+                "preset": config.clip_preset,
+                "pan": "none" if pan is None else f"{pan[0]:.4f}-{pan[1]:.4f}",
+            },
+        )
+        cached = file_cache.lookup(cache_key)
+        if cached is not None:
+            try:
+                if out_path.exists():
+                    out_path.unlink()
+                os.link(cached, out_path)
+            except OSError:
+                import shutil as _shutil
+
+                _shutil.copy2(cached, out_path)
+        else:
+            cmd = build_clip_command(
+                source=asset.path,
+                out_path=out_path,
+                in_ts=in_ts,
+                out_ts=out_ts,
+                config=config,
+                has_audio=asset.has_audio,
+                is_hdr=is_hdr,
+                pan=pan,
+            )
+            async with sem:
+                await asyncio.to_thread(run_ffmpeg, cmd, log_file=log_file)
+            try:
+                cache_target = file_cache.path_for("clip", cache_key, "mp4")
+                import shutil as _shutil
+
+                _shutil.copy2(out_path, cache_target)
+                file_cache.register(cache_key, "clip", cache_target)
+                file_cache.evict_if_over_cap("clip", file_cache.cap_from_env("clip", 20.0))
+            except Exception:  # pragma: no cover
+                log.exception("clip cache write failed for %s", cache_key)
+        return ClipInfo(
+            path=out_path,
+            scene_index=-1,
+            in_ts=in_ts,
+            out_ts=out_ts,
+            duration=out_ts - in_ts,
+            has_audio=asset.has_audio,
+            effects_applied=[],
+            asset_id=asset.id,
+            volume=shot.effective_gain,
+        )
+
+    async def _photo(position: int, shot) -> ClipInfo:
+        from reelforge_core.models import PhotoInsert
+
+        out_path = clips_dir / f"clip_{position:04d}.mp4"
+        insert = PhotoInsert(
+            asset_id=shot.asset_id,
+            path=shot.path,
+            position=position,
+            duration_sec=shot.duration_sec,
+            ken_burns=shot.ken_burns,
+        )
+        await render_photo_clip(insert, out_path, config, log_file, pan_index=position)
+        return ClipInfo(
+            path=out_path,
+            scene_index=-1,
+            in_ts=0.0,
+            out_ts=shot.duration_sec,
+            duration=max(0.2, shot.duration_sec),
+            has_audio=True,
+            effects_applied=["ken_burns"] if shot.ken_burns else [],
+            is_photo=True,
+            photo_asset_id=shot.asset_id,
+            asset_id=shot.asset_id,
+        )
+
+    async def _one(position: int, shot) -> ClipInfo:
+        if shot.kind == "photo":
+            return await _photo(position, shot)
+        return await _video(position, shot)
+
+    results: list[ClipInfo | None] = [None] * total
+    tasks = [asyncio.create_task(_one(i, shot)) for i, shot in enumerate(shots)]
+    for coro in asyncio.as_completed(tasks):
+        info = await coro
+        position = int(info.path.stem.split("_")[-1])
+        results[position] = info
+        done += 1
+        if progress_cb is not None:
+            await progress_cb(done, total)
+    return [r for r in results if r is not None]

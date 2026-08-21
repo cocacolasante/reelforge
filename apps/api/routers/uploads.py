@@ -10,7 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Request
+import uuid
+
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -84,11 +86,11 @@ async def create_upload(
         raise ApiError(404, "PROJECT_NOT_FOUND", f"project {project_id} not found")
 
     ctype = body.content_type.lower()
-    if not (ctype.startswith("video/") or ctype.startswith("image/")):
+    if not (ctype.startswith("video/") or ctype.startswith("image/") or ctype.startswith("audio/")):
         raise ApiError(
             400,
             "UPLOAD_UNSUPPORTED_TYPE",
-            f"content_type {body.content_type!r} is not a video/* or image/* MIME type",
+            f"content_type {body.content_type!r} is not a video/*, image/* or audio/* MIME type",
         )
     limit_bytes = int(settings.max_upload_gb * (1024**3))
     if body.total_bytes <= 0 or body.total_bytes > limit_bytes:
@@ -287,7 +289,7 @@ async def complete_upload(
         a = dbmod.Asset(
             id=asset.id,
             project_id=s.project_id,
-            kind="photo" if asset.is_photo else "video",
+            kind="audio" if asset.is_audio else ("photo" if asset.is_photo else "video"),
             path=str(asset.path),
             original_filename=s.filename,
             duration_sec=asset.probe.duration_s,
@@ -348,3 +350,112 @@ async def _aopen_write(path: Path):
     import aiofiles
 
     return aiofiles.open(path, "wb")
+
+
+
+VOICEOVER_MAX_BYTES = 50 * 1024 * 1024
+_VO_EXT_BY_TYPE = {
+    "audio/webm": "webm",
+    "audio/ogg": "ogg",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "aac",
+    "audio/mpeg": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+}
+
+
+@router.post("/projects/{project_id}/voiceovers", response_model=AssetOut, status_code=201)
+async def upload_voiceover(
+    project_id: str,
+    file: UploadFile = File(...),
+    label: str = Form(""),
+    db: AsyncSession = Depends(get_db),
+) -> AssetOut:
+    """Store a browser-recorded voiceover take as an audio asset.
+
+    Takes are small (minutes of speech), so this is a single multipart POST
+    rather than the chunked session protocol. The asset is content-addressed
+    like everything else and served through /assets/{id}/media.
+    """
+    p = await db.get(dbmod.Project, project_id)
+    if p is None:
+        raise ApiError(404, "PROJECT_NOT_FOUND", f"project {project_id} not found")
+    ctype = (file.content_type or "").split(";")[0].strip().lower()
+    ext = _VO_EXT_BY_TYPE.get(ctype) or (
+        Path(file.filename or "").suffix.lstrip(".").lower() or None
+    )
+    if not ext:
+        raise ApiError(
+            400, "UPLOAD_UNSUPPORTED_TYPE", f"unsupported voiceover type {ctype!r}"
+        )
+
+    uploads_dir = settings.data_dir / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    tmp = uploads_dir / f".voiceover.{uuid.uuid4().hex}.{ext}"
+    received = 0
+    try:
+        with tmp.open("wb") as out:
+            while chunk := await file.read(1 << 20):
+                received += len(chunk)
+                if received > VOICEOVER_MAX_BYTES:
+                    raise ApiError(413, "UPLOAD_TOO_LARGE", "voiceover exceeds 50 MiB")
+                out.write(chunk)
+        if received == 0:
+            raise ApiError(400, "UPLOAD_UNSUPPORTED_TYPE", "empty recording")
+        try:
+            asset = probe(tmp)
+        except Exception as exc:
+            raise ApiError(
+                400, "UPLOAD_UNSUPPORTED_TYPE", f"could not read the recording: {str(exc)[:200]}"
+            )
+        if not asset.is_audio or (asset.probe.duration_s or 0) < 0.2:
+            raise ApiError(400, "UPLOAD_UNSUPPORTED_TYPE", "recording has no usable audio")
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    final_path = uploads_dir / f"{asset.id}.{ext}"
+    if final_path.exists():
+        tmp.unlink(missing_ok=True)
+    else:
+        tmp.replace(final_path)
+    asset = probe(final_path)
+
+    existing = await db.get(dbmod.Asset, asset.id)
+    if existing is None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        name = (label.strip()[:60] or f"voiceover-{stamp}") + f".{ext}"
+        existing = dbmod.Asset(
+            id=asset.id,
+            project_id=project_id,
+            kind="audio",
+            path=str(asset.path),
+            original_filename=name,
+            duration_sec=asset.probe.duration_s,
+            width=0,
+            height=0,
+            fps=0.0,
+            has_audio=True,
+            size_bytes=asset.size_bytes,
+            probe_json=json.dumps(asset_to_dict(asset)),
+        )
+        db.add(existing)
+        await db.commit()
+    return AssetOut(
+        id=existing.id,
+        project_id=existing.project_id,
+        kind=existing.kind,
+        path=existing.path,
+        original_filename=existing.original_filename,
+        duration_sec=existing.duration_sec,
+        width=existing.width,
+        height=existing.height,
+        fps=existing.fps,
+        has_audio=existing.has_audio,
+        size_bytes=existing.size_bytes,
+        created_at=existing.created_at,
+        analysis_ready=False,
+    )

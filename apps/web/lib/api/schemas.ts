@@ -118,6 +118,8 @@ export const ReelSchema = z.object({
   scene_indices: z.array(z.number()),
   scores: ReelScoresSchema,
   mezzanine_ready: z.boolean(),
+  has_edits: z.boolean(),
+  edited_duration_sec: z.number().nullable(),
 });
 export const ReelListSchema = z.object({ reels: z.array(ReelSchema) });
 export type Reel = z.infer<typeof ReelSchema>;
@@ -215,3 +217,91 @@ export const PublicationListSchema = z.object({
   publications: z.array(PublicationSchema),
 });
 export type Publication = z.infer<typeof PublicationSchema>;
+
+// --- Editable timeline --------------------------------------------------------
+
+export const TransitionStyleSchema = z.object({
+  kind: z.string(),
+  duration_sec: z.number(),
+});
+export const TimelineShotSchema = z.object({
+  kind: z.enum(['video', 'photo']),
+  asset_id: z.string(),
+  path: z.string().optional(),
+  in_ts: z.number(),
+  out_ts: z.number(),
+  duration_sec: z.number(),
+  ken_burns: z.boolean(),
+  transition_after: TransitionStyleSchema.nullable(),
+  volume: z.number(),
+  muted: z.boolean(),
+});
+export const VoiceoverTakeSchema = z.object({
+  id: z.string(),
+  asset_id: z.string(),
+  path: z.string().optional(),
+  start_sec: z.number(),
+  duration_sec: z.number(),
+  volume: z.number(),
+  muted: z.boolean(),
+  label: z.string(),
+});
+export const TextOverlaySchema = z.object({
+  id: z.string(),
+  text: z.string(),
+  start_sec: z.number(),
+  end_sec: z.number(),
+  position: z.enum(['top', 'center', 'bottom']),
+  font_size_px: z.number(),
+  color: z.string(),
+  outline_color: z.string(),
+  bold: z.boolean(),
+  fade_ms: z.number(),
+});
+export const ReelTimelineSchema = z.object({
+  shots: z.array(TimelineShotSchema),
+  overlays: z.array(TextOverlaySchema),
+  voiceovers: z.array(VoiceoverTakeSchema),
+});
+export const SourceAudioSchema = z.object({
+  asset_id: z.string(),
+  filename: z.string(),
+  duration_sec: z.number(),
+  url: z.string(),
+});
+export const SceneSourceSchema = z.object({
+  index: z.number(),
+  start_sec: z.number(),
+  end_sec: z.number(),
+  thumbnail_url: z.string(),
+});
+export const SourceVideoSchema = z.object({
+  asset_id: z.string(),
+  filename: z.string(),
+  duration_sec: z.number(),
+  width: z.number(),
+  height: z.number(),
+  analyzed: z.boolean(),
+  scenes: z.array(SceneSourceSchema),
+});
+export const SourcePhotoSchema = z.object({
+  asset_id: z.string(),
+  filename: z.string(),
+  url: z.string(),
+});
+export const ReelEditSchema = z.object({
+  reel_id: z.string(),
+  has_edits: z.boolean(),
+  timeline: ReelTimelineSchema,
+  videos: z.array(SourceVideoSchema),
+  photos: z.array(SourcePhotoSchema),
+  audios: z.array(SourceAudioSchema),
+});
+export type TimelineShot = z.infer<typeof TimelineShotSchema>;
+export type VoiceoverTake = z.infer<typeof VoiceoverTakeSchema>;
+export type SourceAudio = z.infer<typeof SourceAudioSchema>;
+export type TextOverlay = z.infer<typeof TextOverlaySchema>;
+export type ReelTimeline = z.infer<typeof ReelTimelineSchema>;
+export type ReelEdit = z.infer<typeof ReelEditSchema>;
+export type SourceVideo = z.infer<typeof SourceVideoSchema>;
+export type SourcePhoto = z.infer<typeof SourcePhotoSchema>;

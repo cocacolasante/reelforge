@@ -157,3 +157,37 @@ async def test_preview_range_suffix(api_client, isolated_data_dir: Path) -> None
     assert r.status_code == 206
     assert len(r.content) == 512
     assert r.headers.get("content-range") == "bytes 1488-1999/2000"
+
+
+@pytest.mark.asyncio
+async def test_asset_media_supports_range(api_client) -> None:
+    """The editor preview seeks into source footage via Range requests."""
+    import apps.api.settings as settings_mod
+    from apps.api import db as dbmod
+
+    r = await api_client.post("/api/v1/projects", json={"name": "media-range"})
+    pid = r.json()["id"]
+    aid = "c" * 64
+    up = settings_mod.settings.data_dir / "uploads" / f"{aid}.mp4"
+    up.parent.mkdir(parents=True, exist_ok=True)
+    up.write_bytes(bytes(range(256)) * 8)  # 2048 bytes
+    async with dbmod.db_state.sessionmaker() as session:
+        session.add(dbmod.Asset(
+            id=aid, project_id=pid, path=str(up), original_filename="x.mp4",
+            duration_sec=10, width=1920, height=1080, fps=30, has_audio=True,
+            size_bytes=2048, probe_json="{}",
+        ))
+        await session.commit()
+
+    full = await api_client.get(f"/api/v1/assets/{aid}/media")
+    assert full.status_code == 200
+    assert full.headers["content-type"].startswith("video/mp4")
+    assert len(full.content) == 2048
+
+    part = await api_client.get(f"/api/v1/assets/{aid}/media", headers={"Range": "bytes=256-511"})
+    assert part.status_code == 206
+    assert part.headers["content-range"] == "bytes 256-511/2048"
+    assert part.content == bytes(range(256))
+
+    missing = await api_client.get("/api/v1/assets/" + "0" * 64 + "/media")
+    assert missing.status_code == 404

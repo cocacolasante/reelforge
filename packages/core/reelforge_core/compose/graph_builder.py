@@ -44,20 +44,50 @@ def _transition_duration(config: ComposeConfig) -> float:
 
 
 def _xfade_offsets(
-    clip_durations: list[float], xfade_dur: float
+    clip_durations: list[float], xfade_dur: float | list[float]
 ) -> list[float]:
     """Offsets[i] is the xfade offset for the transition between clip i and i+1.
-    Length = len(clips) - 1. See spec §7 for the math."""
+    Length = len(clips) - 1. `xfade_dur` is one duration for every cut, or a
+    per-cut list (len n-1) when transitions differ per cut."""
     if len(clip_durations) <= 1:
         return []
+    n_cuts = len(clip_durations) - 1
+    xfades = (
+        list(xfade_dur) if isinstance(xfade_dur, list) else [xfade_dur] * n_cuts
+    )
     offsets: list[float] = []
     cumulative = 0.0
+    overlapped = 0.0
     for i, dur in enumerate(clip_durations[:-1]):
-        # Offset for transition i is cumulative duration up through clip i, minus xfade_dur,
-        # minus (i transitions that already overlapped by xfade_dur each).
+        # Offset for transition i is cumulative duration up through clip i,
+        # minus the overlap already reclaimed by earlier transitions, minus
+        # this transition's own duration.
         cumulative += dur
-        offsets.append(cumulative - (i + 1) * xfade_dur)
+        overlapped += xfades[i]
+        offsets.append(cumulative - overlapped)
     return offsets
+
+
+def resolve_transitions(
+    config: ComposeConfig, n_clips: int, per_cut: list[tuple[str, float] | None] | None = None
+) -> list[tuple[str, float]]:
+    """(xfade transition name, duration) for each of the n-1 cuts.
+
+    `per_cut[i]` overrides the reel-wide transition for cut i (None keeps the
+    default). "cut" renders as a 40ms fade so the graph shape stays uniform.
+    """
+    default_kind = config.transition.kind
+    default_dur = _transition_duration(config)
+    out: list[tuple[str, float]] = []
+    for i in range(max(0, n_clips - 1)):
+        override = per_cut[i] if per_cut and i < len(per_cut) else None
+        if override is not None:
+            kind, dur = override
+            dur = 0.04 if kind == "cut" else max(0.04, dur)
+        else:
+            kind, dur = default_kind, default_dur
+        out.append((_TRANSITION_MAP.get(kind, "fade"), dur))
+    return out
 
 
 def build_final_command(
@@ -68,14 +98,23 @@ def build_final_command(
     captions_path: Path | None,
     config: ComposeConfig,
     output_path: Path,
+    transitions: list[tuple[str, float]] | None = None,
+    voiceovers: list[tuple[Path, float, float]] | None = None,
 ) -> RenderPlan:
+    """`voiceovers`: (path, start_sec on the mezzanine, linear gain) per take.
+    Muted takes should be omitted by the caller."""
     if not clips:
         raise ValueError("build_final_command requires at least one clip")
 
     width, height = config.resolution
     fps = config.target_fps
-    xfade_dur = _transition_duration(config)
-    transition_kind = _TRANSITION_MAP[config.transition.kind]
+    # Per-cut (xfade name, duration). Defaults to the reel-wide transition.
+    cuts = transitions if transitions is not None else resolve_transitions(config, len(clips))
+    if len(cuts) != max(0, len(clips) - 1):
+        raise ValueError(
+            f"transitions has {len(cuts)} entries for {len(clips)} clips (need {len(clips) - 1})"
+        )
+    xfade_durs = [d for _, d in cuts]
 
     # ----- input args -----
     # -stats forces ffmpeg to emit `time=...` lines on stderr even when
@@ -87,6 +126,12 @@ def build_final_command(
     if music_path is not None:
         music_input_index = len(clips)
         args += ["-i", str(music_path)]
+    vo_inputs: list[tuple[int, float, float]] = []  # (input index, start, gain)
+    for vo_path, vo_start, vo_gain in (voiceovers or []):
+        if vo_gain <= 0:
+            continue
+        vo_inputs.append((len(clips) + (1 if music_path is not None else 0) + len(vo_inputs), vo_start, vo_gain))
+        args += ["-i", str(vo_path)]
 
     graph = FilterGraph()
 
@@ -156,9 +201,19 @@ def build_final_command(
         v_labels.append(v_out)
 
         if clip.has_audio:
+            # Per-shot gain from the editor (mute = 0). Applied before the
+            # crossfade so a muted shot fades in/out like any other.
+            gain_part = (
+                f"volume={max(0.0, clip.volume):.4f},"
+                if abs(clip.volume - 1.0) > 1e-6
+                else ""
+            )
             graph.add(
                 FilterNode(
-                    filter_name="aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS",
+                    filter_name=(
+                        "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                        f"{gain_part}asetpts=PTS-STARTPTS"
+                    ),
                     inputs=[raw_a],
                     outputs=[a_out],
                 )
@@ -179,20 +234,21 @@ def build_final_command(
         a_labels.append(a_out)
 
     # ----- xfade chain -----
-    offsets = _xfade_offsets(durations, xfade_dur)
+    offsets = _xfade_offsets(durations, xfade_durs)
     v_chain = v_labels[0]
     a_chain = a_labels[0]
     for i, offset in enumerate(offsets):
         next_v = f"[xv{i}]"
         next_a = f"[xa{i}]"
+        kind_i, dur_i = cuts[i]
         graph.add(
             FilterNode(
                 filter_name="xfade",
                 inputs=[v_chain, v_labels[i + 1]],
                 outputs=[next_v],
                 args={
-                    "transition": transition_kind,
-                    "duration": f"{xfade_dur:.3f}",
+                    "transition": kind_i,
+                    "duration": f"{dur_i:.3f}",
                     "offset": f"{offset:.3f}",
                 },
             )
@@ -202,7 +258,7 @@ def build_final_command(
                 filter_name="acrossfade",
                 inputs=[a_chain, a_labels[i + 1]],
                 outputs=[next_a],
-                args={"d": f"{xfade_dur:.3f}"},
+                args={"d": f"{dur_i:.3f}"},
             )
         )
         v_chain = next_v
@@ -268,6 +324,105 @@ def build_final_command(
             )
         )
         v_chain = "[vfinal]"
+
+    # Program length after crossfade overlap — needed below to pad the
+    # voiceover bus to full length, and reported in the plan.
+    total_duration = sum(durations) - sum(xfade_durs)
+
+    # ----- voiceover takes: mix beneath-ducked footage audio -----
+    # Each take is delayed to its mezzanine start and gain-staged; the takes
+    # sum to [vo_mix]; footage audio ducks under it (sidechain), and the two
+    # are summed into the voice bus BEFORE voice loudnorm — so music then
+    # ducks beneath footage+voiceover together.
+    if vo_inputs:
+        vo_labels: list[str] = []
+        for k, (idx, start, gain) in enumerate(vo_inputs):
+            label = f"[vo{k}]"
+            delay_ms = max(0, int(round(start * 1000)))
+            graph.add(
+                FilterNode(
+                    filter_name=(
+                        "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                        f"adelay=delays={delay_ms}|{delay_ms}:all=1,"
+                        f"volume={gain:.4f}"
+                    ),
+                    inputs=[f"[{idx}:a]"],
+                    outputs=[label],
+                )
+            )
+            vo_labels.append(label)
+        if len(vo_labels) == 1:
+            graph.add(FilterNode(filter_name="anull", inputs=vo_labels, outputs=["[vo_mix]"]))
+        else:
+            graph.add(
+                FilterNode(
+                    filter_name="amix",
+                    inputs=vo_labels,
+                    outputs=["[vo_mix]"],
+                    args={"inputs": len(vo_labels), "duration": "longest", "normalize": 0},
+                )
+            )
+        # Level the voiceover bus so takes recorded at different gains match.
+        graph.add(
+            FilterNode(
+                filter_name="loudnorm",
+                inputs=["[vo_mix]"],
+                outputs=["[vo_norm]"],
+                args={"I": f"{config.voiceover_volume_db:.1f}", "LRA": 7, "TP": -1.5},
+            )
+        )
+        # Pad to the full program length. Two-input filters (the ducking
+        # sidechain, amix) stop when their SHORTEST input ends — without this
+        # a 4s take would cut the whole mix off at 4s. Padded after loudnorm
+        # so levelling sees only the real takes, not the silence.
+        graph.add(
+            FilterNode(
+                filter_name=(
+                    "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"apad=whole_dur={max(0.1, total_duration):.3f}"
+                ),
+                inputs=["[vo_norm]"],
+                outputs=["[vo_ready]"],
+            )
+        )
+        if config.voiceover_ducking:
+            graph.add(
+                FilterNode(
+                    filter_name="asplit",
+                    inputs=["[vo_ready]"],
+                    outputs=["[vo_main]", "[vo_key]"],
+                )
+            )
+            threshold_linear = 10 ** (config.ducking_threshold_db / 20.0)
+            graph.add(
+                FilterNode(
+                    filter_name="sidechaincompress",
+                    inputs=[a_chain, "[vo_key]"],
+                    outputs=["[aclips_ducked]"],
+                    args={
+                        "threshold": f"{threshold_linear:.4f}",
+                        "ratio": f"{config.ducking_ratio:.1f}",
+                        "attack": f"{config.ducking_attack_ms:.1f}",
+                        "release": f"{config.ducking_release_ms:.1f}",
+                    },
+                )
+            )
+            footage_label = "[aclips_ducked]"
+            vo_main = "[vo_main]"
+        else:
+            footage_label = a_chain
+            vo_main = "[vo_ready]"
+        graph.add(
+            FilterNode(
+                filter_name="amix",
+                inputs=[footage_label, vo_main],
+                outputs=["[voice_pre]"],
+                # duration=first: the footage defines the length; takes that
+                # run past the end are truncated, not padded.
+                args={"inputs": 2, "duration": "first", "dropout_transition": 2, "normalize": 0},
+            )
+        )
+        a_chain = "[voice_pre]"
 
     # ----- audio: loudnorm voice, then mix with optional music bed -----
     graph.add(
@@ -388,8 +543,6 @@ def build_final_command(
         )
 
     filter_complex = graph.serialize()
-
-    total_duration = sum(durations) - max(0, len(durations) - 1) * xfade_dur
 
     args += [
         "-filter_complex",

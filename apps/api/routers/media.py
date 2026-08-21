@@ -286,3 +286,114 @@ async def get_photo(
         media_type=media_type,
         cache_control="public, max-age=86400",
     )
+
+
+@router.get("/assets/{asset_id}/media")
+async def get_asset_media(
+    asset_id: str, request: Request, db: AsyncSession = Depends(get_db)
+) -> Response:
+    """Stream the original upload with HTTP Range support.
+
+    Backs the editor's scrubbable preview: the browser seeks into source
+    footage directly (range requests), so no render is needed to see a cut.
+    """
+    a = await db.get(dbmod.Asset, asset_id)
+    if a is None:
+        raise ApiError(404, "ASSET_NOT_FOUND", f"asset {asset_id} not found")
+    path = Path(a.path)
+    if not path.exists():
+        raise ApiError(404, "NOT_FOUND", "media file missing on disk")
+    suffix = path.suffix.lower().lstrip(".")
+    media_type = {
+        "mp4": "video/mp4",
+        "m4v": "video/mp4",
+        "mov": "video/quicktime",
+        "webm": "video/webm",
+        "mkv": "video/x-matroska",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+        "webm": "video/webm" if a.kind != "audio" else "audio/webm",
+        "ogg": "audio/ogg",
+        "m4a": "audio/mp4",
+        "aac": "audio/aac",
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+    }.get(suffix, "application/octet-stream")
+    return await stream_file_with_range(
+        path, request, media_type=media_type, cache_control="private, max-age=86400"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Waveform peaks (editor)
+# ---------------------------------------------------------------------------
+
+_WAVEFORM_CACHE: "dict[tuple, dict]" = {}
+_WAVEFORM_CACHE_MAX = 512
+WAVEFORM_MAX_SPAN_SEC = 900.0
+
+
+def _waveform_peaks(path: Path, start: float, end: float, buckets: int) -> list[float]:
+    """Decode [start, end] to mono 8 kHz PCM and reduce to `buckets` peak
+    values in 0..1. Normalized to the 98th percentile so one spike doesn't
+    flatten the whole bar."""
+    import numpy as np
+
+    cmd = [
+        "ffmpeg", "-v", "error", "-nostdin",
+        "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(path),
+        "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "-",
+    ]
+    out = subprocess.run(cmd, capture_output=True, check=False, timeout=60).stdout
+    if not out:
+        return [0.0] * buckets
+    samples = np.abs(np.frombuffer(out, dtype=np.int16).astype(np.float32))
+    if samples.size < buckets:
+        samples = np.pad(samples, (0, buckets - samples.size))
+    cut = (samples.size // buckets) * buckets
+    chunks = samples[:cut].reshape(buckets, -1)
+    peaks = chunks.max(axis=1)
+    ref = float(np.percentile(peaks, 98)) or 1.0
+    norm = np.clip(peaks / max(ref, 1e-6), 0.0, 1.0)
+    return [round(float(v), 3) for v in norm]
+
+
+@router.get("/assets/{asset_id}/waveform")
+async def get_waveform(
+    asset_id: str,
+    start: float = Query(0.0, ge=0.0),
+    end: float | None = Query(None, ge=0.0),
+    buckets: int = Query(160, ge=8, le=1000),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Peak envelope for a range of an asset's audio — drawn as the waveform
+    under shots and voiceover takes in the editor."""
+    a = await db.get(dbmod.Asset, asset_id)
+    if a is None:
+        raise ApiError(404, "ASSET_NOT_FOUND", f"asset {asset_id} not found")
+    if not a.has_audio:
+        return {"peaks": [0.0] * buckets, "start": start, "end": start, "silent": True}
+    path = Path(a.path)
+    if not path.exists():
+        raise ApiError(404, "NOT_FOUND", "media file missing on disk")
+    duration = float(a.duration_sec or 0.0)
+    end_eff = min(end if end is not None else duration, duration) if duration > 0 else (end or 0.0)
+    if end_eff <= start:
+        raise ApiError(400, "INVALID_CONFIG", "end must be after start")
+    if end_eff - start > WAVEFORM_MAX_SPAN_SEC:
+        raise ApiError(400, "INVALID_CONFIG", f"span is capped at {WAVEFORM_MAX_SPAN_SEC:.0f}s")
+
+    key = (asset_id, round(start, 2), round(end_eff, 2), buckets, int(path.stat().st_mtime))
+    cached = _WAVEFORM_CACHE.get(key)
+    if cached is None:
+        try:
+            peaks = await asyncio.to_thread(_waveform_peaks, path, start, end_eff, buckets)
+        except subprocess.TimeoutExpired:
+            raise ApiError(504, "INTERNAL_ERROR", "waveform decode timed out")
+        cached = {"peaks": peaks, "start": start, "end": end_eff, "silent": not any(peaks)}
+        if len(_WAVEFORM_CACHE) >= _WAVEFORM_CACHE_MAX:
+            _WAVEFORM_CACHE.pop(next(iter(_WAVEFORM_CACHE)))
+        _WAVEFORM_CACHE[key] = cached
+    return cached

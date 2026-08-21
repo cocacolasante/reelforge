@@ -136,7 +136,7 @@ function ProjectDetail({ projectId }: { projectId: string }) {
   const allAssets = assets.data?.assets ?? [];
   // Footage drives analysis and reel selection; photos are stills that get
   // woven into a reel at compose time, so they're listed separately.
-  const assetList = allAssets.filter((a) => a.kind !== 'photo');
+  const assetList = allAssets.filter((a) => a.kind === 'video');
   const photoList = allAssets.filter((a) => a.kind === 'photo');
   const reelCount = (projectReels.data?.reels as unknown[] | undefined)?.length ?? 0;
 
