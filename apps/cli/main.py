@@ -327,6 +327,7 @@ def _print_selection_summary(selection: ReelSelection) -> None:
         )
         return
 
+    show_match = any(r.prompt_relevance is not None for r in selection.reels)
     table = Table(title="ReelForge Selection", show_lines=False)
     table.add_column("#", justify="right", style="bold")
     table.add_column("Timespan")
@@ -334,17 +335,24 @@ def _print_selection_summary(selection: ReelSelection) -> None:
     table.add_column("Title")
     table.add_column("Hook", overflow="fold")
     table.add_column("Mood")
+    if show_match:
+        table.add_column("Match", justify="right")
     table.add_column("Score", justify="right")
     for reel in selection.reels:
-        table.add_row(
+        row = [
             str(reel.rank),
             _format_timespan(reel.start_sec, reel.end_sec),
             f"{reel.duration_sec:.1f}s",
             reel.title,
             reel.hook,
             reel.suggested_mood,
-            f"{reel.overall:.1f}",
-        )
+        ]
+        if show_match:
+            row.append(
+                f"{reel.prompt_relevance}%" if reel.prompt_relevance is not None else "—"
+            )
+        row.append(f"{reel.overall:.1f}")
+        table.add_row(*row)
     console.print(table)
 
 
@@ -437,6 +445,11 @@ def select(
     resume: bool = typer.Option(
         False, "--resume/--no-resume", help="Reuse prior ranking if the stamp matches."
     ),
+    prompt: str = typer.Option(
+        None,
+        "--prompt",
+        help="Natural-language direction, e.g. 'clips of falls' or 'make it feel intense'.",
+    ),
     local: bool = typer.Option(
         False,
         "--local/--queued",
@@ -461,6 +474,7 @@ def select(
         overlap_threshold=overlap,
         ranking_model=model,
         resume=resume,
+        prompt=prompt,
     )
 
     try:

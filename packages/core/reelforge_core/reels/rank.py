@@ -7,6 +7,7 @@ the model can compare them globally. Only batch if > 80 candidates (rare).
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import random
@@ -134,6 +135,56 @@ RECORD_RANKINGS: dict[str, Any] = {
         "required": ["rankings"],
     },
 }
+
+
+# When a user prompt is active, candidates scoring below this floor on
+# prompt_relevance are dropped entirely (strict filter). The rubric anchors
+# <=20 as "unrelated" and ~50 as "partial", so 35 removes clear misses while
+# keeping partial matches in play.
+PROMPT_RELEVANCE_FLOOR = 35
+
+USER_DIRECTION_TEMPLATE = (
+    "\n\nUSER DIRECTION\n"
+    "The user gave this instruction for what they want in the selected reels:\n"
+    '"{prompt}"\n\n'
+    "Apply it in two ways:\n"
+    "1. Content matching: score each candidate on a fifth dimension, "
+    "prompt_relevance (0-100): how well the candidate's actual content — "
+    "scene summaries, tags, transcript — matches the instruction. "
+    "90+ = the requested content is clearly the focus of the span. "
+    "Around 50 = partially or indirectly related. 20 or below = unrelated. "
+    "Judge only from the evidence provided; never invent content. "
+    "If the instruction is purely about style or feel rather than content, "
+    "score prompt_relevance on how well the span could carry that feel.\n"
+    "2. Style: if the instruction expresses a desired feel, tone, or energy "
+    "(e.g. 'make it feel intense'), reflect it in suggested_mood (still from "
+    "the fixed vocabulary) and write the title and hook in that tone.\n"
+    "Keep the four original dimensions at their normal meanings — do not "
+    "inflate them for relevant candidates; prompt_relevance is reported "
+    "separately."
+)
+
+
+def build_system_prompt(config: SelectionConfig) -> str:
+    """SYSTEM_PROMPT_V1, plus the user-direction block when a prompt is set."""
+    if not config.prompt:
+        return SYSTEM_PROMPT_V1
+    return SYSTEM_PROMPT_V1 + USER_DIRECTION_TEMPLATE.format(prompt=config.prompt)
+
+
+def build_ranking_tool(config: SelectionConfig) -> dict[str, Any]:
+    """RECORD_RANKINGS, plus a required prompt_relevance field when a prompt is set."""
+    if not config.prompt:
+        return RECORD_RANKINGS
+    tool = copy.deepcopy(RECORD_RANKINGS)
+    item = tool["input_schema"]["properties"]["rankings"]["items"]
+    item["properties"]["prompt_relevance"] = {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+    }
+    item["required"].append("prompt_relevance")
+    return tool
 
 
 @dataclass
@@ -264,16 +315,19 @@ async def _call_model(
     temperature: float,
     system_prompt: str,
     messages: list[dict],
+    tools: list[dict] | None = None,
 ) -> Any:
     last_exc: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
+            # NOTE: anthropic>=1.0 removed the `temperature` kwarg from
+            # messages.create; config.temperature now only feeds the resume
+            # stamp. Claude 5 ranking runs at the API default.
             resp = await client.messages.create(
                 model=model,
                 max_tokens=8000,
-                temperature=temperature,
                 system=system_prompt,
-                tools=[RECORD_RANKINGS],
+                tools=tools if tools is not None else [RECORD_RANKINGS],
                 tool_choice={"type": "tool", "name": "record_rankings"},
                 messages=messages,
             )
@@ -308,6 +362,7 @@ def _coerce_rankings(
     rankings: Iterable[dict],
     *,
     candidate_map: dict[str, ReelCandidate],
+    prompt_active: bool = False,
 ) -> list[RankedReel]:
     """Validate + convert raw tool-input entries to RankedReel. Skips extras."""
     seen: set[str] = set()
@@ -322,6 +377,12 @@ def _coerce_rankings(
             continue
         try:
             scores = ReelScores(**entry["scores"])
+            relevance: int | None = None
+            if prompt_active:
+                relevance = int(entry["prompt_relevance"])  # KeyError -> drop + retry
+                overall = round(0.45 * relevance + 0.55 * scores.weighted, 2)
+            else:
+                overall = round(scores.weighted, 2)
             candidate = candidate_map[cid]
             reel = RankedReel(
                 candidate_id=cid,
@@ -333,9 +394,10 @@ def _coerce_rankings(
                 hook=entry["hook"],
                 justification=entry["justification"],
                 scores=scores,
-                overall=round(scores.weighted, 2),
+                overall=overall,
                 rank=0,  # assigned after dedup
                 suggested_mood=entry["suggested_mood"],
+                prompt_relevance=relevance,
             )
         except Exception as exc:
             log.warning(
@@ -389,18 +451,22 @@ async def _rank_once(
     contexts = [build_candidate_context(c, analysis) for c in batch]
     user_payload = json.dumps({"candidates": contexts}, indent=2)
     messages: list[dict] = [{"role": "user", "content": user_payload}]
+    system_prompt = build_system_prompt(config)
+    tools = [build_ranking_tool(config)]
+    prompt_active = bool(config.prompt)
 
     resp = await _call_model(
         client,
         model=config.ranking_model,
         temperature=config.temperature,
-        system_prompt=SYSTEM_PROMPT_V1,
+        system_prompt=system_prompt,
         messages=messages,
+        tools=tools,
     )
     rankings_raw = _extract_rankings(resp)
     usage = _accumulate_usage(resp)
 
-    ranked = _coerce_rankings(rankings_raw, candidate_map=candidate_map)
+    ranked = _coerce_rankings(rankings_raw, candidate_map=candidate_map, prompt_active=prompt_active)
     missing = [c.candidate_id for c in batch if c.candidate_id not in {r.candidate_id for r in ranked}]
 
     # One targeted retry for missing candidates.
@@ -436,14 +502,15 @@ async def _rank_once(
                 client,
                 model=config.ranking_model,
                 temperature=config.temperature,
-                system_prompt=SYSTEM_PROMPT_V1,
+                system_prompt=system_prompt,
                 messages=messages,
+                tools=tools,
             )
             rankings2 = _extract_rankings(resp2)
             usage2 = _accumulate_usage(resp2)
             usage.input_tokens += usage2.input_tokens
             usage.output_tokens += usage2.output_tokens
-            ranked2 = _coerce_rankings(rankings2, candidate_map=candidate_map)
+            ranked2 = _coerce_rankings(rankings2, candidate_map=candidate_map, prompt_active=prompt_active)
             # Merge: prefer the second response's entry when it covers a candidate
             by_id = {r.candidate_id: r for r in ranked}
             for r in ranked2:

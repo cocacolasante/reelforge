@@ -107,6 +107,8 @@ class Reel(SQLModel, table=True):
     mezzanine_path: Optional[str] = None
     trim_start_offset_sec: float = 0.0
     trim_end_offset_sec: float = 0.0
+    # 0-100 match against the selection prompt (NULL when no prompt was used).
+    prompt_relevance: Optional[int] = None
     # Phase 7.x long-form montage: when set, this Reel is the concatenation of
     # the listed child reel_ids. The compose worker takes the montage path
     # instead of the normal extract → render path.
@@ -332,6 +334,11 @@ async def create_all(engine: AsyncEngine) -> None:
         if reel_cols and "child_reel_ids_json" not in reel_cols:
             await conn.execute(
                 text("ALTER TABLE reels ADD COLUMN child_reel_ids_json TEXT")
+            )
+        # NL selection prompt: per-reel relevance score (nullable).
+        if reel_cols and "prompt_relevance" not in reel_cols:
+            await conn.execute(
+                text("ALTER TABLE reels ADD COLUMN prompt_relevance INTEGER")
             )
 
 

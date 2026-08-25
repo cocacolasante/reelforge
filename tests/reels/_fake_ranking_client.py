@@ -26,7 +26,7 @@ class _Usage:
     output_tokens: int = 200
 
 
-def _ranking_for(candidate_id: str, seed: int = 0) -> dict:
+def _ranking_for(candidate_id: str, seed: int = 0, relevance: int | None = None) -> dict:
     base_scores = {
         "narrative_coherence": (40 + seed * 7) % 101,
         "hook_strength": (50 + seed * 11) % 101,
@@ -45,7 +45,7 @@ def _ranking_for(candidate_id: str, seed: int = 0) -> dict:
         "melancholic",
         "neutral",
     ]
-    return {
+    entry = {
         "candidate_id": candidate_id,
         "title": f"Title for {candidate_id}",
         "hook": f"Hook teaser for {candidate_id}.",
@@ -53,10 +53,21 @@ def _ranking_for(candidate_id: str, seed: int = 0) -> dict:
         "suggested_mood": moods[seed % len(moods)],
         "scores": base_scores,
     }
+    if relevance is not None:
+        entry["prompt_relevance"] = relevance
+    return entry
 
 
-def all_rankings(candidate_ids: list[str]) -> list[dict]:
-    return [_ranking_for(cid, seed=i) for i, cid in enumerate(candidate_ids)]
+def all_rankings(
+    candidate_ids: list[str],
+    relevance: int | dict[str, int] | None = None,
+) -> list[dict]:
+    """relevance: None (no field), an int (same for all), or {cid: int}."""
+    out = []
+    for i, cid in enumerate(candidate_ids):
+        rel = relevance.get(cid, 50) if isinstance(relevance, dict) else relevance
+        out.append(_ranking_for(cid, seed=i, relevance=rel))
+    return out
 
 
 class FakeRankingClient:

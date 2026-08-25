@@ -120,6 +120,7 @@ export const ReelSchema = z.object({
   mezzanine_ready: z.boolean(),
   has_edits: z.boolean(),
   edited_duration_sec: z.number().nullable(),
+  prompt_relevance: z.number().nullable().optional(),
 });
 export const ReelListSchema = z.object({ reels: z.array(ReelSchema) });
 export type Reel = z.infer<typeof ReelSchema>;

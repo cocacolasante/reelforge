@@ -424,6 +424,8 @@ function SelectionPanel({
   const [maxSec, setMaxSec] = React.useState<number[]>([60]);
   const [longTarget, setLongTarget] = React.useState<number[]>([300]);
   const [count, setCount] = React.useState(10);
+  const [prompt, setPrompt] = React.useState('');
+  const [zeroMatchNote, setZeroMatchNote] = React.useState(false);
   const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
 
@@ -452,10 +454,12 @@ function SelectionPanel({
 
   const runSelect = async () => {
     setConfirmOpen(false);
+    setZeroMatchNote(false);
     const config: Record<string, unknown> = {
       output_form: form,
       top_k: count,
     };
+    if (prompt.trim()) config.prompt = prompt.trim();
     if (form === 'long_single') {
       config.long_target_duration_sec = longTarget[0];
     } else {
@@ -556,6 +560,22 @@ function SelectionPanel({
         </div>
       )}
 
+      <div className="space-y-1.5">
+        <Label htmlFor="select-direction">Direction (optional)</Label>
+        <textarea
+          id="select-direction"
+          value={prompt}
+          maxLength={500}
+          rows={2}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="e.g. clips of falls, big jumps, make it feel intense"
+          className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        />
+        <p className="text-xs text-muted-foreground">
+          Describe what you want and only matching clips are returned, styled to fit.
+        </p>
+      </div>
+
       {form !== 'long_single' ? (
         <div className="space-y-1.5">
           <Label>How many clips: {count}</Label>
@@ -579,6 +599,13 @@ function SelectionPanel({
         <Alert variant="destructive">
           <AlertDescription>{errorMsg}</AlertDescription>
         </Alert>
+      ) : null}
+
+      {zeroMatchNote ? (
+        <p className="text-sm text-muted-foreground">
+          No clips matched your direction — try broader wording or run without a
+          prompt.
+        </p>
       ) : null}
 
       <Button onClick={startSelect} disabled={enqueue.isPending || readyAssetIds.length === 0}>
@@ -631,6 +658,7 @@ function SelectionPanel({
                   result && typeof result === 'object' && 'reel_count' in result
                     ? Number((result as { reel_count?: unknown }).reel_count) || 0
                     : 0;
+                if (reelCount === 0 && prompt.trim()) setZeroMatchNote(true);
                 onJobSettled(jid, { ok: true, reelCount });
               }}
               onFail={() => onJobSettled(jid, { ok: false, reelCount: 0 })}

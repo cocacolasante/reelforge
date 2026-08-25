@@ -121,3 +121,50 @@ async def test_export_invalid_preset(api_client, tiny_mp4: Path) -> None:
     )
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "REEL_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_select_accepts_prompt_and_roundtrips_into_job_config(
+    api_client, tiny_mp4: Path
+) -> None:
+    from pathlib import Path as _P
+
+    from apps.api import db as dbmod
+    from reelforge_core.analysis.pipeline import working_dir_for
+
+    _pid, asset_id = await _upload_tiny(api_client, tiny_mp4)
+    wd = working_dir_for(asset_id)
+    _P(wd).mkdir(parents=True, exist_ok=True)
+    (wd / "analysis.json").write_text("{}")  # existence check only
+
+    r = await api_client.post(
+        f"/api/v1/assets/{asset_id}/select",
+        json={"prompt": "  clips of falls  ", "top_k": 5},
+    )
+    assert r.status_code == 200, r.text
+    job_id = r.json()["id"]
+    import json as _json
+
+    async with dbmod.db_state.sessionmaker() as session:
+        job = await session.get(dbmod.Job, job_id)
+        cfg = _json.loads(job.config_json)
+    assert cfg["prompt"] == "clips of falls"  # whitespace stripped by validator
+    assert cfg["top_k"] == 5
+
+
+@pytest.mark.asyncio
+async def test_select_rejects_oversized_prompt(api_client, tiny_mp4: Path) -> None:
+    from pathlib import Path as _P
+
+    from reelforge_core.analysis.pipeline import working_dir_for
+
+    _pid, asset_id = await _upload_tiny(api_client, tiny_mp4)
+    wd = working_dir_for(asset_id)
+    _P(wd).mkdir(parents=True, exist_ok=True)
+    (wd / "analysis.json").write_text("{}")
+
+    r = await api_client.post(
+        f"/api/v1/assets/{asset_id}/select", json={"prompt": "x" * 501}
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_CONFIG"

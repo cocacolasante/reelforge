@@ -234,3 +234,82 @@ def test_coerce_rankings_drops_out_of_range_score() -> None:
     cand_map = {c.candidate_id: c for c in cands}
     out = _coerce_rankings(rankings, candidate_map=cand_map)
     assert out == []
+
+
+# ---------------------------------------------------------------------------
+# prompt_relevance coercion
+# ---------------------------------------------------------------------------
+
+
+def _cand(cid: str):
+    from reelforge_core.models import ReelCandidate
+
+    return ReelCandidate(
+        candidate_id=cid,
+        scene_indices=[0],
+        start_sec=0.0,
+        end_sec=45.0,
+        duration_sec=45.0,
+        scene_count=1,
+    )
+
+
+def _entry(cid: str, **extra):
+    e = {
+        "candidate_id": cid,
+        "title": "T",
+        "hook": "H",
+        "justification": "J",
+        "suggested_mood": "calm",
+        "scores": {
+            "narrative_coherence": 60,
+            "hook_strength": 80,
+            "emotional_payoff": 40,
+            "standalone_clarity": 70,
+        },
+    }
+    e.update(extra)
+    return e
+
+
+def test_coerce_requires_prompt_relevance_when_active() -> None:
+    from reelforge_core.reels.rank import _coerce_rankings
+
+    out = _coerce_rankings(
+        [_entry("c1")], candidate_map={"c1": _cand("c1")}, prompt_active=True
+    )
+    assert out == [], "entry without prompt_relevance must be dropped when active"
+
+
+def test_coerce_blend_math_exact() -> None:
+    from reelforge_core.models import ReelScores
+    from reelforge_core.reels.rank import _coerce_rankings
+
+    out = _coerce_rankings(
+        [_entry("c1", prompt_relevance=90)],
+        candidate_map={"c1": _cand("c1")},
+        prompt_active=True,
+    )
+    assert len(out) == 1
+    weighted = ReelScores(
+        narrative_coherence=60, hook_strength=80, emotional_payoff=40, standalone_clarity=70
+    ).weighted
+    assert out[0].prompt_relevance == 90
+    assert out[0].overall == round(0.45 * 90 + 0.55 * weighted, 2)
+
+
+def test_coerce_ignores_prompt_relevance_when_inactive() -> None:
+    from reelforge_core.models import ReelScores
+    from reelforge_core.reels.rank import _coerce_rankings
+
+    out = _coerce_rankings(
+        [_entry("c1", prompt_relevance=90)],
+        candidate_map={"c1": _cand("c1")},
+        prompt_active=False,
+    )
+    assert len(out) == 1
+    assert out[0].prompt_relevance is None
+    weighted = ReelScores(
+        narrative_coherence=60, hook_strength=80, emotional_payoff=40, standalone_clarity=70
+    ).weighted
+    assert out[0].overall == round(weighted, 2)

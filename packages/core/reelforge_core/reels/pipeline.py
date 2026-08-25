@@ -71,12 +71,17 @@ def _working_dir(analysis: AnalysisReport) -> Path:
 
 
 def _ranking_stamp(config: SelectionConfig, cand_hash: str) -> dict:
-    return {
+    stamp = {
         "ranking_model": config.ranking_model,
         "ranking_prompt_version": config.ranking_prompt_version,
         "temperature": config.temperature,
         "candidate_hash": cand_hash,
     }
+    # Conditional so existing no-prompt stamps keep matching; any prompt
+    # add/change/remove mismatches and forces a fresh ranking call.
+    if config.prompt:
+        stamp["prompt"] = config.prompt
+    return stamp
 
 
 def _write_stamp(path: Path, payload: dict) -> None:
@@ -149,7 +154,11 @@ async def select_reels(
         candidate_map = {c.candidate_id: c for c in candidates}
         from reelforge_core.reels.rank import _coerce_rankings  # local import
 
-        ranked = _coerce_rankings(rankings_raw, candidate_map=candidate_map)
+        ranked = _coerce_rankings(
+            rankings_raw,
+            candidate_map=candidate_map,
+            prompt_active=bool(config.prompt),
+        )
         ranking_result = RankingResult(
             reels=ranked, usage=UsageTotals(), raw_rankings=rankings_raw
         )
@@ -169,9 +178,26 @@ async def select_reels(
         )
         _write_stamp(stamp_path, stamp)
 
-    # ----- dedup + top-k + rank assignment -----
+    # ----- prompt-relevance gate (strict filter) + dedup + top-k -----
     await progress(_emit("dedup", 0.0))
-    kept, dropped = dedup(ranking_result.reels, config)
+    reels_for_dedup = ranking_result.reels
+    if config.prompt:
+        from reelforge_core.reels.rank import PROMPT_RELEVANCE_FLOOR  # local import
+
+        before = len(reels_for_dedup)
+        reels_for_dedup = [
+            r
+            for r in reels_for_dedup
+            if (r.prompt_relevance or 0) >= PROMPT_RELEVANCE_FLOOR
+        ]
+        if before != len(reels_for_dedup):
+            log.info(
+                "prompt gate: %d/%d candidates below relevance floor %d dropped",
+                before - len(reels_for_dedup),
+                before,
+                PROMPT_RELEVANCE_FLOOR,
+            )
+    kept, dropped = dedup(reels_for_dedup, config)
     final = assign_ranks_and_truncate(kept, config.top_k)
     await progress(_emit("dedup", 1.0))
 

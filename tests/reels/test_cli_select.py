@@ -45,3 +45,30 @@ def test_cli_select_local_happy_path(
     assert data["asset_id"] == analysis.asset_id
     assert isinstance(data["reels"], list)
     assert len(data["reels"]) > 0
+
+
+def test_cli_select_local_with_prompt(
+    isolated_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reelforge_core.models import SelectionConfig
+
+    analysis = make_analysis("b" * 64, [10.0] * 6)
+    wd = isolated_data_dir / "working" / analysis.asset_id
+    wd.mkdir(parents=True, exist_ok=True)
+    (wd / "analysis.json").write_text(analysis.model_dump_json(indent=2))
+
+    candidates = generate_candidates(analysis, SelectionConfig())
+    rankings = all_rankings([c.candidate_id for c in candidates], relevance=85)
+    client = FakeRankingClient(script=[{"rankings": rankings}])
+    import anthropic
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", lambda *a, **kw: client)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["select", analysis.asset_id, "--local", "--prompt", "clips of falls"]
+    )
+    assert result.exit_code == 0, result.stdout
+    data = json.loads((wd / "reels.json").read_text())
+    assert data["config"]["prompt"] == "clips of falls"
+    assert all(r["prompt_relevance"] == 85 for r in data["reels"])

@@ -120,6 +120,8 @@ class ReelOut(BaseModel):
     # Editor state: True when a saved timeline overrides the AI cut.
     has_edits: bool = False
     edited_duration_sec: Optional[float] = None
+    # 0-100 match against the selection prompt; None when no prompt was used.
+    prompt_relevance: Optional[int] = None
 
 
 class ReelList(BaseModel):

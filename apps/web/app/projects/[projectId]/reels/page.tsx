@@ -36,6 +36,7 @@ interface ProjectReel {
   scene_indices: number[];
   scores: Record<string, number>;
   mezzanine_ready: boolean;
+  prompt_relevance?: number | null;
 }
 
 interface MontageOut {
@@ -220,6 +221,9 @@ function ReelCard({ projectId, reel }: { projectId: string; reel: ProjectReel })
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="truncate font-semibold">{reel.title}</h3>
               <Badge variant="secondary">{reel.suggested_mood}</Badge>
+              {typeof reel.prompt_relevance === 'number' ? (
+                <Badge variant="outline">Match {reel.prompt_relevance}%</Badge>
+              ) : null}
               {reel.mezzanine_ready ? (
                 <Badge variant="muted">composed</Badge>
               ) : null}

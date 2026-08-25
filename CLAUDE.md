@@ -360,6 +360,20 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   (`silenced` prop) so the mic doesn't capture footage; takes are placed
   where recording started and can be nudged. Preview caps gain at 1.0 (HTML
   media limit) while the render allows up to 3x.
+- **Natural-language selection prompt ("Direction").** `SelectionConfig.prompt`
+  (max 500 chars, whitespace-stripped, ""→None) steers ranking: `rank.py::
+  build_system_prompt` appends a USER DIRECTION block to `SYSTEM_PROMPT_V1`
+  and `build_ranking_tool` adds a required `prompt_relevance` (0-100) tool
+  field. Overall becomes `0.45*relevance + 0.55*scores.weighted`; candidates
+  under `PROMPT_RELEVANCE_FLOOR` (35) are dropped BEFORE dedup (strict filter
+  — zero matches → honest empty reels.json). Style intent rides
+  `suggested_mood`, which already drives transitions/LUT/music. The resume
+  stamp gains a `prompt` key ONLY when set (old stamps keep matching; any
+  prompt change forces a fresh rank). No prompt → byte-identical old behavior
+  (guarded by `test_no_prompt_is_unchanged`). `prompt_relevance` is persisted
+  on the Reel row (additive migration) and surfaced through all three reel
+  serialization paths + a "Match NN%" badge; the select endpoint 422s on
+  invalid config (`INVALID_CONFIG`) instead of 500. CLI: `--prompt`.
 - **Voiceover auto-captions + waveforms.** At the captions stage the compose
   pipeline transcribes every unmuted `VoiceoverTake` with faster-whisper
   (`analysis/transcribe.py::ensure_take_transcript`, cached at

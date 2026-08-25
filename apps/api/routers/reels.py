@@ -65,6 +65,7 @@ def _to_reel_out(r: dbmod.Reel, mezz_ready: bool) -> ReelOut:
         scene_indices=json.loads(r.scene_indices_json),
         scores=json.loads(r.scores_json),
         mezzanine_ready=mezz_ready,
+        prompt_relevance=r.prompt_relevance,
     )
 
 

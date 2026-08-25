@@ -146,3 +146,18 @@ async def test_patch_trim_invalidates_mezzanine(
     assert r.status_code == 200
     assert r.json()["mezzanine_ready"] is False
     assert not mezz.exists()
+
+
+@pytest.mark.asyncio
+async def test_get_reel_surfaces_prompt_relevance(api_client) -> None:
+    pid, aid, reel_id = await _project_asset_reel(api_client)
+    from apps.api import db as dbmod
+
+    async with dbmod.db_state.sessionmaker() as session:
+        row = await session.get(dbmod.Reel, reel_id)
+        row.prompt_relevance = 88
+        await session.commit()
+
+    r = await api_client.get(f"/api/v1/reels/{reel_id}")
+    assert r.status_code == 200
+    assert r.json()["prompt_relevance"] == 88

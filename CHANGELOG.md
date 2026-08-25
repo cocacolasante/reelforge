@@ -2,6 +2,26 @@
 
 Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+- Natural-language selection prompt ("Direction"): describe the clips you want
+  ("clips of falls", "jumps or carves", "make it feel intense") when selecting.
+  The ranker scores each candidate's `prompt_relevance` (0-100); clips below
+  the relevance floor are filtered out entirely (strict match — no matches
+  yields an empty, clearly-messaged result), and the final order blends
+  relevance (45%) with quality (55%). Style/feel wording steers the reel's
+  suggested mood, which cascades into transitions, color grade, and music.
+  Surfaced as a "Direction" field in the selection panel, a "Match %" badge on
+  reel cards, and `--prompt` on `reelforge select`.
+
+### Changed
+- Blended `overall` under a prompt means dedup now prefers the more on-prompt
+  span among overlapping candidates.
+- `POST /assets/{id}/select` returns 422 `INVALID_CONFIG` for invalid bodies
+  (e.g. prompt over 500 chars) instead of a 500.
+
+
 ## [0.7.0] — 2026-04-22
 
 ### Added

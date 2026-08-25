@@ -11,7 +11,9 @@ from reelforge_core.analysis.pipeline import working_dir_for
 from reelforge_core.io_utils import write_json_atomic
 
 
-def _build_selection_on_disk(asset_id: str, project_id: str, n_reels: int) -> None:
+def _build_selection_on_disk(
+    asset_id: str, project_id: str, n_reels: int, relevance: int | None = None
+) -> None:
     from reelforge_core.models import (
         REELFORGE_VERSION,
         RankedReel,
@@ -39,6 +41,7 @@ def _build_selection_on_disk(asset_id: str, project_id: str, n_reels: int) -> No
             overall=70 + i,
             rank=i + 1,
             suggested_mood="neutral",
+            prompt_relevance=relevance,
         )
         for i in range(n_reels)
     ]
@@ -238,3 +241,45 @@ async def test_create_montage_enqueues_job(
     assert len(montages) == 1
     assert montages[0]["child_reel_ids"] == ["chap-0", "chap-1"]
     assert montages[0]["mezzanine_ready"] is False  # job hasn't run yet
+
+
+@pytest.mark.asyncio
+async def test_project_reels_surface_and_clear_prompt_relevance(
+    api_client, isolated_data_dir: Path
+) -> None:
+    from apps.api import db as dbmod
+
+    r = await api_client.post("/api/v1/projects", json={"name": "prompt-agg"})
+    pid = r.json()["id"]
+    aid = "p" * 64
+    async with dbmod.db_state.sessionmaker() as session:
+        session.add(
+            dbmod.Asset(
+                id=aid,
+                project_id=pid,
+                path=f"/tmp/{aid}.mp4",
+                original_filename="p.mp4",
+                duration_sec=120,
+                width=1920,
+                height=1080,
+                fps=30,
+                has_audio=True,
+                size_bytes=1,
+                probe_json="{}",
+            )
+        )
+        await session.commit()
+
+    # Prompted selection → relevance surfaces in the aggregation + DB row.
+    _build_selection_on_disk(aid, pid, 2, relevance=77)
+    r = await api_client.get(f"/api/v1/projects/{pid}/reels")
+    assert r.status_code == 200, r.text
+    assert all(reel["prompt_relevance"] == 77 for reel in r.json()["reels"])
+
+    # Promptless re-select of the same candidates → values NULL-clear.
+    _build_selection_on_disk(aid, pid, 2)
+    r = await api_client.get(f"/api/v1/projects/{pid}/reels")
+    assert all(reel["prompt_relevance"] is None for reel in r.json()["reels"])
+    async with dbmod.db_state.sessionmaker() as session:
+        row = await session.get(dbmod.Reel, f"reel-{aid[:4]}-0")
+        assert row is not None and row.prompt_relevance is None

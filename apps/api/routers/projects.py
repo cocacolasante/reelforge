@@ -370,6 +370,7 @@ async def list_project_reels(
                         suggested_mood=r.suggested_mood,
                         scene_indices_json=_json.dumps(r.scene_indices),
                         scores_json=_json.dumps(r.scores.model_dump()),
+                        prompt_relevance=r.prompt_relevance,
                         mezzanine_path=mezz_path,
                     )
                 )
@@ -380,6 +381,8 @@ async def list_project_reels(
                 existing.justification = r.justification
                 existing.overall_score = r.overall
                 existing.suggested_mood = r.suggested_mood
+                # Unconditional: a promptless re-select clears stale values.
+                existing.prompt_relevance = r.prompt_relevance
                 if mezz_path:
                     existing.mezzanine_path = mezz_path
             merged.append(
@@ -400,6 +403,7 @@ async def list_project_reels(
                     "scene_indices": r.scene_indices,
                     "scores": r.scores.model_dump(),
                     "mezzanine_ready": mezz.exists(),
+                    "prompt_relevance": r.prompt_relevance,
                 }
             )
     # Re-rank merged set by overall score so the UI shows the best content first

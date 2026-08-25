@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import field_validator, BaseModel, Field
 
 REELFORGE_VERSION = "0.5.0"  # Phase 4: export
 
@@ -155,7 +155,9 @@ class ReelScores(BaseModel):
     @property
     def weighted(self) -> float:
         """Overall score. Weights sum to 1.0. If you change them, update
-        docs + the determinism checks — this is the single source of truth."""
+        docs + the determinism checks — this is the single source of truth.
+        When SelectionConfig.prompt is set, rank.py blends this with
+        prompt_relevance: overall = 0.45*relevance + 0.55*weighted."""
         return (
             0.35 * self.hook_strength
             + 0.30 * self.narrative_coherence
@@ -190,6 +192,8 @@ class RankedReel(BaseModel):
     overall: float
     rank: int
     suggested_mood: Mood
+    # 0-100 match against SelectionConfig.prompt; None when no prompt was used.
+    prompt_relevance: int | None = Field(default=None, ge=0, le=100)
 
 
 OutputForm = Literal["short", "long_single", "long_montage"]
@@ -212,6 +216,17 @@ class SelectionConfig(BaseModel):
     ranking_prompt_version: str = "v1"
     temperature: float = 0.0
     resume: bool = False
+    # Natural-language direction, e.g. "clips of falls", "make it feel intense".
+    # Steers ranking (prompt_relevance gate + blend) and style (suggested_mood).
+    prompt: str | None = Field(default=None, max_length=500)
+
+    @field_validator("prompt", mode="before")
+    @classmethod
+    def _clean_prompt(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.strip()
+            return v or None
+        return v
 
     @property
     def effective_min_sec(self) -> float:

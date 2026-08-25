@@ -20,6 +20,7 @@ from apps.api.settings import settings
 from reelforge_core.analysis.pipeline import working_dir_for
 from reelforge_core.ingest import asset_to_dict, probe
 from reelforge_core.io_utils import write_json_atomic
+from pydantic import ValidationError as PydanticValidationError
 from reelforge_core.models import (
     AnalysisConfig,
     AnalysisReport,
@@ -111,7 +112,14 @@ async def select_reels_endpoint(
             "ANALYSIS_NOT_READY",
             "Run analyze before select — analysis.json is missing.",
         )
-    config = SelectionConfig(**body)
+    try:
+        config = SelectionConfig(**body)
+    except PydanticValidationError as exc:
+        raise ApiError(
+            422,
+            "INVALID_CONFIG",
+            f"invalid selection config: {exc.errors()[0].get('msg', exc)}",
+        )
 
     job_row = await enqueue_job(
         db,
@@ -161,6 +169,7 @@ def _hydrate_reels_from_disk(
                 scene_indices=r.scene_indices,
                 scores=r.scores.model_dump(),
                 mezzanine_ready=mezz.exists(),
+                prompt_relevance=r.prompt_relevance,
             )
         )
     return out
@@ -193,6 +202,7 @@ async def list_reels_for_asset(
                     suggested_mood=r.suggested_mood,
                     scene_indices_json=json.dumps(r.scene_indices),
                     scores_json=json.dumps(r.scores),
+                    prompt_relevance=r.prompt_relevance,
                     mezzanine_path=(
                         str(
                             working_dir_for(asset_id)
