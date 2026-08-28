@@ -16,11 +16,12 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 # ---- Stage 2: python deps (cached separately from app code) ------------------
 FROM system AS python-deps
 WORKDIR /app
-RUN pip install --no-cache-dir uv==0.5.0
-COPY pyproject.toml ./
+RUN pip install --no-cache-dir uv==0.9.30
+COPY pyproject.toml uv.lock ./
 # Skip installing the root project itself — code lands in the next stage.
-# Phase 0 has no committed uv.lock; `uv sync` resolves from pyproject.toml.
-RUN uv sync --no-install-project
+# --frozen honors the committed uv.lock so rebuilds can't drift (an unpinned
+# anthropic once jumped a major version on rebuild and broke ranking).
+RUN uv sync --frozen --no-install-project
 
 # ---- Stage 3: app code -------------------------------------------------------
 FROM python-deps AS core

@@ -14,7 +14,7 @@ dependencies = [
     "arq>=0.26",
     "redis>=5.2",
     # External services
-    "anthropic>=0.40",
+    "anthropic>=1.0,<2",
     # CLI
     "typer>=0.15",
     "rich>=13.9",
