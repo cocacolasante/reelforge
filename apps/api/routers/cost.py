@@ -78,13 +78,17 @@ async def estimate_select_cost(
         raise ApiError(500, "INTERNAL_ERROR", f"failed to read analysis.json: {exc}")
     cfg = SelectionConfig(**body)
     candidates = generate_candidates(analysis, cfg)
+    # The ranking call only ever sees the prescore shortlist, so price that,
+    # not the full generator union.
+    ranked_count = min(len(candidates), cfg.shortlist_size)
     breakdown = estimate_ranking_cost(
-        candidate_count=len(candidates), model=cfg.ranking_model
+        candidate_count=ranked_count, model=cfg.ranking_model
     )
     return {
         "pricing_as_of": PRICING_AS_OF,
         "estimated_cost_usd": breakdown["estimated_cost_usd"],
         "candidate_count": len(candidates),
+        "ranked_candidate_count": ranked_count,
         "breakdown": [breakdown],
     }
 

@@ -165,20 +165,29 @@ def clip_bounds(
     scene,
     config: ComposeConfig,
     analysis: AnalysisReport,
+    reel_start: float | None = None,
+    reel_end: float | None = None,
 ) -> tuple[float, float]:
     """Pure: the source in/out timestamps for the clip at `position`.
 
-    Applies user trim offsets to the reel's outer clips, then snaps the outer
-    bounds off the middle of any spoken word (speech-safe cuts). Caption
-    timing mirrors this computation — keep them in sync.
+    Selection v2 reel bounds are authoritative and may fall mid-scene: the
+    outer clips are clamped to `reel_start`/`reel_end` FIRST (scene-aligned
+    reels clamp to their own scene edges — a no-op), then user trim offsets
+    apply, then the outer bounds snap off the middle of any spoken word
+    (speech-safe cuts). Caption timing mirrors this computation — keep them
+    in sync.
     """
     from reelforge_core.compose.speech_snap import flatten_words, snap_end, snap_start
 
     in_ts = scene.start_sec
     out_ts = scene.end_sec
     if position == 0:
+        if reel_start is not None:
+            in_ts = max(in_ts, reel_start)
         in_ts = max(0.0, in_ts + config.trim_start_offset_sec)
     if position == n_scenes - 1:
+        if reel_end is not None:
+            out_ts = min(out_ts, reel_end)
         out_ts = max(in_ts + 0.1, out_ts - config.trim_end_offset_sec)
     if config.speech_safe_cuts and analysis.transcript is not None:
         words = flatten_words(analysis.transcript)
@@ -224,8 +233,16 @@ async def extract_clips(
 
     async def _one(position: int, scene_idx: int) -> ClipInfo:
         scene = analysis.scenes[scene_idx]
-        # Trim offsets + speech-safe snapping for the reel's outer clips.
-        in_ts, out_ts = clip_bounds(position, n_scenes, scene, config, analysis)
+        # Reel-bound clamp + trim offsets + speech-safe snapping (outer clips).
+        in_ts, out_ts = clip_bounds(
+            position,
+            n_scenes,
+            scene,
+            config,
+            analysis,
+            reel_start=reel.start_sec,
+            reel_end=reel.end_sec,
+        )
         if end_trims is not None and position < n_scenes - 1 and position < len(end_trims):
             out_ts = max(in_ts + 0.5, out_ts - end_trims[position])
         pan: tuple[float, float] | None = None

@@ -10,7 +10,7 @@ import { cn } from '@/lib/utils';
 
 export type JobVariant = 'analyze' | 'select' | 'compose' | 'export' | 'publish';
 
-const ANALYZE_STAGES = ['probe', 'scenes', 'transcribe', 'loudness', 'semantics'];
+const ANALYZE_STAGES = ['probe', 'scenes', 'transcribe', 'loudness', 'energy', 'semantics'];
 const COMPOSE_STAGES = ['prepare', 'clips', 'captions', 'music', 'render', 'finalize'];
 
 export function JobProgress({

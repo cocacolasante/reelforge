@@ -106,12 +106,93 @@ docker compose logs worker | jq            # structured JSON logs from the worke
   - `analysis/audio_extract.py` — one-shot mono 16 kHz PCM extraction shared by transcribe + loudness.
   - `analysis/transcribe.py` — faster-whisper with VAD + auto device/compute selection.
   - `analysis/audio.py` — ffmpeg `ebur128` → 1-second LUFS bins.
+  - `analysis/energy.py` — per-second energy track (v2): motion = mean abs
+    grey frame diff via SEQUENTIAL decode at `energy_sample_fps` (2.0), using
+    the shared helpers in `reelforge_core/vision.py` (also used by
+    compose/reframe.py — keep them in sync); `loudness_delta` between adjacent
+    LUFS bins (clamped at the −80 silence sentinel). Bins centered i+0.5 like
+    loudness. Writes `energy.json` + stamp `(source_mtime, sample_fps)`;
+    `AnalysisReport.energy` defaults to [] so old analysis.json still loads
+    (the moment generator just won't run). Stage "energy" (weight 0.03, carved
+    from semantics) sits between loudness and semantics in STAGE_WEIGHTS —
+    insertion order matters to `compute_overall`.
   - `analysis/semantics.py` — forced tool-use calls with retry + SQLite cache.
   - `analysis/pipeline.py` — `analyze()` orchestrator with weighted progress + resume stamps.
 - **Selection pipeline (Phase 2)**:
-  - `reels/candidates.py` — pure enumeration of 30-60s scene-aligned spans + stable `candidate_id` (sha1 truncated to 16 hex).
-  - `reels/rank.py` — **one batched Anthropic call** covering all candidates (split into overlapping batches of 60 only when > 80). Forced tool-use with one corrective retry for missing candidates.
-  - `reels/dedup.py` — greedy overlap-aware dedup (intersection over smaller set, strict `<` threshold) + `assign_ranks_and_truncate`.
+  - `reels/candidates.py` — pure candidate generators unioned by
+    `generate_candidates` (scene + `generators/sentence.py` +
+    `generators/moment.py`). Union dedups exact (start_ms, end_ms) collisions first-generator-wins
+    and caps at `SelectionConfig.max_candidates` (400; sentence kept first,
+    then scene, then moment, even time-stride within a truncated generator).
+    `generators/sentence.py` builds utterance units from the word timeline
+    (punctuation / ≥0.45s gap / segment boundary + ≥0.25s gap; <1s units merge
+    forward) and enumerates unit-start→unit-end spans, skipping spans with
+    <15% spoken time. **v2 contract: `start_sec`/`end_sec` are the authoritative
+    reel bounds and the identity** — `candidate_id =
+    sha1(asset_id|start_ms|end_ms)[:16]`; `scene_indices` = scenes that COVER
+    the span (`covering_scenes`, half-open `[start, end)`), for compose's
+    per-scene clip extraction. `ReelCandidate.source` names the generator.
+    Compose clamps outer clip bounds to reel bounds in `clips.py::clip_bounds`
+    (`reel_start`/`reel_end` params) — mirrored in captions' fallback path,
+    the beat-sync planned durations in `compose/pipeline.py`, and the editor's
+    `_default_timeline` in `apps/api/routers/reels.py`. Scene-aligned
+    candidates clamp to their own edges (no-op), so pre-v2 behavior is
+    byte-identical for them.
+  - `reels/evaluate.py` — eval harness: recall@K of `reels.json` against
+    hand-labeled picks in `tests/reels/eval/labels/` (mounted into the cli
+    service); `./reelforge eval-select`.
+  - `reels/features.py` — re-exports `flatten_words` from
+    `compose/speech_snap.py` (one definition of the word timeline; the
+    dependency edge is one-way reels→compose).
+  - `reels/prescore.py` — heuristic pre-score + shortlist (pure, no API):
+    per-candidate features (unit-boundary/mid-word edges, speech_ratio,
+    energy peak pos/z, lufs_range, scene cuts) → documented linear formula →
+    `shortlist()` walk in score order skipping >0.85 time-overlap with kept.
+    `SelectionConfig.shortlist_size` (40) caps what the ranker sees. All
+    candidates + features + scores land in `prescore.json` (debug).
+    `PRESCORE_VERSION` is part of the ranking resume stamp — bump it whenever
+    the weights change.
+  - `reels/rank.py` — **one multimodal listwise Anthropic call on the
+    prescore shortlist** (SYSTEM_PROMPT_V2 / ranking_prompt_version "v2").
+    Message = intro text block + per candidate a contact-sheet image block +
+    a JSON text block (transcript_words first/last 60 with "…", opening/
+    closing line, per-sec energy z, prescore_features, scenes[]). Required v2
+    tool fields: `rank_position` (explicit order, breaks overall ties) +
+    `opening_description` (literal first-2s). max_tokens 16000. Forced
+    tool-use with one corrective retry for missing candidates. Temperature
+    rides `extra_body` (SDK 1.x removed the kwarg; sonnet-4-5 still accepts).
+    The old >80 overlapping-batch path is deleted (first-seen-wins merging
+    across batches scored on different scales was never sound); oversize sets
+    truncate to the first `LARGE_SET_THRESHOLD` (80) in prescore order.
+  - `reels/contact_sheet.py` — pure sheet command builder: 3 frames
+    (start+0.5 / energy peak / end−0.5) scaled to 180px HEIGHT (fixed height
+    bounds image tokens ≈ w*h/750 across aspects; ~230/sheet), hstacked JPEG
+    q≈75 → `working/{asset_id}/candidates/{candidate_id}.jpg`. Extraction
+    (I/O, parallelism 4, skip-if-exists, best-effort — missing source just
+    means text-only ranking) lives in `reels/pipeline.py`.
+  - `reels/refine.py` — CP7 boundary refinement: ONE small API call
+    (`record_refinements`, forced tool-use via rank's `_call_model` with
+    `tool_name=`) proposing new bounds for the top-K; pure `apply_refinement`
+    validates everything locally (±6s window, duration within effective
+    min/max — violations revert, mid-word edges snap ≤0.6s or revert,
+    `covering_scenes` recomputed). `candidate_id` NEVER changes; originals
+    kept in `pre_refine_start/end_sec`. Best-effort: failures keep unrefined
+    bounds. `refine_raw.json` + stamp `(model, refine_prompt_version r1,
+    top-K ids+bounds)`; `SelectionConfig.refine` (default on). Live-verified:
+    the model does propose floor-violating durations — the local validator is
+    load-bearing, keep it strict.
+  - `reels/dedup.py` — TIME-based greedy dedup (intersection / shorter
+    duration, strict `<` threshold), `mmr_diversify` (score = overall −
+    λ·max_sim; sim = scene-tag Jaccard + 0.25 same-mood bonus;
+    `SelectionConfig.diversity_lambda` 8.0, halved under a user prompt, 0
+    disables), `resolve_post_refine_overlaps` (refined edges can newly
+    collide — drop the lower-ordered, backfill from the post-MMR reserve),
+    and `assign_ranks_and_truncate`. Final pipeline order: rank → relevance
+    gate → dedup → MMR → truncate top-K → refine → overlap recheck → ranks.
+    NOTE: reel `rank` follows the MMR order and may deviate from pure
+    overall-desc; the project-level aggregation still re-sorts by
+    overall_score. `candidates_dropped_by_diversity` on ReelSelection counts
+    top-K displacement.
   - `reels/pipeline.py` — `select_reels()` orchestrator with stage-weighted progress (candidates 5% / ranking 90% / dedup 5%) + `ranking_raw.json.stamp` resume.
 - **Composition pipeline (Phase 3)** — `packages/core/reelforge_core/compose/`:
   - `graph.py` — `FilterNode`/`FilterGraph` DSL, `_ffescape` for filter-argument escaping, `run_ffmpeg` subprocess wrapper that raises `FFmpegError` with stderr tail, and `ffmpeg_version()`.
@@ -195,14 +276,32 @@ Per-asset working dir: `/data/working/{asset_id}/`.
 
 Resume: each stage checks its `.stamp` matches `(config, source_mtime)` before skipping. Semantics use the SQLite cache keyed on `(asset_id, scene_index, model, prompt_version, thumb_sha256, transcript_slice_sha256)`.
 
-## Phase 2 artifacts on disk
+## Phase 2 artifacts on disk (Selection v2 — see docs/selection.md)
 Same working dir, per asset:
-- `candidates.json` — every 30-60s scene-span (pre-ranking). Written even when the list is empty.
+- `candidates.json` — the generator union (scene + sentence + moment),
+  time-bounded spans with covering `scene_indices`. Written even when empty.
+- `prescore.json` — EVERY candidate with its features, prescore, and a
+  `shortlisted` flag, sorted by score. The place to look when tuning weights.
+- `candidates/{candidate_id}.jpg` — 3-frame contact sheets (960×~180) for the
+  shortlisted candidates. Skip-if-exists; safe to delete (regenerated).
 - `ranking_raw.json` — the parsed tool-use `rankings` array straight from Claude; untouched by dedup. Invaluable for debugging.
-- `ranking_raw.json.stamp` — `(ranking_model, ranking_prompt_version, temperature, candidate_hash)`. When `--resume` is set and the stamp matches, `ranking_raw.json` is re-parsed instead of calling Claude.
+- `ranking_raw.json.stamp` — `(ranking_model, ranking_prompt_version,
+  temperature, candidate_hash [over the SHORTLIST], prescore_version,
+  prompt [only when set])`. When `--resume` is set and the stamp matches,
+  `ranking_raw.json` is re-parsed instead of calling Claude.
+- `refine_raw.json` (+ `.stamp` keyed `(model, refine_prompt_version,
+  top-K ids+pre-refine bounds)`) — the boundary-refinement proposals; only
+  written on a successful call so failures retry next run.
 - `reels.json` — the merged `ReelSelection`. **Phase 3 and Phase 5 read only this file.**
 
-Determinism: Claude at `temperature=0` is usually — but not always — byte-identical across back-to-back calls. The reliable determinism path is `--resume`: two consecutive `--resume` runs are byte-identical (excluding `created_at`/`elapsed_sec`). If exact reproducibility matters, snapshot `ranking_raw.json`.
+Determinism: Claude at `temperature=0` (passed via `extra_body`; the 1.x SDK
+removed the kwarg) is usually — but not always — byte-identical across
+back-to-back calls. The reliable determinism path is `--resume`: two
+consecutive `--resume` runs are byte-identical (excluding
+`created_at`/`elapsed_sec`) and cost zero tokens (ranking AND refinement both
+stamp-cached). If exact reproducibility matters, snapshot `ranking_raw.json`.
+Eval: hand-label picks in `tests/reels/eval/labels/` and run
+`./reelforge eval-select` for recall@K against them.
 
 ## Phase 3 artifacts on disk
 Per-reel dir: `/data/working/{asset_id}/reels/{reel_id}/` (where `reel_id` = `candidate_id` from Phase 2).
@@ -286,6 +385,18 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   `select_track` prefers `source == "user"` tracks over bundled placeholders
   whenever the mood is covered, so the placeholders only play on a fresh
   install that hasn't fetched the library.
+- **Music packs + CC-BY auto-credit.** `scripts/fetch_music_packs.py`
+  replaces the OpenGameArt pack (retires `*-oga-*` ids) with Scott Buckley
+  (CC-BY 4.0, mp3 URLs scraped from track pages at run time) and Loyalty
+  Freak Music (CC0, Internet Archive `archive.org/download/...`, license
+  verified via the IA metadata API). `publish/credits.py::
+  music_credit_for_reel` reads compose.json's `chosen_music`; when license
+  starts with CC-BY the worker appends the credit to `pub["description"]`
+  BEFORE platform dispatch, so YouTube descriptions and IG/TikTok captions
+  all carry it (idempotent — `append_credit`). Pixabay/Mixkit forbid
+  scripted downloads: hand-picked tracks go through the reel page's
+  "Manage library" dialog (`music-library-dialog.tsx`) → existing
+  `POST /music/uploads`. FMA gates downloads behind login — don't script it.
 - **Final-mix loudness normalization is on by default.**
   `ComposeConfig.normalize_loudness` adds a `loudnorm I=-14:TP=-1.5:LRA=11`
   pass on the mixed bus (after amix / voice passthrough) followed by

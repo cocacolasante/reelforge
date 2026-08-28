@@ -371,6 +371,8 @@ async def list_project_reels(
                         scene_indices_json=_json.dumps(r.scene_indices),
                         scores_json=_json.dumps(r.scores.model_dump()),
                         prompt_relevance=r.prompt_relevance,
+                        source=r.source,
+                        opening_description=r.opening_description,
                         mezzanine_path=mezz_path,
                     )
                 )
@@ -383,6 +385,14 @@ async def list_project_reels(
                 existing.suggested_mood = r.suggested_mood
                 # Unconditional: a promptless re-select clears stale values.
                 existing.prompt_relevance = r.prompt_relevance
+                existing.source = r.source
+                existing.opening_description = r.opening_description
+                # v2: candidate_id hashes the bounds, but refinement (CP7) can
+                # move bounds under a stable id — always refresh geometry.
+                existing.start_sec = r.start_sec
+                existing.end_sec = r.end_sec
+                existing.duration_sec = r.duration_sec
+                existing.scene_indices_json = _json.dumps(r.scene_indices)
                 if mezz_path:
                     existing.mezzanine_path = mezz_path
             merged.append(
@@ -404,6 +414,8 @@ async def list_project_reels(
                     "scores": r.scores.model_dump(),
                     "mezzanine_ready": mezz.exists(),
                     "prompt_relevance": r.prompt_relevance,
+                    "source": r.source,
+                    "opening_description": r.opening_description,
                 }
             )
     # Re-rank merged set by overall score so the UI shows the best content first

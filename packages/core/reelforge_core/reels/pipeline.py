@@ -71,11 +71,19 @@ def _working_dir(analysis: AnalysisReport) -> Path:
 
 
 def _ranking_stamp(config: SelectionConfig, cand_hash: str) -> dict:
+    from reelforge_core.reels.prescore import PRESCORE_VERSION
+
     stamp = {
         "ranking_model": config.ranking_model,
         "ranking_prompt_version": config.ranking_prompt_version,
         "temperature": config.temperature,
+        # Hash of the SHORTLIST (not the full union) — a prescore change that
+        # alters shortlist membership invalidates resume via the hash; a
+        # weights change that happens NOT to alter membership still must
+        # invalidate (features ride into the v2 ranking context), hence the
+        # explicit version key.
         "candidate_hash": cand_hash,
+        "prescore_version": PRESCORE_VERSION,
     }
     # Conditional so existing no-prompt stamps keep matching; any prompt
     # add/change/remove mismatches and forces a fresh ranking call.
@@ -95,6 +103,103 @@ def _stamp_matches(path: Path, expected: dict) -> bool:
         return json.loads(path.read_text(encoding="utf-8")) == expected
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Boundary refinement (stamped, resumable — the pure logic lives in
+# reels/refine.py)
+# ---------------------------------------------------------------------------
+
+
+def _refine_stamp(config: SelectionConfig, reels: list[RankedReel]) -> dict:
+    from reelforge_core.reels.refine import REFINE_PROMPT_VERSION
+
+    targets = sorted(
+        f"{r.candidate_id}:{int(round(r.start_sec * 1000))}:{int(round(r.end_sec * 1000))}"
+        for r in reels
+    )
+    return {
+        "model": config.ranking_model,
+        "refine_prompt_version": REFINE_PROMPT_VERSION,
+        "targets": "|".join(targets),
+    }
+
+
+async def _refine_step(
+    final: list[RankedReel],
+    analysis: AnalysisReport,
+    config: SelectionConfig,
+    wd: Path,
+) -> tuple[list[RankedReel], UsageTotals]:
+    from reelforge_core.reels.refine import apply_refinements_raw, refine_reels
+
+    raw_path = wd / "refine_raw.json"
+    stamp_path = wd / "refine_raw.json.stamp"
+    stamp = _refine_stamp(config, final)
+    if config.resume and raw_path.exists() and _stamp_matches(stamp_path, stamp):
+        log.info("refinement: resume cache hit (%d reels)", len(final))
+        raw = json.loads(raw_path.read_text()).get("refinements", [])
+        return apply_refinements_raw(final, raw, analysis, config), UsageTotals()
+
+    refined, usage, raw = await refine_reels(final, analysis, config)
+    if raw:  # persist only successful calls so a failure retries next run
+        write_json_atomic(
+            raw_path, {"refinements": raw, "usage": usage.model_dump()}
+        )
+        _write_stamp(stamp_path, stamp)
+    return refined, usage
+
+
+# ---------------------------------------------------------------------------
+# Contact-sheet extraction (I/O — the pure command builder lives in
+# reels/contact_sheet.py)
+# ---------------------------------------------------------------------------
+
+
+async def _extract_contact_sheets(
+    candidates: list[ReelCandidate],
+    analysis: AnalysisReport,
+    features: dict,
+    wd: Path,
+) -> dict[str, Path]:
+    """candidate_id -> sheet path for every candidate whose sheet could be
+    produced. Best-effort: a missing source or a failed extraction just means
+    that candidate is ranked text-only."""
+    import asyncio
+
+    from reelforge_core.compose.graph import run_ffmpeg
+    from reelforge_core.reels.contact_sheet import (
+        build_contact_sheet_command,
+        sheet_frame_times,
+    )
+
+    source = Path(analysis.source_path)
+    if not source.exists():
+        log.warning("contact sheets skipped: source missing at %s", source)
+        return {}
+    sheets_dir = wd / "candidates"
+    sheets_dir.mkdir(parents=True, exist_ok=True)
+    sem = asyncio.Semaphore(4)
+
+    async def _one(c: ReelCandidate) -> tuple[str, Path] | None:
+        out = sheets_dir / f"{c.candidate_id}.jpg"
+        if out.exists():
+            return c.candidate_id, out
+        f = features.get(c.candidate_id)
+        times = sheet_frame_times(
+            c.start_sec, c.end_sec, getattr(f, "energy_peak_pos", None)
+        )
+        cmd = build_contact_sheet_command(source, times, out)
+        try:
+            async with sem:
+                await asyncio.to_thread(run_ffmpeg, cmd, timeout_sec=120)
+        except Exception as exc:
+            log.warning("contact sheet failed for %s: %s", c.candidate_id, exc)
+            return None
+        return c.candidate_id, out
+
+    results = await asyncio.gather(*(_one(c) for c in candidates))
+    return dict(r for r in results if r is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -140,18 +245,47 @@ async def select_reels(
         await progress(_emit("dedup", 1.0))
         return selection
 
+    # ----- prescore + shortlist (local, no API) -----
+    from reelforge_core.reels.prescore import compute_features, prescore, shortlist
+
+    features = compute_features(candidates, analysis)
+    short = shortlist(candidates, features, config.shortlist_size)
+    short_ids = {s.candidate_id for s in short}
+    write_json_atomic(
+        wd / "prescore.json",
+        sorted(
+            (
+                {
+                    "candidate_id": c.candidate_id,
+                    "start_sec": c.start_sec,
+                    "end_sec": c.end_sec,
+                    "source": c.source,
+                    "prescore": prescore(features[c.candidate_id]),
+                    "shortlisted": c.candidate_id in short_ids,
+                    "features": features[c.candidate_id].to_dict(),
+                }
+                for c in candidates
+            ),
+            key=lambda row: -row["prescore"],
+        ),
+    )
+    log.info(
+        "prescore: shortlisted %d of %d candidates", len(short), len(candidates)
+    )
+
     # ----- ranking (with stamp-based resume) -----
-    cand_hash = candidate_set_hash(candidates)
+    cand_hash = candidate_set_hash(short)
     stamp_path = wd / "ranking_raw.json.stamp"
     raw_path = wd / "ranking_raw.json"
     stamp = _ranking_stamp(config, cand_hash)
 
+    sheets: dict[str, Path] = {}
     ranking_result: RankingResult | None = None
     if config.resume and raw_path.exists() and _stamp_matches(stamp_path, stamp):
-        log.info("ranking: resume cache hit (%d candidates)", len(candidates))
+        log.info("ranking: resume cache hit (%d candidates)", len(short))
         raw = json.loads(raw_path.read_text())
         rankings_raw = raw.get("rankings", [])
-        candidate_map = {c.candidate_id: c for c in candidates}
+        candidate_map = {c.candidate_id: c for c in short}
         from reelforge_core.reels.rank import _coerce_rankings  # local import
 
         ranked = _coerce_rankings(
@@ -164,8 +298,12 @@ async def select_reels(
         )
         await progress(_emit("ranking", 1.0))
     else:
-        await progress(_emit("ranking", 0.05, f"ranking {len(candidates)} candidates"))
-        ranking_result = await rank(candidates, analysis, config)
+        await progress(_emit("ranking", 0.02, "extracting contact sheets"))
+        sheets = await _extract_contact_sheets(short, analysis, features, wd)
+        await progress(_emit("ranking", 0.05, f"ranking {len(short)} candidates"))
+        ranking_result = await rank(
+            short, analysis, config, features=features, sheets=sheets
+        )
         await progress(_emit("ranking", 1.0))
         # Persist raw rankings + stamp so re-runs can skip the Claude call.
         write_json_atomic(
@@ -198,8 +336,49 @@ async def select_reels(
                 PROMPT_RELEVANCE_FLOOR,
             )
     kept, dropped = dedup(reels_for_dedup, config)
-    final = assign_ranks_and_truncate(kept, config.top_k)
+
+    # ----- MMR diversity re-rank (halved λ under a user prompt) -----
+    from reelforge_core.reels.dedup import mmr_diversify, resolve_post_refine_overlaps
+
+    lam = config.diversity_lambda * (0.5 if config.prompt else 1.0)
+    sem_tags = {s.scene_index: set(s.tags) for s in analysis.semantics}
+    tag_sets = {
+        r.candidate_id: set().union(*(sem_tags.get(i, set()) for i in r.scene_indices))
+        if r.scene_indices
+        else set()
+        for r in kept
+    }
+    ordered = mmr_diversify(kept, tag_sets, lam)
+    topk_by_overall = {r.candidate_id for r in kept[: config.top_k]}
+    topk_by_mmr = {r.candidate_id for r in ordered[: config.top_k]}
+    dropped_by_diversity = len(topk_by_overall - topk_by_mmr)
+    if dropped_by_diversity:
+        log.info(
+            "diversity: %d reel(s) displaced from the top-%d by MMR (λ=%.1f)",
+            dropped_by_diversity,
+            config.top_k,
+            lam,
+        )
+
+    final = ordered[: config.top_k]
+    reserve = ordered[config.top_k :]
+
+    # ----- boundary refinement (best-effort, one small API call) -----
+    refine_usage = UsageTotals()
+    if config.refine and final:
+        await progress(_emit("dedup", 0.5, "refining reel bounds"))
+        final, refine_usage = await _refine_step(final, analysis, config, wd)
+        # Refined edges can newly collide; drop the lower-ordered reel and
+        # backfill from the post-MMR reserve.
+        final = resolve_post_refine_overlaps(final, reserve, config)
+    final = assign_ranks_and_truncate(final, config.top_k)
     await progress(_emit("dedup", 1.0))
+
+    total_usage = UsageTotals(
+        input_tokens=ranking_result.usage.input_tokens + refine_usage.input_tokens,
+        output_tokens=ranking_result.usage.output_tokens + refine_usage.output_tokens,
+        cache_hits=ranking_result.usage.cache_hits,
+    )
 
     selection = ReelSelection(
         asset_id=analysis.asset_id,
@@ -207,8 +386,9 @@ async def select_reels(
         config=config,
         candidates_generated=len(candidates),
         candidates_dropped_by_dedup=dropped,
+        candidates_dropped_by_diversity=dropped_by_diversity,
         reels=final,
-        anthropic_usage=ranking_result.usage.model_dump(),
+        anthropic_usage=total_usage.model_dump(),
         created_at=datetime.now(timezone.utc).isoformat(),
         elapsed_sec=round(time.monotonic() - t_start, 3),
         reelforge_version=REELFORGE_VERSION,

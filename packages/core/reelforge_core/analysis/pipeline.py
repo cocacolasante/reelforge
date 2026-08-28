@@ -23,6 +23,7 @@ from reelforge_core.models import (
     REELFORGE_VERSION,
     AnalysisConfig,
     AnalysisReport,
+    EnergyPoint,
     LoudnessPoint,
     ProgressCallback,
     ProgressEvent,
@@ -148,6 +149,26 @@ async def analyze(
         loudness = await measure_loudness(asset, wd, config, progress)
         _write_stamp(loudness_path, loudness_stamp)
 
+    # --- energy ----------------------------------------------------------------
+    # Per-second motion + loudness-delta track for the moment-anchored
+    # candidate generator. Independent of scenes, so it runs before the split.
+    energy_path = wd / "energy.json"
+    energy_stamp = {"source_mtime": mtime, "sample_fps": config.energy_sample_fps}
+    energy: list[EnergyPoint]
+    await progress(ProgressEvent("energy", 0.0, compute_overall("energy", 0.0)))
+    if config.resume and _stamp_matches(energy_path, energy_stamp):
+        energy = [
+            EnergyPoint.model_validate(p) for p in json.loads(energy_path.read_text())
+        ]
+        log.info("energy: resume cache hit (%d points)", len(energy))
+    else:
+        from reelforge_core.analysis.energy import compute_energy
+
+        energy = await compute_energy(asset, loudness, config)
+        write_json_atomic(energy_path, [p.model_dump() for p in energy])
+        _write_stamp(energy_path, energy_stamp)
+    await progress(ProgressEvent("energy", 1.0, compute_overall("energy", 1.0)))
+
     # --- scene refinement: split long takes ------------------------------------
     # Raw unedited footage often has scenes far longer than any reel, which
     # makes candidate enumeration produce nothing. Now that transcript +
@@ -198,6 +219,7 @@ async def analyze(
         scenes=scenes,
         transcript=transcript,
         loudness=loudness,
+        energy=energy,
         semantics=semantics,
         created_at=datetime.now(timezone.utc).isoformat(),
         elapsed_sec=round(elapsed, 3),

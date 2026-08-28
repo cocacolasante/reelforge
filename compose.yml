@@ -85,6 +85,9 @@ services:
     volumes:
       - ./data:/data
       - whisper_models:/models/whisper
+      # Selection-eval labels live in the repo; mount them read-only so
+      # `./reelforge eval-select` sees them without a rebuild.
+      - ./tests/reels/eval/labels:/app/tests/reels/eval/labels:ro
     networks: [reelforge_net]
 
   # Public tunnel for Instagram publishing: Meta's servers must FETCH the

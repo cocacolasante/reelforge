@@ -7,12 +7,13 @@ the model can compare them globally. Only batch if > 80 candidates (rare).
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import json
 import logging
 import random
-import statistics
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 from reelforge_core.errors import RankingError
@@ -33,8 +34,6 @@ log = logging.getLogger(__name__)
 MAX_RETRIES = 5
 TRANSCRIPT_SLICE_CAP = 3000
 LARGE_SET_THRESHOLD = 80
-BATCH_SIZE = 60
-BATCH_OVERLAP = 10
 
 SYSTEM_PROMPT_V1 = (
     "You are a senior short-form video editor selecting moments from a longer "
@@ -59,6 +58,47 @@ SYSTEM_PROMPT_V1 = (
     "- standalone_clarity: does the span make sense without the surrounding "
     "video? Heavy reliance on prior context ('as I said earlier...') scores "
     "low. Self-contained scores high.\n\n"
+    "Call the record_rankings tool exactly once with rankings for ALL "
+    "candidates. Do not omit candidates. Do not include any text outside the "
+    "tool call.\n\n"
+    "Titles: <= 60 characters, no emoji, no trailing punctuation, written like "
+    "a content creator would actually title a reel.\n"
+    "Hooks: <= 140 characters, one sentence, designed to retain a viewer past "
+    "3 seconds.\n"
+    "Justifications: 1-2 sentences, specific to the content, not generic.\n"
+    "Mood: pick from the fixed vocabulary to aid music selection downstream."
+)
+
+SYSTEM_PROMPT_V2 = (
+    "You are a senior short-form video editor selecting moments from a longer "
+    "piece of footage for a 30-60 second standalone reel (the kind that would "
+    "work on TikTok, Instagram Reels, or YouTube Shorts).\n\n"
+    "You will receive every viable candidate span at once. Each candidate "
+    "comes as a 3-frame contact sheet (opening frame / energy peak / closing "
+    "frame) followed by its data as JSON: per-scene summaries and tags, "
+    "word-timestamped transcript, per-second energy, and the heuristic "
+    "features that pre-selected it. Candidates arrive in heuristic prescore "
+    "order — treat that order as a weak prior, not the answer.\n\n"
+    "You are seeing the whole set: first decide the ORDERING — which would "
+    "you post first, second, third. Record it as rank_position (1 = best). "
+    "Then assign the four dimension scores so they reflect RELATIVE quality "
+    "within this set, using the full 0-100 range; the top 5 candidates must "
+    "be separated by at least 5 points of overall quality. Do not compress "
+    "everything into a 55-80 band.\n\n"
+    "Score meanings (be harsh — most raw candidates are mediocre):\n"
+    "- narrative_coherence: does this span tell a self-contained story or make "
+    "a complete point? A random 45 seconds of B-roll scores low. A clear "
+    "setup-development-payoff scores high.\n"
+    "- hook_strength: would someone scrolling past stop in the first 2 seconds? "
+    "Judge from the FIRST contact-sheet frame and the opening line. Strong "
+    "opening visual, unexpected moment, or compelling question scores high.\n"
+    "- emotional_payoff: does the span deliver an emotional or informational "
+    "punch? Laughter, revelation, surprise, release of tension all score high.\n"
+    "- standalone_clarity: does the span make sense without the surrounding "
+    "video? Heavy reliance on prior context scores low.\n\n"
+    "opening_description: at most 80 characters stating what is LITERALLY on "
+    "screen and said in the first 2 seconds — from the first contact-sheet "
+    "frame and the opening line. No marketing language; describe, don't sell.\n\n"
     "Call the record_rankings tool exactly once with rankings for ALL "
     "candidates. Do not omit candidates. Do not include any text outside the "
     "tool call.\n\n"
@@ -137,6 +177,23 @@ RECORD_RANKINGS: dict[str, Any] = {
 }
 
 
+# v2 tool: v1 fields plus the listwise ordering + literal opening description.
+RECORD_RANKINGS_V2: dict[str, Any] = copy.deepcopy(RECORD_RANKINGS)
+_V2_ITEM = RECORD_RANKINGS_V2["input_schema"]["properties"]["rankings"]["items"]
+_V2_ITEM["properties"]["rank_position"] = {
+    "type": "integer",
+    "minimum": 1,
+    "description": "Explicit listwise order: 1 = the candidate you would post first.",
+}
+_V2_ITEM["properties"]["opening_description"] = {
+    "type": "string",
+    "maxLength": 80,
+    "description": "What is literally on screen and said in the first 2 seconds.",
+}
+_V2_ITEM["required"].extend(["rank_position", "opening_description"])
+del _V2_ITEM
+
+
 # When a user prompt is active, candidates scoring below this floor on
 # prompt_relevance are dropped entirely (strict filter). The rubric anchors
 # <=20 as "unrelated" and ~50 as "partial", so 35 removes clear misses while
@@ -166,17 +223,21 @@ USER_DIRECTION_TEMPLATE = (
 
 
 def build_system_prompt(config: SelectionConfig) -> str:
-    """SYSTEM_PROMPT_V1, plus the user-direction block when a prompt is set."""
+    """SYSTEM_PROMPT_V2, plus the user-direction block when a prompt is set.
+
+    SYSTEM_PROMPT_V1 stays in the file for reference/stamp archaeology only —
+    old stamps recording ranking_prompt_version "v1" simply won't match and
+    force one fresh rank."""
     if not config.prompt:
-        return SYSTEM_PROMPT_V1
-    return SYSTEM_PROMPT_V1 + USER_DIRECTION_TEMPLATE.format(prompt=config.prompt)
+        return SYSTEM_PROMPT_V2
+    return SYSTEM_PROMPT_V2 + USER_DIRECTION_TEMPLATE.format(prompt=config.prompt)
 
 
 def build_ranking_tool(config: SelectionConfig) -> dict[str, Any]:
-    """RECORD_RANKINGS, plus a required prompt_relevance field when a prompt is set."""
+    """RECORD_RANKINGS_V2, plus a required prompt_relevance field when a prompt is set."""
     if not config.prompt:
-        return RECORD_RANKINGS
-    tool = copy.deepcopy(RECORD_RANKINGS)
+        return RECORD_RANKINGS_V2
+    tool = copy.deepcopy(RECORD_RANKINGS_V2)
     item = tool["input_schema"]["properties"]["rankings"]["items"]
     item["properties"]["prompt_relevance"] = {
         "type": "integer",
@@ -202,37 +263,70 @@ class RankingResult:
 def _slice_transcript(
     transcript: Transcript | None, start: float, end: float
 ) -> str:
+    """Word-granular slice: a word belongs to the span iff its midpoint does.
+
+    Segment-granular slicing bled a whole segment's text into the span when it
+    overlapped by as little as 0.1s; boundary words are the difference between
+    "opens mid-sentence" and "opens on the hook" for the ranker.
+    """
     if transcript is None:
         return ""
     parts: list[str] = []
     for seg in transcript.segments:
         if seg.end < start or seg.start > end:
             continue
-        parts.append(seg.text.strip())
+        if seg.words:
+            for w in seg.words:
+                if start <= (w.start + w.end) / 2.0 <= end:
+                    parts.append(w.word.strip())
+        else:
+            # No word timings (older artifacts / overrides): whole-segment fallback.
+            parts.append(seg.text.strip())
     text = " ".join(parts).strip()
     if len(text) > TRANSCRIPT_SLICE_CAP:
         text = text[: TRANSCRIPT_SLICE_CAP - len("…[truncated]")] + "…[truncated]"
     return text
 
 
-def _slice_loudness(
-    loudness: list[LoudnessPoint], start: float, end: float
-) -> list[float]:
-    return [p.lufs for p in loudness if start <= p.time_sec <= end]
+# transcript_words keeps this many words from each end of the span (with a
+# "…" marker between when truncated) — openings and closings decide reels.
+WORD_WINDOW = 60
+
+
+def _span_words(
+    transcript: Transcript | None, start: float, end: float
+) -> list[tuple[float, str]]:
+    """(start_time, word) for every word whose midpoint falls in the span."""
+    if transcript is None:
+        return []
+    out: list[tuple[float, str]] = []
+    for seg in transcript.segments:
+        if seg.end < start or seg.start > end:
+            continue
+        for w in seg.words:
+            if start <= (w.start + w.end) / 2.0 <= end:
+                out.append((round(w.start, 2), w.word.strip()))
+    return out
 
 
 def build_candidate_context(
-    candidate: ReelCandidate, analysis: AnalysisReport
+    candidate: ReelCandidate,
+    analysis: AnalysisReport,
+    *,
+    features: Any | None = None,
+    units: list | None = None,
+    energy_z: list[tuple[float, float]] | None = None,
 ) -> dict:
+    """The per-candidate JSON the ranker sees (v2).
+
+    `features` is the candidate's PrescoreFeatures, `units` the asset's
+    utterance units, `energy_z` the asset-wide (time, combined z) series —
+    callers compute each once and share across candidates.
+    """
     scenes = [analysis.scenes[i] for i in candidate.scene_indices]
     # Semantics is keyed by scene_index, which equals the list position; look up safely.
     sem_by_index = {s.scene_index: s for s in analysis.semantics}
-    transcript_slice = _slice_transcript(
-        analysis.transcript, candidate.start_sec, candidate.end_sec
-    )
-    loudness_slice = _slice_loudness(
-        analysis.loudness, candidate.start_sec, candidate.end_sec
-    )
+    start, end = candidate.start_sec, candidate.end_sec
 
     scene_dicts: list[dict] = []
     for s in scenes:
@@ -249,28 +343,40 @@ def build_candidate_context(
             }
         )
 
-    stats: dict[str, float | None] = {
-        "mean_lufs": None,
-        "peak_lufs": None,
-        "dynamic_range_lu": None,
-    }
-    if loudness_slice:
-        stats["mean_lufs"] = round(statistics.fmean(loudness_slice), 1)
-        stats["peak_lufs"] = round(max(loudness_slice), 1)
-        if len(loudness_slice) > 1:
-            stats["dynamic_range_lu"] = round(
-                max(loudness_slice) - min(loudness_slice), 1
-            )
+    words = _span_words(analysis.transcript, start, end)
+    transcript_words: list[Any] = (
+        [[t, w] for t, w in words]
+        if len(words) <= 2 * WORD_WINDOW
+        else [[t, w] for t, w in words[:WORD_WINDOW]]
+        + ["…"]
+        + [[t, w] for t, w in words[-WORD_WINDOW:]]
+    )
+
+    opening_line = ""
+    closing_line = ""
+    if units:
+        in_span = [u for u in units if u.end > start and u.start < end]
+        if in_span:
+            opening_line = in_span[0].text[:200]
+            closing_line = in_span[-1].text[:200]
+
+    energy_series: list[float] = []
+    if energy_z:
+        energy_series = [round(z, 1) for t, z in energy_z if start <= t <= end]
 
     return {
         "candidate_id": candidate.candidate_id,
-        "start_sec": round(candidate.start_sec, 2),
-        "end_sec": round(candidate.end_sec, 2),
+        "start_sec": round(start, 2),
+        "end_sec": round(end, 2),
         "duration_sec": round(candidate.duration_sec, 2),
         "scene_count": candidate.scene_count,
+        "source": candidate.source,
         "scenes": scene_dicts,
-        "transcript": transcript_slice,
-        "loudness_stats": stats,
+        "transcript_words": transcript_words,
+        "opening_line": opening_line,
+        "closing_line": closing_line,
+        "energy_series": energy_series,
+        "prescore_features": features.to_dict() if features is not None else None,
     }
 
 
@@ -316,20 +422,26 @@ async def _call_model(
     system_prompt: str,
     messages: list[dict],
     tools: list[dict] | None = None,
+    tool_name: str = "record_rankings",
+    max_tokens: int = 16000,
 ) -> Any:
     last_exc: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
-            # NOTE: anthropic>=1.0 removed the `temperature` kwarg from
-            # messages.create; config.temperature now only feeds the resume
-            # stamp. Claude 5 ranking runs at the API default.
+            # NOTE: anthropic SDK 1.0.0 removed the `temperature` kwarg from
+            # messages.create, but the API still accepts it for
+            # claude-sonnet-4-5 (verified 2026-08-27), so we pass it through
+            # extra_body for reproducible ranking. If the ranking model ever
+            # moves to a Claude 5 family model that rejects sampling params
+            # (400), drop the extra_body line.
             resp = await client.messages.create(
                 model=model,
-                max_tokens=8000,
+                max_tokens=max_tokens,
                 system=system_prompt,
                 tools=tools if tools is not None else [RECORD_RANKINGS],
-                tool_choice={"type": "tool", "name": "record_rankings"},
+                tool_choice={"type": "tool", "name": tool_name},
                 messages=messages,
+                extra_body={"temperature": temperature},
             )
             stop_reason = getattr(resp, "stop_reason", None)
             if stop_reason not in {"tool_use", None}:
@@ -384,6 +496,10 @@ def _coerce_rankings(
             else:
                 overall = round(scores.weighted, 2)
             candidate = candidate_map[cid]
+            rank_position = entry.get("rank_position")
+            rank_position = int(rank_position) if rank_position is not None else None
+            opening = entry.get("opening_description")
+            opening = str(opening)[:80] if opening else None
             reel = RankedReel(
                 candidate_id=cid,
                 scene_indices=candidate.scene_indices,
@@ -398,6 +514,9 @@ def _coerce_rankings(
                 rank=0,  # assigned after dedup
                 suggested_mood=entry["suggested_mood"],
                 prompt_relevance=relevance,
+                source=candidate.source,
+                rank_position=rank_position,
+                opening_description=opening,
             )
         except Exception as exc:
             log.warning(
@@ -408,6 +527,9 @@ def _coerce_rankings(
             continue
         seen.add(cid)
         out.append(reel)
+    # Sort so the model's explicit listwise order breaks overall-score ties
+    # (dedup's stable overall-desc sort then preserves this ordering).
+    out.sort(key=lambda r: (-r.overall, r.rank_position if r.rank_position is not None else 1 << 30))
     return out
 
 
@@ -417,8 +539,15 @@ async def rank(
     config: SelectionConfig,
     *,
     client: Any | None = None,
+    features: dict[str, Any] | None = None,
+    sheets: dict[str, Path] | None = None,
 ) -> RankingResult:
-    """Single batched ranking call. Retries on missing candidates (once)."""
+    """Single listwise ranking call on the (shortlisted) candidates.
+
+    `features` maps candidate_id -> PrescoreFeatures; `sheets` maps
+    candidate_id -> contact-sheet JPEG path. Both are optional — the call
+    degrades to text-only context without them. Retries on missing
+    candidates (once)."""
     if not candidates:
         return RankingResult(reels=[], usage=UsageTotals(), raw_rankings=[])
 
@@ -430,15 +559,22 @@ async def rank(
     candidate_map = {c.candidate_id: c for c in candidates}
 
     if len(candidates) > LARGE_SET_THRESHOLD:
-        log.info(
-            "large candidate set (%d) — splitting into overlapping batches of %d",
+        # The pipeline's prescore shortlist (SelectionConfig.shortlist_size)
+        # should keep sets far below this; if something bypasses it, rank the
+        # first LARGE_SET_THRESHOLD in the given (prescore) order. The old
+        # overlapping-batch path is gone — first-seen-wins merging of batches
+        # scored on different scales was never sound.
+        log.warning(
+            "ranking set of %d exceeds %d — ranking only the first %d "
+            "(raise SelectionConfig.shortlist_size deliberately if you want more)",
             len(candidates),
-            BATCH_SIZE,
+            LARGE_SET_THRESHOLD,
+            LARGE_SET_THRESHOLD,
         )
-        merged = await _rank_batched(client, candidates, analysis, config)
-        return merged
+        candidates = candidates[:LARGE_SET_THRESHOLD]
+        candidate_map = {c.candidate_id: c for c in candidates}
 
-    return await _rank_once(client, candidates, analysis, config, candidate_map)
+    return await _rank_once(client, candidates, analysis, config, candidate_map, features=features, sheets=sheets)
 
 
 async def _rank_once(
@@ -447,10 +583,52 @@ async def _rank_once(
     analysis: AnalysisReport,
     config: SelectionConfig,
     candidate_map: dict[str, ReelCandidate],
+    features: dict[str, Any] | None = None,
+    sheets: dict[str, Path] | None = None,
 ) -> RankingResult:
-    contexts = [build_candidate_context(c, analysis) for c in batch]
-    user_payload = json.dumps({"candidates": contexts}, indent=2)
-    messages: list[dict] = [{"role": "user", "content": user_payload}]
+    # Shared context computed once per call, not per candidate.
+    from reelforge_core.reels.generators.moment import combined_scores
+    from reelforge_core.reels.generators.sentence import build_units
+
+    units = build_units(analysis.transcript)
+    energy_z = combined_scores(analysis)
+
+    blocks: list[dict] = [
+        {
+            "type": "text",
+            "text": (
+                "Candidates follow in heuristic prescore order (a weak prior, "
+                "not the answer). Each candidate: a 3-frame contact sheet "
+                "(opening / energy peak / closing frame), then its data as JSON."
+            ),
+        }
+    ]
+    for c in batch:
+        sheet = sheets.get(c.candidate_id) if sheets else None
+        if sheet is not None:
+            try:
+                data = base64.standard_b64encode(Path(sheet).read_bytes()).decode()
+                blocks.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": data,
+                        },
+                    }
+                )
+            except OSError:
+                log.warning("contact sheet unreadable for %s; sending text only", c.candidate_id)
+        ctx = build_candidate_context(
+            c,
+            analysis,
+            features=(features or {}).get(c.candidate_id),
+            units=units,
+            energy_z=energy_z,
+        )
+        blocks.append({"type": "text", "text": json.dumps(ctx, indent=2)})
+    messages: list[dict] = [{"role": "user", "content": blocks}]
     system_prompt = build_system_prompt(config)
     tools = [build_ranking_tool(config)]
     prompt_active = bool(config.prompt)
@@ -532,50 +710,6 @@ async def _rank_once(
             log.warning("retry for missing candidates failed: %s", exc)
 
     return RankingResult(reels=ranked, usage=usage, raw_rankings=rankings_raw)
-
-
-async def _rank_batched(
-    client: Any,
-    candidates: list[ReelCandidate],
-    analysis: AnalysisReport,
-    config: SelectionConfig,
-) -> RankingResult:
-    """Rank a large candidate set in overlapping batches. Later batches use the
-    same prompt; we merge results by candidate_id (first seen wins)."""
-    seen_ids: set[str] = set()
-    all_reels: list[RankedReel] = []
-    usage = UsageTotals()
-    all_raw: list[dict] = []
-    seen_raw_ids: set[str] = set()
-
-    step = BATCH_SIZE - BATCH_OVERLAP
-    for start in range(0, len(candidates), step):
-        batch = candidates[start : start + BATCH_SIZE]
-        if not batch:
-            break
-        candidate_map = {c.candidate_id: c for c in batch}
-        result = await _rank_once(client, batch, analysis, config, candidate_map)
-        for reel in result.reels:
-            if reel.candidate_id in seen_ids:
-                continue
-            seen_ids.add(reel.candidate_id)
-            all_reels.append(reel)
-        # Dedup raw rankings across overlapping batches with their own seen-set.
-        # (Filtering against seen_ids here would drop nearly everything — it
-        # was just updated with this batch's ids above.)
-        for r in result.raw_rankings:
-            cid = r.get("candidate_id")
-            if cid in seen_raw_ids:
-                continue
-            if cid is not None:
-                seen_raw_ids.add(cid)
-            all_raw.append(r)
-        usage.input_tokens += result.usage.input_tokens
-        usage.output_tokens += result.usage.output_tokens
-        if start + BATCH_SIZE >= len(candidates):
-            break
-
-    return RankingResult(reels=all_reels, usage=usage, raw_rankings=all_raw)
 
 
 def _accumulate_usage(resp: Any) -> UsageTotals:

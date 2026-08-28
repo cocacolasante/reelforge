@@ -230,9 +230,19 @@ async def compose(
         from reelforge_core.compose.clips import clip_bounds
 
         n = len(reel.scene_indices)
+        # Must mirror extract_clips exactly (incl. the reel-bound clamp) or
+        # beat-sync trims are computed against the wrong shot durations.
         planned_durations = [
             (lambda b: b[1] - b[0])(
-                clip_bounds(pos, n, analysis.scenes[idx], config, analysis)
+                clip_bounds(
+                    pos,
+                    n,
+                    analysis.scenes[idx],
+                    config,
+                    analysis,
+                    reel_start=reel.start_sec,
+                    reel_end=reel.end_sec,
+                )
             )
             for pos, idx in enumerate(reel.scene_indices)
         ]

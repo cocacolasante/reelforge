@@ -958,5 +958,34 @@ def cleanup(
     )
 
 
+# ---------------------------------------------------------------------------
+# Selection v2: eval harness
+# ---------------------------------------------------------------------------
+
+
+@app.command("eval-select")
+def eval_select(
+    labels: Path = typer.Option(
+        None,
+        "--labels",
+        help="Directory of <asset_id>.json label files "
+        "(default: tests/reels/eval/labels, mounted into the cli container).",
+    ),
+) -> None:
+    """Score reels.json against hand-labeled picks (recall@3/5/10)."""
+    from reelforge_core.reels.evaluate import evaluate_all, format_report
+
+    if labels is None:
+        for cand in (Path("/app/tests/reels/eval/labels"), Path("tests/reels/eval/labels")):
+            if cand.is_dir():
+                labels = cand
+                break
+    if labels is None or not labels.is_dir():
+        console.print("[red]error:[/red] no labels directory found; pass --labels DIR")
+        raise typer.Exit(code=2)
+    console.print(f"labels: {labels}   data: {_data_dir()}\n")
+    console.print(format_report(evaluate_all(labels, _data_dir())), highlight=False)
+
+
 if __name__ == "__main__":
     app()

@@ -121,6 +121,9 @@ export const ReelSchema = z.object({
   has_edits: z.boolean(),
   edited_duration_sec: z.number().nullable(),
   prompt_relevance: z.number().nullable().optional(),
+  // Selection v2: generator source + literal first-2s description.
+  source: z.string().nullable().optional(),
+  opening_description: z.string().nullable().optional(),
 });
 export const ReelListSchema = z.object({ reels: z.array(ReelSchema) });
 export type Reel = z.infer<typeof ReelSchema>;

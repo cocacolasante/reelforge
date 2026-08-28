@@ -52,6 +52,9 @@ def _ranking_for(candidate_id: str, seed: int = 0, relevance: int | None = None)
         "justification": f"Ranked because of reasons specific to {candidate_id}.",
         "suggested_mood": moods[seed % len(moods)],
         "scores": base_scores,
+        # v2 required fields — harmless extras under a v1-style schema.
+        "rank_position": seed + 1,
+        "opening_description": f"Opening frame of {candidate_id}"[:80],
     }
     if relevance is not None:
         entry["prompt_relevance"] = relevance
@@ -77,9 +80,14 @@ class FakeRankingClient:
     care about sequencing still work).
     """
 
-    def __init__(self, script: list[dict]):
+    def __init__(self, script: list[dict], refine_script: list[dict] | None = None):
         self.script = list(script)
         self.calls: list[dict] = []
+        # record_refinements calls are tracked separately so ranking-call
+        # count assertions stay stable. Default response: empty refinements
+        # (a no-op refinement pass).
+        self.refine_script = list(refine_script) if refine_script else []
+        self.refine_calls: list[dict] = []
         self.messages = self
 
     def _user_text(self, kwargs: dict) -> str:
@@ -96,14 +104,49 @@ class FakeRankingClient:
         return ""
 
     def _candidate_ids_from_payload(self, kwargs: dict) -> list[str]:
-        text = self._user_text(kwargs)
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            return []
-        return [c["candidate_id"] for c in parsed.get("candidates", [])]
+        """Candidate ids from either message layout: the v1 single JSON string
+        ({"candidates": [...]}) or the v2 interleaved blocks (one JSON text
+        block per candidate, with image blocks between)."""
+        msgs = kwargs.get("messages", [])
+        content = msgs[0].get("content") if msgs else None
+        texts: list[str] = []
+        if isinstance(content, str):
+            texts = [content]
+        elif isinstance(content, list):
+            texts = [b["text"] for b in content if b.get("type") == "text"]
+        ids: list[str] = []
+        for text in texts:
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and "candidate_id" in parsed:
+                ids.append(parsed["candidate_id"])
+            elif isinstance(parsed, dict):
+                ids.extend(c["candidate_id"] for c in parsed.get("candidates", []))
+        return ids
 
     async def create(self, **kwargs: Any) -> Any:
+        tools = kwargs.get("tools") or []
+        if tools and tools[0].get("name") == "record_refinements":
+            self.refine_calls.append(kwargs)
+            if self.refine_script:
+                payload = (
+                    self.refine_script.pop(0)
+                    if len(self.refine_script) > 1
+                    else self.refine_script[0]
+                )
+            else:
+                payload = {"refinements": []}
+            return SimpleNamespace(
+                content=[
+                    _ToolUseBlock(
+                        type="tool_use", input=payload, name="record_refinements"
+                    )
+                ],
+                stop_reason="tool_use",
+                usage=_Usage(input_tokens=40, output_tokens=30),
+            )
         self.calls.append(kwargs)
         if not self.script:
             rankings = all_rankings(self._candidate_ids_from_payload(kwargs))

@@ -109,6 +109,10 @@ class Reel(SQLModel, table=True):
     trim_end_offset_sec: float = 0.0
     # 0-100 match against the selection prompt (NULL when no prompt was used).
     prompt_relevance: Optional[int] = None
+    # Selection v2: which generator proposed the reel (scene|sentence|moment)
+    # and the ranker's literal first-2-seconds description.
+    source: Optional[str] = None
+    opening_description: Optional[str] = None
     # Phase 7.x long-form montage: when set, this Reel is the concatenation of
     # the listed child reel_ids. The compose worker takes the montage path
     # instead of the normal extract → render path.
@@ -339,6 +343,13 @@ async def create_all(engine: AsyncEngine) -> None:
         if reel_cols and "prompt_relevance" not in reel_cols:
             await conn.execute(
                 text("ALTER TABLE reels ADD COLUMN prompt_relevance INTEGER")
+            )
+        # Selection v2: generator source + literal opening description.
+        if reel_cols and "source" not in reel_cols:
+            await conn.execute(text("ALTER TABLE reels ADD COLUMN source TEXT"))
+        if reel_cols and "opening_description" not in reel_cols:
+            await conn.execute(
+                text("ALTER TABLE reels ADD COLUMN opening_description TEXT")
             )
 
 

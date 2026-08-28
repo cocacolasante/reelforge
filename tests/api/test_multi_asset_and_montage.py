@@ -42,6 +42,8 @@ def _build_selection_on_disk(
             rank=i + 1,
             suggested_mood="neutral",
             prompt_relevance=relevance,
+            source="sentence",
+            opening_description=f"literal opening {i}",
         )
         for i in range(n_reels)
     ]
@@ -274,7 +276,11 @@ async def test_project_reels_surface_and_clear_prompt_relevance(
     _build_selection_on_disk(aid, pid, 2, relevance=77)
     r = await api_client.get(f"/api/v1/projects/{pid}/reels")
     assert r.status_code == 200, r.text
-    assert all(reel["prompt_relevance"] == 77 for reel in r.json()["reels"])
+    payload = r.json()["reels"]
+    assert all(reel["prompt_relevance"] == 77 for reel in payload)
+    # v2 fields ride the same three serialization paths.
+    assert all(reel["source"] == "sentence" for reel in payload)
+    assert all(reel["opening_description"].startswith("literal opening") for reel in payload)
 
     # Promptless re-select of the same candidates → values NULL-clear.
     _build_selection_on_disk(aid, pid, 2)

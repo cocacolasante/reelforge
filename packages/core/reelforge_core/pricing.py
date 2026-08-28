@@ -69,9 +69,14 @@ def price_for(model: str, input_tokens: int, output_tokens: int) -> float:
 # at worst. The UI labels these as estimates.
 AVG_SEMANTICS_PROMPT_TOKENS = 900        # system + scene frame (image) context
 AVG_SEMANTICS_OUTPUT_TOKENS = 130
-AVG_RANKING_PROMPT_PER_CANDIDATE = 260
-AVG_RANKING_SYSTEM_TOKENS = 650
-AVG_RANKING_OUTPUT_PER_CANDIDATE = 65
+# Calibrated against a live v2 run (silent 119s asset, 6 candidates:
+# 8,175 in / 1,278 out); speech-heavy contexts run larger.
+AVG_RANKING_PROMPT_PER_CANDIDATE = 800   # v2 rich context (words/energy/features)
+AVG_RANKING_SYSTEM_TOKENS = 1200         # v2 listwise prompt + intro block
+AVG_RANKING_OUTPUT_PER_CANDIDATE = 200   # v2 adds rank_position + opening_description
+# Contact sheet ≈ width*height/750 image tokens; 3 tiles at 180px height from
+# 16:9 source ≈ 960x180 ≈ 230 — rounded up for taller-than-16:9 tiles.
+AVG_CONTACT_SHEET_TOKENS = 250
 
 
 def estimate_semantics_cost(
@@ -115,7 +120,8 @@ def estimate_ranking_cost(
         }
     input_tokens = (
         AVG_RANKING_SYSTEM_TOKENS
-        + candidate_count * AVG_RANKING_PROMPT_PER_CANDIDATE
+        + candidate_count
+        * (AVG_RANKING_PROMPT_PER_CANDIDATE + AVG_CONTACT_SHEET_TOKENS)
     )
     output_tokens = candidate_count * AVG_RANKING_OUTPUT_PER_CANDIDATE
     cost = price_for(model, input_tokens, output_tokens)

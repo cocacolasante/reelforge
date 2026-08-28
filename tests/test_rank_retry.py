@@ -145,23 +145,32 @@ def test_build_candidate_context_populates_fields() -> None:
     assert ctx["candidate_id"] == candidates[0].candidate_id
     assert ctx["scene_count"] >= 1
     assert "scenes" in ctx and ctx["scenes"]
-    assert "transcript" in ctx
-    # Loudness stats either None (no samples in span) or a dict with the keys.
-    ls = ctx["loudness_stats"]
-    assert set(ls.keys()) == {"mean_lufs", "peak_lufs", "dynamic_range_lu"}
+    assert ctx["source"] == "scene"
+    # v2 context: word-timestamped transcript, no loudness_stats.
+    assert isinstance(ctx["transcript_words"], list)
+    assert "loudness_stats" not in ctx
+    assert "prescore_features" in ctx and "energy_series" in ctx
 
 
-def test_build_candidate_context_long_transcript_truncates() -> None:
+def test_build_candidate_context_word_window_truncates() -> None:
+    """v2: transcript_words keeps the first/last WORD_WINDOW words with a
+    '…' marker between."""
     from reelforge_core.models import (
         SelectionConfig,
         Transcript,
         TranscriptSegment,
         TranscriptWord,
     )
+    from reelforge_core.reels.rank import WORD_WINDOW
 
     analysis = make_analysis("ctx-long", [10.0] * 5)
-    # Inject a huge transcript segment overlapping the first candidate span
-    huge_text = "word " * 5000
+    n_words = 200
+    words = [
+        TranscriptWord(
+            start=i * 0.2, end=i * 0.2 + 0.15, word=f"w{i}", probability=0.9
+        )
+        for i in range(n_words)
+    ]
     analysis = analysis.model_copy(
         update={
             "transcript": Transcript(
@@ -170,14 +179,7 @@ def test_build_candidate_context_long_transcript_truncates() -> None:
                 duration=50.0,
                 segments=[
                     TranscriptSegment(
-                        start=0.0,
-                        end=50.0,
-                        text=huge_text,
-                        words=[
-                            TranscriptWord(
-                                start=0.0, end=0.1, word="word", probability=0.9
-                            )
-                        ],
+                        start=0.0, end=40.0, text="lots of words", words=words
                     )
                 ],
             )
@@ -186,11 +188,58 @@ def test_build_candidate_context_long_transcript_truncates() -> None:
     cfg = SelectionConfig()
     candidates = generate_candidates(analysis, cfg)
     ctx = build_candidate_context(candidates[0], analysis)
-    # Truncation marker present, length ≤ cap + tolerance
-    assert "truncated" in ctx["transcript"]
-    from reelforge_core.reels.rank import TRANSCRIPT_SLICE_CAP
+    tw = ctx["transcript_words"]
+    assert len(tw) == 2 * WORD_WINDOW + 1
+    assert tw[WORD_WINDOW] == "…"
+    assert tw[0][1] == "w0"
 
-    assert len(ctx["transcript"]) <= TRANSCRIPT_SLICE_CAP + 20
+
+def test_slice_transcript_is_word_granular_on_straddling_segments() -> None:
+    """A segment straddling the span boundary contributes only in-span words."""
+    from reelforge_core.models import Transcript, TranscriptSegment, TranscriptWord
+    from reelforge_core.reels.rank import _slice_transcript
+
+    def _word(t: float, text: str) -> TranscriptWord:
+        return TranscriptWord(start=t, end=t + 0.4, word=text, probability=0.9)
+
+    transcript = Transcript(
+        language="en",
+        language_probability=1.0,
+        duration=40.0,
+        segments=[
+            # Straddles the span start (span = [10, 30]).
+            TranscriptSegment(
+                start=8.0,
+                end=12.0,
+                text="before before inside",
+                words=[_word(8.0, "before"), _word(9.0, "before"), _word(11.0, "inside")],
+            ),
+            # Fully inside.
+            TranscriptSegment(
+                start=15.0,
+                end=16.0,
+                text="middle",
+                words=[_word(15.0, "middle")],
+            ),
+            # Straddles the span end.
+            TranscriptSegment(
+                start=29.0,
+                end=33.0,
+                text="last after after",
+                words=[_word(29.0, "last"), _word(31.0, "after"), _word(32.0, "after")],
+            ),
+            # Fully outside.
+            TranscriptSegment(
+                start=35.0,
+                end=36.0,
+                text="way-after",
+                words=[_word(35.0, "way-after")],
+            ),
+        ],
+    )
+    assert _slice_transcript(transcript, 10.0, 30.0) == "inside middle last"
+    # Word exactly on the boundary midpoint is included (<= comparison).
+    assert "inside" in _slice_transcript(transcript, 11.2, 30.0)
 
 
 def test_build_candidate_context_no_transcript_is_empty_string() -> None:
@@ -200,7 +249,8 @@ def test_build_candidate_context_no_transcript_is_empty_string() -> None:
     cfg = SelectionConfig()
     candidates = generate_candidates(analysis, cfg)
     ctx = build_candidate_context(candidates[0], analysis)
-    assert ctx["transcript"] == ""
+    assert ctx["transcript_words"] == []
+    assert ctx["opening_line"] == "" and ctx["closing_line"] == ""
 
 
 def test_coerce_rankings_drops_duplicate_candidate_id() -> None:

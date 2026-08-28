@@ -170,6 +170,8 @@ def _hydrate_reels_from_disk(
                 scores=r.scores.model_dump(),
                 mezzanine_ready=mezz.exists(),
                 prompt_relevance=r.prompt_relevance,
+                source=r.source,
+                opening_description=r.opening_description,
             )
         )
     return out
@@ -185,6 +187,15 @@ async def list_reels_for_asset(
     # Upsert DB rows so downstream endpoints (compose, export) can resolve by id.
     for r in reels:
         existing = await db.get(dbmod.Reel, r.id)
+        if existing is not None:
+            # v2: refinement (CP7) can move bounds under a stable candidate_id
+            # — refresh geometry so trim/edit endpoints never see stale bounds.
+            existing.start_sec = r.start_sec
+            existing.end_sec = r.end_sec
+            existing.duration_sec = r.duration_sec
+            existing.scene_indices_json = json.dumps(r.scene_indices)
+            existing.source = r.source
+            existing.opening_description = r.opening_description
         if existing is None:
             db.add(
                 dbmod.Reel(
@@ -203,6 +214,8 @@ async def list_reels_for_asset(
                     scene_indices_json=json.dumps(r.scene_indices),
                     scores_json=json.dumps(r.scores),
                     prompt_relevance=r.prompt_relevance,
+                    source=r.source,
+                    opening_description=r.opening_description,
                     mezzanine_path=(
                         str(
                             working_dir_for(asset_id)

@@ -425,6 +425,10 @@ function SelectionPanel({
   const [longTarget, setLongTarget] = React.useState<number[]>([300]);
   const [count, setCount] = React.useState(10);
   const [prompt, setPrompt] = React.useState('');
+  const [advancedOpen, setAdvancedOpen] = React.useState(false);
+  const [shortlistSize, setShortlistSize] = React.useState(40);
+  const [diversity, setDiversity] = React.useState<number[]>([8]);
+  const [refine, setRefine] = React.useState(true);
   const [zeroMatchNote, setZeroMatchNote] = React.useState(false);
   const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
@@ -460,6 +464,11 @@ function SelectionPanel({
       top_k: count,
     };
     if (prompt.trim()) config.prompt = prompt.trim();
+    // Advanced (Selection v2) knobs — only sent when changed from defaults so
+    // the job config stays minimal.
+    if (shortlistSize !== 40) config.shortlist_size = shortlistSize;
+    if (diversity[0] !== 8) config.diversity_lambda = diversity[0];
+    if (!refine) config.refine = false;
     if (form === 'long_single') {
       config.long_target_duration_sec = longTarget[0];
     } else {
@@ -594,6 +603,59 @@ function SelectionPanel({
           ) : null}
         </div>
       ) : null}
+
+      <div className="space-y-3">
+        <button
+          type="button"
+          onClick={() => setAdvancedOpen((v) => !v)}
+          className="text-xs font-medium text-muted-foreground underline-offset-2 hover:underline"
+        >
+          {advancedOpen ? '▾ Advanced' : '▸ Advanced'}
+        </button>
+        {advancedOpen ? (
+          <div className="space-y-4 rounded-md border border-border p-3">
+            <div className="space-y-1.5">
+              <Label>Shortlist size: {shortlistSize}</Label>
+              <Input
+                type="number"
+                min={5}
+                max={80}
+                value={shortlistSize}
+                onChange={(e) =>
+                  setShortlistSize(Math.max(5, Math.min(80, Number(e.target.value) || 40)))
+                }
+                className="w-24"
+              />
+              <p className="text-xs text-muted-foreground">
+                How many pre-scored candidates the AI ranker compares (more = better
+                coverage, higher cost).
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <Label>Variety: {diversity[0]}</Label>
+              <Slider
+                min={0}
+                max={20}
+                step={1}
+                value={diversity}
+                onValueChange={(v: number[]) => setDiversity(v)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Pushes same-topic near-duplicates down the list. 0 = pure score order.
+              </p>
+            </div>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={refine}
+                onChange={(e) => setRefine(e.target.checked)}
+                className="h-4 w-4 accent-primary"
+              />
+              Fine-tune cut points (one extra small AI call)
+            </label>
+          </div>
+        ) : null}
+      </div>
 
       {errorMsg ? (
         <Alert variant="destructive">

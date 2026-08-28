@@ -66,6 +66,8 @@ def _to_reel_out(r: dbmod.Reel, mezz_ready: bool) -> ReelOut:
         scores=json.loads(r.scores_json),
         mezzanine_ready=mezz_ready,
         prompt_relevance=r.prompt_relevance,
+        source=r.source,
+        opening_description=r.opening_description,
     )
 
 
@@ -196,9 +198,13 @@ def _default_timeline(r: dbmod.Reel) -> ReelTimeline:
             scenes_by_idx = {}
     for pos, idx in enumerate(scene_indices):
         start, end = scenes_by_idx.get(idx, (r.start_sec, r.end_sec))
+        # Mirror compose's clip_bounds: reel bounds clamp the outer shots
+        # first (v2 reels may start/end mid-scene), then trim offsets fold in.
         if pos == 0:
+            start = max(start, r.start_sec)
             start = max(0.0, start + r.trim_start_offset_sec)
         if pos == len(scene_indices) - 1:
+            end = min(end, r.end_sec)
             end = max(start + 0.1, end - r.trim_end_offset_sec)
         shots.append(
             TimelineShot(kind="video", asset_id=r.asset_id, in_ts=start, out_ts=end)

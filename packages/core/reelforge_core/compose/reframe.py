@@ -44,6 +44,8 @@ def _estimate(source: Path, in_ts: float, out_ts: float) -> tuple[float, float]:
     import cv2
     import numpy as np
 
+    from reelforge_core.vision import frame_diff_profile, grey_small
+
     cap = cv2.VideoCapture(str(source))
     if not cap.isOpened():
         return (0.5, 0.5)
@@ -62,10 +64,7 @@ def _estimate(source: Path, in_ts: float, out_ts: float) -> tuple[float, float]:
             if not ok or frame is None:
                 grays.append(None)  # type: ignore[arg-type]
                 continue
-            h, w = frame.shape[:2]
-            scale = DETECT_WIDTH / w
-            small = cv2.resize(frame, (DETECT_WIDTH, max(2, int(h * scale))))
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            gray = grey_small(frame, DETECT_WIDTH)
             grays.append(gray)
             if i % 3 == 0 and not cascade.empty():
                 faces = cascade.detectMultiScale(gray, 1.2, 4, minSize=(16, 16))
@@ -81,8 +80,7 @@ def _estimate(source: Path, in_ts: float, out_ts: float) -> tuple[float, float]:
             if g is None:
                 continue
             if prev is not None and prev.shape == g.shape:
-                diff = cv2.absdiff(g, prev).astype(np.float64)
-                col = diff.sum(axis=0)
+                col, _ = frame_diff_profile(prev, g)
                 total = col.sum()
                 if total > 1e-3:
                     centroid = float((col * np.arange(col.size)).sum() / total)

@@ -153,6 +153,46 @@ async def test_select_accepts_prompt_and_roundtrips_into_job_config(
 
 
 @pytest.mark.asyncio
+async def test_select_accepts_v2_knobs_and_roundtrips(
+    api_client, tiny_mp4: Path
+) -> None:
+    from pathlib import Path as _P
+
+    from apps.api import db as dbmod
+    from reelforge_core.analysis.pipeline import working_dir_for
+
+    _pid, asset_id = await _upload_tiny(api_client, tiny_mp4)
+    wd = working_dir_for(asset_id)
+    _P(wd).mkdir(parents=True, exist_ok=True)
+    (wd / "analysis.json").write_text("{}")
+
+    r = await api_client.post(
+        f"/api/v1/assets/{asset_id}/select",
+        json={
+            "shortlist_size": 25,
+            "max_candidates": 200,
+            "refine": False,
+            "diversity_lambda": 3.5,
+        },
+    )
+    assert r.status_code == 200, r.text
+    import json as _json
+
+    async with dbmod.db_state.sessionmaker() as session:
+        job = await session.get(dbmod.Job, r.json()["id"])
+        cfg = _json.loads(job.config_json)
+    assert cfg["shortlist_size"] == 25
+    assert cfg["max_candidates"] == 200
+    assert cfg["refine"] is False
+    assert cfg["diversity_lambda"] == 3.5
+    # Invalid values still 422 through the existing guard.
+    r = await api_client.post(
+        f"/api/v1/assets/{asset_id}/select", json={"shortlist_size": 0}
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_select_rejects_oversized_prompt(api_client, tiny_mp4: Path) -> None:
     from pathlib import Path as _P
 

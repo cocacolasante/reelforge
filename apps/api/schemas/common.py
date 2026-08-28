@@ -122,6 +122,10 @@ class ReelOut(BaseModel):
     edited_duration_sec: Optional[float] = None
     # 0-100 match against the selection prompt; None when no prompt was used.
     prompt_relevance: Optional[int] = None
+    # Selection v2: which generator proposed the reel (scene|sentence|moment)
+    # and the ranker's literal first-2-seconds description. None on pre-v2 rows.
+    source: Optional[str] = None
+    opening_description: Optional[str] = None
 
 
 class ReelList(BaseModel):

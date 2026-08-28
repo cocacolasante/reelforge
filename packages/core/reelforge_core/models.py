@@ -53,6 +53,15 @@ class LoudnessPoint(BaseModel):
     lufs: float  # -inf is serialized as -80.0
 
 
+class EnergyPoint(BaseModel):
+    """Per-second combined energy sample (bin center i + 0.5, matching the
+    loudness bin convention)."""
+
+    time_sec: float
+    motion: float  # mean abs downscaled-grey frame diff, 0..255 scale
+    loudness_delta: float  # LUFS(t) - LUFS(t-1); 0.0 when either bin is silence
+
+
 Mood = Literal[
     "calm",
     "tense",
@@ -113,6 +122,9 @@ class AnalysisConfig(BaseModel):
     semantics_concurrency: int = 5
     semantics_prompt_version: str = "v1"
     thumbnail_width: int = 480
+    # Per-second energy track: frames sampled at this rate for the motion
+    # metric (part of the energy.json resume stamp).
+    energy_sample_fps: float = 2.0
     resume: bool = False
 
 
@@ -134,6 +146,9 @@ class AnalysisReport(BaseModel):
     scenes: list[Scene]
     transcript: Transcript | None
     loudness: list[LoudnessPoint]
+    # Per-second energy track (v2, additive — old analysis.json files load
+    # with an empty list; the moment generator just won't run for them).
+    energy: list[EnergyPoint] = Field(default_factory=list)
     semantics: list[SceneSemantics]
     created_at: str
     elapsed_sec: float
@@ -166,8 +181,16 @@ class ReelScores(BaseModel):
         )
 
 
+CandidateSource = Literal["scene", "sentence", "moment"]
+
+
 class ReelCandidate(BaseModel):
-    """Pre-ranking: a scene-aligned span. No title or scores yet."""
+    """Pre-ranking: a time-bounded span. No title or scores yet.
+
+    `start_sec`/`end_sec` are the authoritative bounds (and the identity —
+    candidate_id hashes them); `scene_indices` lists the scenes that COVER
+    the span, for compose's per-scene clip extraction. `source` names the
+    generator that proposed it."""
 
     candidate_id: str
     scene_indices: list[int]
@@ -175,6 +198,7 @@ class ReelCandidate(BaseModel):
     end_sec: float
     duration_sec: float
     scene_count: int
+    source: CandidateSource = "scene"
 
 
 class RankedReel(BaseModel):
@@ -194,6 +218,17 @@ class RankedReel(BaseModel):
     suggested_mood: Mood
     # 0-100 match against SelectionConfig.prompt; None when no prompt was used.
     prompt_relevance: int | None = Field(default=None, ge=0, le=100)
+    # Which generator proposed the winning candidate (default keeps old
+    # reels.json files parseable).
+    source: CandidateSource = "scene"
+    # v2 listwise ranking: the model's explicit order (1 = best) and its
+    # literal description of the first 2 seconds. Additive; None on old files.
+    rank_position: int | None = Field(default=None, ge=1)
+    opening_description: str | None = None
+    # CP7 boundary refinement: the pre-refinement bounds, set only when
+    # refinement actually moved an edge. candidate_id never changes.
+    pre_refine_start_sec: float | None = None
+    pre_refine_end_sec: float | None = None
 
 
 OutputForm = Literal["short", "long_single", "long_montage"]
@@ -209,11 +244,25 @@ class SelectionConfig(BaseModel):
     target_min_sec: float = 30.0
     target_max_sec: float = 60.0
     long_target_duration_sec: float | None = None  # used only when output_form="long_single"
-    max_scenes_per_reel: int = 6
+    # High cap: the enumerator already breaks on duration > effective_max_sec,
+    # so a low scene-count cap only starves fast-cut footage (3-4s scenes can
+    # never reach 30s at 6 scenes).
+    max_scenes_per_reel: int = 40
+    # Union cap across all candidate generators (sentence kept first, then
+    # scene, then moment; even time-stride within a truncated generator).
+    max_candidates: int = Field(default=400, ge=1)
+    # How many prescore-ranked candidates the (single) ranking call sees.
+    shortlist_size: int = Field(default=40, ge=1)
+    # Best-effort boundary refinement of the top-K (one extra small API call);
+    # failures keep the unrefined bounds.
+    refine: bool = True
+    # MMR diversity strength in overall-score points (0 disables). Halved when
+    # a prompt is set — the user asked for a theme, don't fight it.
+    diversity_lambda: float = Field(default=8.0, ge=0)
     top_k: int = 10
     overlap_threshold: float = 0.5
     ranking_model: str = "claude-sonnet-4-5"
-    ranking_prompt_version: str = "v1"
+    ranking_prompt_version: str = "v2"
     temperature: float = 0.0
     resume: bool = False
     # Natural-language direction, e.g. "clips of falls", "make it feel intense".
@@ -257,6 +306,9 @@ class ReelSelection(BaseModel):
     config: SelectionConfig
     candidates_generated: int
     candidates_dropped_by_dedup: int
+    # Reels displaced from the top-k by the MMR diversity re-rank (additive;
+    # 0 on old files and when diversity_lambda=0).
+    candidates_dropped_by_diversity: int = 0
     reels: list[RankedReel]
     anthropic_usage: dict
     created_at: str
@@ -616,14 +668,17 @@ class ExportManifest(BaseModel):
 # Progress
 # ---------------------------------------------------------------------------
 
-Stage = Literal["probe", "scenes", "transcribe", "loudness", "semantics"]
+Stage = Literal["probe", "scenes", "transcribe", "loudness", "energy", "semantics"]
 
+# compute_overall walks this dict in insertion order — keys MUST stay in
+# pipeline execution order.
 STAGE_WEIGHTS: dict[Stage, float] = {
     "probe": 0.02,
     "scenes": 0.08,
     "transcribe": 0.55,
     "loudness": 0.10,
-    "semantics": 0.25,
+    "energy": 0.03,
+    "semantics": 0.22,
 }
 
 

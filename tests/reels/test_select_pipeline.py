@@ -23,6 +23,13 @@ def _patch_anthropic(monkeypatch: pytest.MonkeyPatch, client) -> None:
     monkeypatch.setattr(anthropic, "AsyncAnthropic", lambda *a, **kw: client)
 
 
+def _shortlisted(analysis, config, candidates):
+    """The candidates the pipeline will actually send to the ranker (CP5)."""
+    from reelforge_core.reels.prescore import compute_features, shortlist
+
+    return shortlist(candidates, compute_features(candidates, analysis), config.shortlist_size)
+
+
 async def test_happy_path_ranks_every_candidate(
     isolated_data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -40,10 +47,9 @@ async def test_happy_path_ranks_every_candidate(
 
     assert selection.candidates_generated == len(candidates)
     assert len(selection.reels) <= config.top_k
-    assert all(r.rank >= 1 for r in selection.reels)
-    # Sorted by rank and by overall desc
-    overalls = [r.overall for r in selection.reels]
-    assert overalls == sorted(overalls, reverse=True)
+    # Ranks are sequential 1..n; note the ORDER follows the MMR diversity
+    # re-rank (CP8), which may deliberately deviate from pure overall-desc.
+    assert [r.rank for r in selection.reels] == list(range(1, len(selection.reels) + 1))
     # Titles are non-empty and distinct for this fake
     titles = {r.title for r in selection.reels}
     assert len(titles) == len(selection.reels)
@@ -52,6 +58,8 @@ async def test_happy_path_ranks_every_candidate(
     assert reels_path.exists()
     data = json.loads(reels_path.read_text())
     assert data["asset_id"] == "aid1"
+    # CP8 diversity stat is always present (0 when nothing was displaced).
+    assert data["candidates_dropped_by_diversity"] >= 0
 
 
 async def test_no_candidates_writes_empty_selection_without_api_call(
@@ -84,15 +92,16 @@ async def test_missing_candidate_triggers_retry_and_eventually_includes_it(
     analysis = make_analysis("aid3", [10.0] * 6)
     config = SelectionConfig()
     candidates = generate_candidates(analysis, config)
-    assert len(candidates) >= 2
-    missing_cid = candidates[0].candidate_id
+    short = _shortlisted(analysis, config, candidates)
+    assert len(short) >= 2
+    missing_cid = short[0].candidate_id
 
-    # First response omits one candidate; second response includes every id.
+    # First response omits one shortlisted candidate; second includes every id.
     first_partial = [
-        r for r in all_rankings([c.candidate_id for c in candidates])
+        r for r in all_rankings([c.candidate_id for c in short])
         if r["candidate_id"] != missing_cid
     ]
-    second_full = all_rankings([c.candidate_id for c in candidates])
+    second_full = all_rankings([c.candidate_id for c in short])
     client = FakeRankingClient(
         script=[{"rankings": first_partial}, {"rankings": second_full}]
     )
@@ -250,10 +259,10 @@ async def test_prompt_injects_direction_and_relevance_field(
 
     selection = await select_reels(analysis, config)
 
-    from reelforge_core.reels.rank import SYSTEM_PROMPT_V1
+    from reelforge_core.reels.rank import SYSTEM_PROMPT_V2
 
     system = client.calls[0]["system"]
-    assert system.startswith(SYSTEM_PROMPT_V1)
+    assert system.startswith(SYSTEM_PROMPT_V2)
     assert "USER DIRECTION" in system and "clips of falls" in system
     tool = client.calls[0]["tools"][0]
     item = tool["input_schema"]["properties"]["rankings"]["items"]
@@ -265,9 +274,11 @@ async def test_prompt_injects_direction_and_relevance_field(
         assert r.overall == round(0.45 * 80 + 0.55 * r.scores.weighted, 2)
 
 
-async def test_no_prompt_is_unchanged(
+async def test_no_prompt_uses_v2_golden(
     isolated_data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """v2 golden (replaces the retired test_no_prompt_is_unchanged — v2 is a
+    deliberate behavior change): listwise prompt, v2 tool schema, v2 stamp."""
     analysis = make_analysis("aidp2", [10.0] * 6)
     config = SelectionConfig()
     candidates = generate_candidates(analysis, config)
@@ -279,15 +290,34 @@ async def test_no_prompt_is_unchanged(
 
     selection = await select_reels(analysis, config)
 
-    from reelforge_core.reels.rank import RECORD_RANKINGS, SYSTEM_PROMPT_V1
+    from reelforge_core.reels.rank import RECORD_RANKINGS_V2, SYSTEM_PROMPT_V2
 
-    assert client.calls[0]["system"] == SYSTEM_PROMPT_V1
-    assert client.calls[0]["tools"][0] is RECORD_RANKINGS or client.calls[0]["tools"][0] == RECORD_RANKINGS
+    assert client.calls[0]["system"] == SYSTEM_PROMPT_V2
+    assert client.calls[0]["tools"][0] == RECORD_RANKINGS_V2
     item = client.calls[0]["tools"][0]["input_schema"]["properties"]["rankings"]["items"]
     assert "prompt_relevance" not in item["properties"]
+    assert {"rank_position", "opening_description"} <= set(item["properties"])
+    assert "rank_position" in item["required"] and "opening_description" in item["required"]
+    assert client.calls[0]["max_tokens"] == 16000
     for r in selection.reels:
         assert r.prompt_relevance is None
         assert r.overall == round(r.scores.weighted, 2)
+        assert r.rank_position is not None
+        assert r.opening_description
+
+    # Stamp golden: v2 prompt version + prescore version + shortlist hash.
+    stamp = json.loads(
+        (isolated_data_dir / "working" / "aidp2" / "ranking_raw.json.stamp").read_text()
+    )
+    assert stamp["ranking_prompt_version"] == "v2"
+    assert stamp["prescore_version"] == "p1"
+    assert set(stamp) == {
+        "ranking_model",
+        "ranking_prompt_version",
+        "temperature",
+        "candidate_hash",
+        "prescore_version",
+    }
 
 
 async def test_relevance_floor_gates_before_dedup(
@@ -296,9 +326,10 @@ async def test_relevance_floor_gates_before_dedup(
     analysis = make_analysis("aidp3", [10.0] * 6)
     config = SelectionConfig(prompt="jumps")
     candidates = generate_candidates(analysis, config)
-    assert len(candidates) >= 2
+    short = _shortlisted(analysis, config, candidates)
+    assert len(short) >= 2
 
-    ids = [c.candidate_id for c in candidates]
+    ids = [c.candidate_id for c in short]
     relevance = {cid: (90 if i == 0 else 10) for i, cid in enumerate(ids)}
     client = FakeRankingClient(script=[{"rankings": all_rankings(ids, relevance=relevance)}])
     _patch_anthropic(monkeypatch, client)
@@ -360,10 +391,12 @@ async def test_resume_invalidated_by_prompt_change(
 async def test_missing_prompt_relevance_drops_entry_and_triggers_retry(
     isolated_data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    analysis = make_analysis("aidp6", [10.0] * 5)
+    # 8 scenes so the shortlist's overlap walk keeps >= 2 spans (with 5 scenes
+    # every candidate nests inside 0-50 and only one survives).
+    analysis = make_analysis("aidp6", [10.0] * 8)
     config = SelectionConfig(prompt="falls")
     candidates = generate_candidates(analysis, config)
-    ids = [c.candidate_id for c in candidates]
+    ids = [c.candidate_id for c in _shortlisted(analysis, config, candidates)]
     assert len(ids) >= 2
 
     # First response: one entry lacks prompt_relevance → dropped → corrective

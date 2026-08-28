@@ -1,0 +1,6 @@
+{
+  "asset_id": "replace-with-a-real-asset-id",
+  "picks": [
+    {"start_sec": 10.0, "end_sec": 45.0, "note": "describe why this span deserves a reel"}
+  ]
+}

@@ -5,6 +5,37 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## Unreleased
 
 ### Added
+- **Selection v2** — full overhaul of reel selection (generate wide → score
+  cheap → rank rich → refine edges → dedup on time; `docs/selection.md`):
+  - Three candidate generators: sentence-aligned spans from the word timeline,
+    the classic scene enumerator (count cap lifted 6 → 40), and
+    moment-anchored windows around motion/loudness peaks from a new
+    per-second energy track (`analysis/energy.py`, additive "energy" stage).
+    Candidate identity is now the time span, not the scene list; compose
+    clamps outer clip bounds to reel bounds.
+  - Local heuristic prescore + shortlist (default 40) so the ranker only
+    sees plausible candidates; the unsound >80 batched-ranking path is gone.
+  - Multimodal listwise ranking: 3-frame contact sheets per candidate,
+    word-timestamped context, explicit `rank_position`, literal
+    `opening_description`, full 0-100 score range.
+  - Best-effort boundary refinement of the top-K (±6s, locally validated,
+    speech-safe; originals kept in `pre_refine_*`).
+  - Time-based dedup + MMR diversity re-rank (`diversity_lambda`, halved
+    under a Direction prompt) + post-refine overlap recheck with backfill.
+  - Eval harness: hand-labeled picks in `tests/reels/eval/labels/` scored by
+    `./reelforge eval-select` (recall@3/5/10 + cost per asset).
+  - UI: source pill + "Opens on:" description on reel cards; Advanced
+    disclosure (shortlist size / variety / refine toggle) in the selection
+    panel. New `SelectionConfig` knobs accepted by the select endpoint:
+    `max_candidates`, `shortlist_size`, `refine`, `diversity_lambda`.
+  - Committed `uv.lock` (+ `uv sync --frozen` in the image) and pinned
+    `anthropic>=1.0,<2`; ranking temperature rides `extra_body`.
+- Curated music packs replacing the OpenGameArt placeholders: Scott Buckley
+  (cinematic, CC-BY 4.0) + Loyalty Freak Music (lo-fi, CC0 via Internet
+  Archive) via `scripts/fetch_music_packs.py`; CC-BY credit lines are
+  auto-appended to descriptions/captions at publish time. New "Manage
+  library" dialog (list / preview / upload / delete) with a Pixabay
+  manual-pick guide.
 - Natural-language selection prompt ("Direction"): describe the clips you want
   ("clips of falls", "jumps or carves", "make it feel intense") when selecting.
   The ranker scores each candidate's `prompt_relevance` (0-100); clips below

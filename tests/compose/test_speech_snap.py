@@ -175,6 +175,52 @@ def test_interior_boundaries_never_snapped():
     assert (in_ts, out_ts) == (10.2, 20.0)
 
 
+# ---- reel-bound clamping (Selection v2) ------------------------------------
+
+
+def test_clip_bounds_scene_aligned_reel_bounds_are_noop():
+    # v2 safety guard: when reel bounds equal the scene edges (every scene-
+    # aligned candidate), passing them must change nothing.
+    scenes = [_scene(0, 10.0, 40.0)]
+    analysis = _analysis(scenes, None)
+    cfg = ComposeConfig()
+    base = clip_bounds(0, 1, scenes[0], cfg, analysis)
+    clamped = clip_bounds(
+        0, 1, scenes[0], cfg, analysis, reel_start=10.0, reel_end=40.0
+    )
+    assert base == clamped == (10.0, 40.0)
+
+
+def test_clip_bounds_reel_start_clamps_first_clip_mid_scene():
+    scenes = [_scene(0, 10.0, 40.0), _scene(1, 40.0, 60.0)]
+    analysis = _analysis(scenes, None)
+    in_ts, out_ts = clip_bounds(
+        0, 2, scenes[0], ComposeConfig(), analysis, reel_start=17.5, reel_end=55.0
+    )
+    assert (in_ts, out_ts) == (17.5, 40.0)
+
+
+def test_clip_bounds_reel_end_clamps_last_clip_mid_scene():
+    scenes = [_scene(0, 10.0, 40.0), _scene(1, 40.0, 60.0)]
+    analysis = _analysis(scenes, None)
+    in_ts, out_ts = clip_bounds(
+        1, 2, scenes[1], ComposeConfig(), analysis, reel_start=17.5, reel_end=55.0
+    )
+    assert (in_ts, out_ts) == (40.0, 55.0)
+
+
+def test_clip_bounds_reel_clamp_applies_before_trim_and_snap():
+    # Clamp to 17.0 lands inside word (16.8, 17.4) -> speech snap extends
+    # back to the word start, proving clamp runs before the snap step.
+    scenes = [_scene(0, 10.0, 40.0)]
+    words = [TranscriptWord(start=16.8, end=17.4, word=" hey", probability=0.9)]
+    analysis = _analysis(scenes, words)
+    in_ts, _ = clip_bounds(
+        0, 1, scenes[0], ComposeConfig(), analysis, reel_start=17.0, reel_end=40.0
+    )
+    assert in_ts == 16.8
+
+
 # ---- caption alignment -----------------------------------------------------
 
 

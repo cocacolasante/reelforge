@@ -350,7 +350,15 @@ def build_captions(
         n = len(reel.scene_indices)
         for position, idx in enumerate(reel.scene_indices):
             scene = analysis.scenes[idx]
-            s_, e_ = clip_bounds(position, n, scene, config, analysis)
+            s_, e_ = clip_bounds(
+                position,
+                n,
+                scene,
+                config,
+                analysis,
+                reel_start=reel.start_sec,
+                reel_end=reel.end_sec,
+            )
             if end_trims is not None and position < n - 1 and position < len(end_trims):
                 e_ = max(s_ + 0.5, e_ - end_trims[position])
             shots.append((analysis.asset_id, s_, e_, e_ - s_))
