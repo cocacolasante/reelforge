@@ -11,6 +11,7 @@ import {
   HealthSchema,
   JobSchema,
   MusicListSchema,
+  MusicTrackSchema,
   ProjectListSchema,
   ProjectSchema,
   PublicationListSchema,
@@ -21,6 +22,7 @@ import {
   UploadSessionSchema,
   type Asset,
   type Job,
+  type MusicTrack,
   type Project,
   type ReelEdit,
   type ReelTimeline,
@@ -173,6 +175,41 @@ export function useMusicLibrary() {
   return useQuery({
     queryKey: ['music'],
     queryFn: () => api('/music', { schema: MusicListSchema }),
+  });
+}
+
+export function useUploadMusic() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: {
+      file: File;
+      title: string;
+      mood: string;
+      license: string;
+      attribution?: string;
+    }) => {
+      const form = new FormData();
+      form.append('file', input.file);
+      form.append('title', input.title);
+      form.append('mood', input.mood);
+      form.append('license', input.license);
+      if (input.attribution) form.append('attribution', input.attribution);
+      return api<MusicTrack>('/music/uploads', {
+        method: 'POST',
+        body: form,
+        schema: MusicTrackSchema,
+      });
+    },
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['music'] }),
+  });
+}
+
+export function useDeleteMusic() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (trackId: string) =>
+      api<void>(`/music/${trackId}`, { method: 'DELETE' }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['music'] }),
   });
 }
 

@@ -6,6 +6,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Download, Film, Pencil, Play, RotateCcw, Sparkles, Upload, Wand2 } from 'lucide-react';
 import { AppShell } from '@/components/layouts/app-shell';
 import { JobProgress } from '@/components/app/job-progress';
+import { MusicLibraryDialog, prettyTrackName } from '@/components/app/music-library-dialog';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -447,7 +448,10 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
 
                 {/* Music */}
                 <section className="space-y-2">
-                  <Label>Music</Label>
+                  <div className="flex items-center justify-between">
+                    <Label>Music</Label>
+                    <MusicLibraryDialog />
+                  </div>
                   <Select value={musicTrack} onValueChange={setMusicTrack}>
                     <SelectTrigger>
                       <SelectValue placeholder="auto" />
@@ -457,7 +461,8 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
                       <SelectItem value="__none__">No music</SelectItem>
                       {music.data?.tracks.map((t) => (
                         <SelectItem key={t.id} value={t.id}>
-                          {t.id} · {t.mood} {t.bpm ? `· ${t.bpm} BPM` : ''}
+                          {prettyTrackName(t.id)} · {t.mood}
+                          {t.license.toUpperCase().startsWith('CC-BY') ? ' · credit req.' : ''}
                         </SelectItem>
                       ))}
                     </SelectContent>

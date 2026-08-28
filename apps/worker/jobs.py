@@ -441,6 +441,15 @@ async def publish_reel_job(ctx: dict, publication_id: str) -> dict:
         if asset_id is None:
             raise RuntimeError(f"reel {pub['reel_id']} not found")
         data_dir = Path(os.environ.get("REELFORGE_DATA_DIR", "/data"))
+
+        # CC-BY music legally requires a credit line — append it to whatever
+        # description/caption the user wrote (idempotent; None for CC0/no music).
+        from reelforge_core.publish.credits import append_credit, music_credit_for_reel
+
+        credit = music_credit_for_reel(asset_id, pub["reel_id"], data_dir)
+        if credit:
+            pub["description"] = append_credit(pub.get("description") or "", credit)
+            log.info("music credit appended to publication", extra=extra)
         video_path = (
             data_dir / "outputs" / asset_id / pub["reel_id"] / f"{pub['preset_id']}.mp4"
         )

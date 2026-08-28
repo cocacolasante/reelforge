@@ -133,3 +133,24 @@ when it does.
   app if you hit the limit (the error message will say so).
 - Access tokens rotate on every publish; if publishing fails with a token
   error, disconnect + reconnect the account.
+
+
+# Music licensing & credits
+
+ReelForge ships two fetchable packs (run
+`docker compose run --rm -T --entrypoint python cli - < scripts/fetch_music_packs.py`):
+
+- **Scott Buckley** (scottbuckley.com.au) — cinematic / ambient / electronic,
+  **CC-BY 4.0**. A credit line is legally required wherever the video is
+  posted. ReelForge appends it automatically to the YouTube description and
+  the Instagram/TikTok caption when you publish. If a YouTube Content ID
+  claim appears anyway, it's released by the credit — see his
+  /copyright-claims-release page.
+- **Loyalty Freak Music** — lo-fi / chill / beats, **CC0** (public domain,
+  verified per-item on the Internet Archive). No attribution needed.
+
+For hand-picked tracks: download from **pixabay.com/music** (free, no
+attribution, commercial OK — but don't redistribute the files standalone) or
+the YouTube Audio Library, then upload via the reel page → Music →
+**Manage library** with a mood tag. Mood is what the auto-selector matches
+against the reel's AI-suggested mood.
