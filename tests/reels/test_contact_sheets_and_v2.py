@@ -116,6 +116,7 @@ def test_coerce_stores_rank_position_and_opening_description():
     for i, c in enumerate(cands):
         assert by_id[c.candidate_id].rank_position == i + 1
         assert by_id[c.candidate_id].opening_description.startswith("Opening frame")
+        assert by_id[c.candidate_id].edit_style is not None
 
 
 def test_coerce_rank_position_breaks_overall_ties():
@@ -156,6 +157,18 @@ def test_coerce_tolerates_missing_v2_fields():
     entry = all_rankings([cands[0].candidate_id])[0]
     del entry["rank_position"]
     del entry["opening_description"]
+    del entry["content_style"]
     reels = _coerce_rankings([entry], candidate_map=cmap)
     assert reels[0].rank_position is None
     assert reels[0].opening_description is None
+    assert reels[0].edit_style is None
+
+
+def test_coerce_rejects_bogus_content_style_without_dropping_entry():
+    analysis = make_analysis("co4", [10.0] * 5)
+    cands = generate_candidates(analysis, SelectionConfig())[:1]
+    cmap = {c.candidate_id: c for c in cands}
+    entry = all_rankings([cands[0].candidate_id])[0]
+    entry["content_style"] = "vaporwave"
+    reels = _coerce_rankings([entry], candidate_map=cmap)
+    assert len(reels) == 1 and reels[0].edit_style is None

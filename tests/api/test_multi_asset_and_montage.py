@@ -44,6 +44,7 @@ def _build_selection_on_disk(
             prompt_relevance=relevance,
             source="sentence",
             opening_description=f"literal opening {i}",
+            edit_style="hype",
         )
         for i in range(n_reels)
     ]
@@ -281,6 +282,7 @@ async def test_project_reels_surface_and_clear_prompt_relevance(
     # v2 fields ride the same three serialization paths.
     assert all(reel["source"] == "sentence" for reel in payload)
     assert all(reel["opening_description"].startswith("literal opening") for reel in payload)
+    assert all(reel["edit_style"] == "hype" for reel in payload)
 
     # Promptless re-select of the same candidates → values NULL-clear.
     _build_selection_on_disk(aid, pid, 2)

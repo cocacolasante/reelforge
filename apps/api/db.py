@@ -113,6 +113,8 @@ class Reel(SQLModel, table=True):
     # and the ranker's literal first-2-seconds description.
     source: Optional[str] = None
     opening_description: Optional[str] = None
+    # v3: the ranker's editing-grammar classification (edit-quality styles).
+    edit_style: Optional[str] = None
     # Phase 7.x long-form montage: when set, this Reel is the concatenation of
     # the listed child reel_ids. The compose worker takes the montage path
     # instead of the normal extract → render path.
@@ -351,6 +353,8 @@ async def create_all(engine: AsyncEngine) -> None:
             await conn.execute(
                 text("ALTER TABLE reels ADD COLUMN opening_description TEXT")
             )
+        if reel_cols and "edit_style" not in reel_cols:
+            await conn.execute(text("ALTER TABLE reels ADD COLUMN edit_style TEXT"))
 
 
 # ---------------------------------------------------------------------------

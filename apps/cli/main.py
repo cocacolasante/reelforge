@@ -626,6 +626,11 @@ def compose(
     no_effects: bool = typer.Option(False, "--no-effects"),
     crf: int = typer.Option(18, "--crf"),
     preset: str = typer.Option("medium", "--preset"),
+    style: str = typer.Option(
+        "auto",
+        "--style",
+        help="Editing grammar: auto|classic|hype|talking_head|cinematic|chill.",
+    ),
     local: bool = typer.Option(
         False, "--local/--queued", help="Run in-process or enqueue to the worker."
     ),
@@ -663,6 +668,7 @@ def compose(
         effects=effects,
         music_track_id=music_track,
         no_music=no_music,
+        style=style,  # type: ignore[arg-type]
     )
 
     try:

@@ -32,7 +32,12 @@ in Docker; the only host requirement is Docker Engine ≥ 24 + Compose v2.
       access tokens rotate on refresh — always persist the returned
       refresh_token. Platform dispatch in `publish_reel_job`; per-platform
       OAuth in `routers/social.py`; UI platform tabs in PublishPanel.
-- [ ] Phase 11+ — not started
+- [x] Phase 11 — Edit Quality v1: renderer capabilities (speed/punch-in/
+      15 transitions/jump cuts/chunked rendering), style grammars
+      (hype/talking_head/cinematic/chill), ranker style classification
+      (prompt v3), AI edit-director (stamped, locally validated).
+      `docs/editing-quality.md`.
+- [ ] Phase 12+ — not started
 
 ## Topology
 ```
@@ -529,6 +534,21 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   bounds (this also fixed captions drifting when trim offsets were used).
   Interior scene boundaries are never snapped — crossfades preserve words
   across contiguous scenes.
+- **Edit Quality v1 invariants.** (1) Shot durations feed TRIPLICATED xfade
+  math — `graph_builder._xfade_offsets`, captions' reclaim loop,
+  `compute_beat_end_trims` — thread all three for any duration-changing
+  feature, and run `clamp_transitions` on whatever list captions/beat-sync
+  will consume. (2) Any new per-shot extraction parameter (like `speed`)
+  goes into BOTH clip cache keys (clips.py scene + timeline). (3) Speed uses
+  output-side seeking on post-setpts timestamps: `-ss/-to` and the reframe
+  pan window scale by 1/speed; speed≠1 shots render muted with captions
+  suppressed. (4) >6 clips render hierarchically (chunks of ≤5) — a 12-clip
+  single-pass 1080x1920 xfade chain OOM'd at ~6 GB. (5) Style grammars
+  (compose/styles.py) engage only in the smart-auto flow or when explicit;
+  director proposals (compose/director.py) are validated against
+  STYLE_BOUNDS or reverted per-entry — the director must never be able to
+  fail a render. Director stamp = fingerprint(plan, style, model, d1) in the
+  reel dir; unchanged re-composes are zero-token.
 - **Only libx264 + AAC.** No NVENC, no hardware encode. Determinism and
   quality come first; we can revisit in Phase 7 after measuring.
 - **Do not use `-c copy` for clip extraction.** Stream-copy with `-ss` snaps to

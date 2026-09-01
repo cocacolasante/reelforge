@@ -8,6 +8,7 @@ raise GraphError at construction time, not at FFmpeg runtime.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,18 +16,30 @@ from reelforge_core.compose.clips import ClipInfo
 from reelforge_core.compose.graph import FilterGraph, FilterNode
 from reelforge_core.models import AnalysisReport, ComposeConfig
 
+log = logging.getLogger(__name__)
+
 # Map our transition.kind to xfade's `transition=` value. "cut" is implemented as
 # a 40ms fade so the graph shape stays uniform.
 _TRANSITION_MAP = {
     # "auto" should be resolved before we reach the graph builder (see
     # compose/auto.py::resolve_smart_config). Keep a defensive fall-through
-    # to plain fade just in case.
+    # to plain fade just in case. Every non-auto/cut TransitionStyle.kind
+    # (models.py) must have an entry here.
     "auto": "fade",
     "fade": "fade",
     "fadeblack": "fadeblack",
-    "slideleft": "slideleft",
-    "wipeleft": "wipeleft",
+    "fadewhite": "fadewhite",
     "dissolve": "dissolve",
+    "slideleft": "slideleft",
+    "slideright": "slideright",
+    "slideup": "slideup",
+    "slidedown": "slidedown",
+    "wipeleft": "wipeleft",
+    "wiperight": "wiperight",
+    "smoothleft": "smoothleft",
+    "smoothright": "smoothright",
+    "circleopen": "circleopen",
+    "circleclose": "circleclose",
     "cut": "fade",
 }
 
@@ -37,6 +50,30 @@ class RenderPlan:
     mezzanine_duration_sec: float
     music_input_index: int | None
     filter_complex: str
+
+
+def _drift_crop(width: int, height: int, dur: float, position: int) -> str:
+    """Eased diagonal crop drift for Ken Burns / animated punch-in.
+
+    Direction rotates with `position` (TL→BR, BR→TL, TR→BL, BL→TR) so
+    consecutive moving shots don't all drift the same way — mirrors the
+    photo pan rotation in compose/photos.py. Ease-out: the window
+    decelerates into its final position.
+    """
+    # eased progress d = 1 - (1 - min(t/dur, 1))^2 ; inv = 1 - d
+    inv = f"pow(1-min(t/{dur:.3f}\\,1)\\,2)"
+    d = f"(1-{inv})"
+    corners = [
+        (d, d),  # TL → BR
+        (inv, inv),  # BR → TL
+        (inv, d),  # TR → BL
+        (d, inv),  # BL → TR
+    ]
+    x_frac, y_frac = corners[position % 4]
+    return (
+        f"crop={width}:{height}:"
+        f"x='(iw-ow)*{x_frac}':y='(ih-oh)*{y_frac}'"
+    )
 
 
 def _transition_duration(config: ComposeConfig) -> float:
@@ -87,6 +124,56 @@ def resolve_transitions(
         else:
             kind, dur = default_kind, default_dur
         out.append((_TRANSITION_MAP.get(kind, "fade"), dur))
+    return out
+
+
+def expand_transitions_for_photos(
+    clips: list[ClipInfo],
+    video_transitions: list[tuple[str, float]],
+    default: tuple[str, float],
+) -> list[tuple[str, float]]:
+    """Re-map per-cut transitions after photos were interleaved into the shot
+    list. Cuts between still-adjacent video shots keep their transition; any
+    cut touching a photo gets the reel-wide default. Pure."""
+    vidx: list[int | None] = []
+    k = 0
+    for c in clips:
+        vidx.append(None if c.is_photo else k)
+        if not c.is_photo:
+            k += 1
+    out: list[tuple[str, float]] = []
+    for j in range(len(clips) - 1):
+        a, b = vidx[j], vidx[j + 1]
+        if a is not None and b is not None and a < len(video_transitions):
+            out.append(video_transitions[a])
+        else:
+            out.append(default)
+    return out
+
+
+def clamp_transitions(
+    durations: list[float], transitions: list[tuple[str, float]]
+) -> list[tuple[str, float]]:
+    """Clamp each crossfade so it never outlasts its shorter adjoining shot
+    (an xfade longer than a clip renders broken with no ffmpeg error). Rule:
+    duration ≤ half the shorter neighbour, floored at 0.04s. Pure — callers
+    MUST apply this to the list that captions and beat-sync consume too, so
+    the triplicated offset math stays in agreement."""
+    out: list[tuple[str, float]] = []
+    for i, (kind, dur) in enumerate(transitions):
+        if i + 1 < len(durations):
+            limit = max(0.04, 0.5 * min(durations[i], durations[i + 1]))
+            if dur > limit:
+                log.info(
+                    "transition %d (%s %.2fs) clamped to %.2fs — adjoining "
+                    "shot too short",
+                    i,
+                    kind,
+                    dur,
+                    limit,
+                )
+                dur = round(limit, 3)
+        out.append((kind, dur))
     return out
 
 
@@ -162,27 +249,45 @@ def build_final_command(
                 outputs=[v_prep_out],
             )
         )
-        if (
-            not clip.is_photo
-            and clip.scene_index in low_energy_by_idx
-            and config.effects.ken_burns_on_low_energy
-        ):
+        wants_ken_burns = not clip.is_photo and (
+            clip.force_ken_burns
+            or (
+                config.effects.ken_burns_on_low_energy
+                and clip.scene_index in low_energy_by_idx
+            )
+        )
+        if not clip.is_photo and clip.punch_in is not None:
+            # Punch-in: digital zoom in the graph (clip stays cache-shareable).
+            zoom = min(1.6, max(1.01, clip.punch_in))
+            sw = int(width * zoom / 2) * 2
+            sh = int(height * zoom / 2) * 2
+            if clip.punch_in_animated:
+                crop = _drift_crop(width, height, max(0.1, clip.duration), i)
+            else:
+                crop = f"crop={width}:{height}:(iw-ow)/2:(ih-oh)/2"
+            graph.add(
+                FilterNode(
+                    filter_name=f"scale={sw}:{sh},{crop}",
+                    inputs=[v_prep_out],
+                    outputs=[v_out],
+                )
+            )
+        elif wants_ken_burns:
             # Ken Burns-style motion as constant-zoom + animated crop: scale
             # the clip up ONCE, then drift a target-sized window diagonally
             # across the margin. Orders of magnitude cheaper than zoompan
             # (which re-resamples every frame and made renders ~10x slower);
             # visually it reads the same "slow deliberate camera move".
+            # Direction rotates with clip position; the drift is eased
+            # (decelerating) so the move settles instead of stopping dead.
             zoom = max(1.01, config.effects.ken_burns_zoom)
             sw = int(width * zoom / 2) * 2
             sh = int(height * zoom / 2) * 2
-            dur = max(0.1, clip.duration)
-            drift = f"min(t/{dur:.3f}\\,1)"
             graph.add(
                 FilterNode(
                     filter_name=(
                         f"scale={sw}:{sh},"
-                        f"crop={width}:{height}:"
-                        f"x='(iw-ow)*{drift}':y='(ih-oh)*{drift}'"
+                        + _drift_crop(width, height, max(0.1, clip.duration), i)
                     ),
                     inputs=[v_prep_out],
                     outputs=[v_out],

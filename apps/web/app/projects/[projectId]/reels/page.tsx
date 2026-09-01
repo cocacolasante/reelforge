@@ -39,6 +39,7 @@ interface ProjectReel {
   prompt_relevance?: number | null;
   source?: string | null;
   opening_description?: string | null;
+  edit_style?: string | null;
 }
 
 interface MontageOut {
@@ -224,6 +225,9 @@ function ReelCard({ projectId, reel }: { projectId: string; reel: ProjectReel })
               <h3 className="truncate font-semibold">{reel.title}</h3>
               <Badge variant="secondary">{reel.suggested_mood}</Badge>
               {reel.source ? <Badge variant="muted">{reel.source}</Badge> : null}
+              {reel.edit_style ? (
+                <Badge variant="outline">{reel.edit_style.replace('_', ' ')}</Badge>
+              ) : null}
               {typeof reel.prompt_relevance === 'number' ? (
                 <Badge variant="outline">Match {reel.prompt_relevance}%</Badge>
               ) : null}

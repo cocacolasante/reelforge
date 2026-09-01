@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { API_BASE, api } from './client';
 import {
+  ComposePlanSchema,
   AnalysisReportSchema,
   AssetListSchema,
   AssetSchema,
@@ -138,6 +139,14 @@ export function useReel(reelId: string | undefined) {
   return useQuery({
     queryKey: ['reel', reelId],
     queryFn: () => api(`/reels/${reelId}`, { schema: ReelSchema }),
+    enabled: !!reelId,
+  });
+}
+
+export function useComposePlan(reelId: string | undefined) {
+  return useQuery({
+    queryKey: ['compose-plan', reelId],
+    queryFn: () => api(`/reels/${reelId}/compose_plan`, { schema: ComposePlanSchema }),
     enabled: !!reelId,
   });
 }

@@ -229,6 +229,9 @@ class RankedReel(BaseModel):
     # refinement actually moved an edge. candidate_id never changes.
     pre_refine_start_sec: float | None = None
     pre_refine_end_sec: float | None = None
+    # The ranker's editing-grammar classification (compose/styles.py);
+    # None on pre-v3 reels -> compose falls back to heuristics.
+    edit_style: Literal["classic", "hype", "talking_head", "cinematic", "chill"] | None = None
 
 
 OutputForm = Literal["short", "long_single", "long_montage"]
@@ -262,7 +265,7 @@ class SelectionConfig(BaseModel):
     top_k: int = 10
     overlap_threshold: float = 0.5
     ranking_model: str = "claude-sonnet-4-5"
-    ranking_prompt_version: str = "v2"
+    ranking_prompt_version: str = "v3"
     temperature: float = 0.0
     resume: bool = False
     # Natural-language direction, e.g. "clips of falls", "make it feel intense".
@@ -354,8 +357,25 @@ class CaptionStyle(BaseModel):
 
 class TransitionStyle(BaseModel):
     # "auto" is resolved at compose time by compose.auto.pick_transition_kind.
+    # Kinds map 1:1 onto ffmpeg xfade transitions (graph_builder._TRANSITION_MAP
+    # must cover every non-auto/cut value here).
     kind: Literal[
-        "auto", "fade", "fadeblack", "slideleft", "wipeleft", "dissolve", "cut"
+        "auto",
+        "cut",
+        "fade",
+        "fadeblack",
+        "fadewhite",
+        "dissolve",
+        "slideleft",
+        "slideright",
+        "slideup",
+        "slidedown",
+        "wipeleft",
+        "wiperight",
+        "smoothleft",
+        "smoothright",
+        "circleopen",
+        "circleclose",
     ] = "auto"
     duration_sec: float = 0.4
 
@@ -431,18 +451,27 @@ class TimelineShot(BaseModel):
     # keep their audio stream (the crossfade chain needs one) at zero gain.
     volume: float = 1.0
     muted: bool = False
+    # Playback speed (0.25 = 4x slow-mo, 4.0 = 4x fast). v1 rule: any
+    # speed != 1 renders the shot's own audio muted (pitch-correct audio
+    # retiming is out of scope) — captions for the shot are suppressed too.
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)
+    # Static digital zoom applied in the render graph (1.0-1.6; None = off).
+    # punch_in_animated drifts the crop window like Ken Burns instead.
+    punch_in: float | None = Field(default=None, ge=1.0, le=1.6)
+    punch_in_animated: bool = False
 
     @property
     def effective_gain(self) -> float:
-        if self.muted:
+        if self.muted or self.speed != 1.0:
             return 0.0
         return max(0.0, min(3.0, self.volume))
 
     @property
     def duration(self) -> float:
+        """Mezzanine seconds this shot occupies (speed-scaled for video)."""
         if self.kind == "photo":
             return max(0.2, self.duration_sec)
-        return max(0.1, self.out_ts - self.in_ts)
+        return max(0.1, (self.out_ts - self.in_ts) / max(0.25, self.speed))
 
 
 class TextOverlay(BaseModel):
@@ -535,6 +564,19 @@ class ComposeConfig(BaseModel):
     # word, else drop the partial word entirely.
     speech_safe_cuts: bool = True
     speech_safe_max_nudge_sec: float = 0.6
+    # Jump cuts: remove dead air inside shots (compose/jumpcuts.py). "on"
+    # forces; "auto" defers to the edit-style grammar; "off" disables.
+    jump_cuts: Literal["off", "auto", "on"] = "auto"
+    # AI edit-director (compose/director.py): one small stamped call refining
+    # the style grammar's plan. Only runs in smart mode with a non-classic
+    # style; failures keep the deterministic plan.
+    director: bool = True
+    director_model: str = "claude-sonnet-4-5"
+    # Editing-style grammar (compose/styles.py). "auto" classifies from the
+    # reel (ranker's pick, else heuristics) — but ONLY in the smart-auto flow
+    # (smart_mode on + transition.kind "auto"); manual flows stay "classic"
+    # (today's behavior). An explicit style always engages its grammar.
+    style: Literal["auto", "classic", "hype", "talking_head", "cinematic", "chill"] = "auto"
     # Beat-synced transitions: shorten interior clips by up to the cap so
     # each crossfade midpoint lands on a beat of the chosen music track.
     beat_sync: bool = True
@@ -556,7 +598,6 @@ class ComposeConfig(BaseModel):
     ducking_ratio: float = 8.0
     ducking_attack_ms: float = 5.0
     ducking_release_ms: float = 250.0
-    burn_title_card: bool = False
     seed: int = 1
     # When True (default), `transition.kind == "auto"` + `effects.lut == "auto"`
     # are resolved to mood-driven picks at compose time. Disabling smart_mode

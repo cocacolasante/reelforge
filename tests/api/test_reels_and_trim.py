@@ -164,6 +164,32 @@ async def test_get_reel_surfaces_prompt_relevance(api_client) -> None:
 
 
 @pytest.mark.asyncio
+async def test_compose_plan_serves_smart_picks(api_client) -> None:
+    pid, aid, reel_id = await _project_asset_reel(api_client)
+    from apps.api import db as dbmod
+
+    async with dbmod.db_state.sessionmaker() as session:
+        row = await session.get(dbmod.Reel, reel_id)
+        row.suggested_mood = "energetic"
+        await session.commit()
+
+    r = await api_client.get(f"/api/v1/reels/{reel_id}/compose_plan")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mood"] == "energetic"
+    assert body["transition"] == "slideleft"
+    assert body["lut"] == "vivid"
+    assert body["music"] == "auto-match"
+    # Edit Quality v1: the grammar preview.
+    assert body["style"] == "classic"  # no ranker classification on this row
+    assert body["style_source"] == "fallback"
+    assert isinstance(body["style_description"], str) and body["style_description"]
+
+    r = await api_client.get("/api/v1/reels/nope/compose_plan")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_get_reel_surfaces_v2_source_and_opening(api_client) -> None:
     pid, aid, reel_id = await _project_asset_reel(api_client)
     from apps.api import db as dbmod
@@ -172,6 +198,7 @@ async def test_get_reel_surfaces_v2_source_and_opening(api_client) -> None:
         row = await session.get(dbmod.Reel, reel_id)
         row.source = "moment"
         row.opening_description = "rider drops in"
+        row.edit_style = "hype"
         await session.commit()
 
     r = await api_client.get(f"/api/v1/reels/{reel_id}")
@@ -179,3 +206,4 @@ async def test_get_reel_surfaces_v2_source_and_opening(api_client) -> None:
     body = r.json()
     assert body["source"] == "moment"
     assert body["opening_description"] == "rider drops in"
+    assert body["edit_style"] == "hype"

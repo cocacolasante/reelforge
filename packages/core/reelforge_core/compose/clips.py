@@ -38,6 +38,30 @@ class ClipInfo:
     # Linear gain applied to this shot's own audio in the render graph
     # (editor per-shot volume/mute). 1.0 = untouched.
     volume: float = 1.0
+    # Editor-requested Ken Burns on a video shot (timeline mode). Scene-mode
+    # clips leave this False and rely on the low-energy auto-trigger.
+    force_ken_burns: bool = False
+    # Playback speed baked into the clip at extraction (see TimelineShot.speed).
+    # duration is already speed-scaled; captions suppress speed != 1 shots.
+    speed: float = 1.0
+    # Static (or drifting) digital zoom applied in the render graph.
+    punch_in: float | None = None
+    punch_in_animated: bool = False
+
+
+def _atempo_chain(speed: float) -> str:
+    """ffmpeg atempo accepts 0.5-2.0 per instance; chain factors outside it.
+    Supported speed range 0.25-4.0 decomposes into at most two instances."""
+    factors: list[float] = []
+    remaining = speed
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(remaining)
+    return ",".join(f"atempo={f:.6g}" for f in factors)
 
 
 def _video_filter_chain(
@@ -48,6 +72,7 @@ def _video_filter_chain(
     is_hdr: bool,
     pan: tuple[float, float] | None = None,
     pan_window: tuple[float, float] | None = None,
+    speed: float = 1.0,
 ) -> str:
     """Scale chain for one clip.
 
@@ -58,6 +83,10 @@ def _video_filter_chain(
     time; the expression clamps p into [0,1] so either seek semantic is safe).
     """
     parts: list[str] = []
+    if speed != 1.0:
+        # Retiming FIRST — the fps filter later in the chain then resamples
+        # to constant frame rate (dup/drop), so downstream xfade math holds.
+        parts.append(f"setpts=PTS/{speed:.6g}")
     if is_hdr:
         # HDR → SDR tonemap. Verbose but correct.
         parts.append(
@@ -97,15 +126,22 @@ def build_clip_command(
     has_audio: bool,
     is_hdr: bool,
     pan: tuple[float, float] | None = None,
+    speed: float = 1.0,
 ) -> list[str]:
     w, h = config.resolution
+    # -ss/-to are OUTPUT options here (accurate-seek re-encode): they act on
+    # post-filter timestamps. setpts=PTS/speed retimes the stream, so the
+    # seek window (and the pan expression's time base) scales by 1/speed.
+    ss = in_ts / speed
+    to = out_ts / speed
     vf = _video_filter_chain(
         width=w,
         height=h,
         fps=config.target_fps,
         is_hdr=is_hdr,
         pan=pan,
-        pan_window=(in_ts, max(0.001, out_ts - in_ts)),
+        pan_window=(ss, max(0.001, to - ss)),
+        speed=speed,
     )
     args: list[str] = [
         "ffmpeg",
@@ -116,17 +152,24 @@ def build_clip_command(
         "-i",
         str(source),
         "-ss",
-        f"{in_ts:.3f}",
+        f"{ss:.3f}",
         "-to",
-        f"{out_ts:.3f}",
+        f"{to:.3f}",
         "-vf",
         vf,
     ]
     if has_audio:
+        af = (
+            "aresample=async=1000:first_pts=0,"
+            "aformat=sample_rates=48000:channel_layouts=stereo"
+        )
+        if speed != 1.0:
+            # Keep the (muted-in-graph) audio stream duration-matched to the
+            # retimed video so the acrossfade chain stays consistent.
+            af += "," + _atempo_chain(speed)
         args += [
             "-af",
-            "aresample=async=1000:first_pts=0,"
-            "aformat=sample_rates=48000:channel_layouts=stereo",
+            af,
             "-c:a",
             "aac",
             "-b:a",
@@ -208,43 +251,62 @@ async def extract_clips(
     log_file: Path,
     progress_cb: Callable[[int, int], Awaitable[None]] | None = None,
     end_trims: list[float] | None = None,
+    shot_bounds: "list | None" = None,
 ) -> list[ClipInfo]:
     """Extract one normalized clip per scene in `reel.scene_indices`.
 
     `end_trims` (len n-1, from beat sync) shortens interior clips so
     transitions land on music beats; never applied to the last clip.
+    `shot_bounds` (a list of styles.PlannedShot — jump cuts, style plans)
+    replaces the scene list with FINAL bounds + per-shot speed/punch-in/Ken
+    Burns: clip_bounds is skipped since the pipeline already applied
+    clamps/trims/snapping when planning.
     """
     from reelforge_core.compose.reframe import estimate_pan, should_crop
 
     clips_dir = reel_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
 
+    plan = list(shot_bounds) if shot_bounds is not None else None
     is_hdr = (asset.probe.color_transfer or "") in HDR_TRANSFERS
-    sem: asyncio.Semaphore = asyncio.Semaphore(min(4, max(1, len(reel.scene_indices))))
-    total = len(reel.scene_indices)
+    total = len(plan) if plan is not None else len(reel.scene_indices)
+    sem: asyncio.Semaphore = asyncio.Semaphore(min(4, max(1, total)))
     done = 0
 
     source_mtime = int(asset.path.stat().st_mtime)
     w, h = config.resolution
-    n_scenes = len(reel.scene_indices)
+    n_scenes = total
     crop_track = should_crop(
         asset.probe.width or 0, asset.probe.height or 0, w, h, config.effects.reframe
     )
 
-    async def _one(position: int, scene_idx: int) -> ClipInfo:
+    async def _one(position: int, scene_idx: int, planned) -> ClipInfo:
         scene = analysis.scenes[scene_idx]
-        # Reel-bound clamp + trim offsets + speech-safe snapping (outer clips).
-        in_ts, out_ts = clip_bounds(
-            position,
-            n_scenes,
-            scene,
-            config,
-            analysis,
-            reel_start=reel.start_sec,
-            reel_end=reel.end_sec,
-        )
+        speed = 1.0
+        punch_in = None
+        punch_in_animated = False
+        force_kb = False
+        if planned is not None:
+            # Final bounds + per-shot treatment from the style planner.
+            in_ts, out_ts = planned.in_ts, planned.out_ts
+            speed = planned.speed
+            punch_in = planned.punch_in
+            punch_in_animated = planned.punch_in_animated
+            force_kb = planned.force_ken_burns
+        else:
+            # Reel-bound clamp + trim offsets + speech-safe snapping (outer clips).
+            in_ts, out_ts = clip_bounds(
+                position,
+                n_scenes,
+                scene,
+                config,
+                analysis,
+                reel_start=reel.start_sec,
+                reel_end=reel.end_sec,
+            )
         if end_trims is not None and position < n_scenes - 1 and position < len(end_trims):
-            out_ts = max(in_ts + 0.5, out_ts - end_trims[position])
+            # Beat trims are mezzanine seconds -> scale into source seconds.
+            out_ts = max(in_ts + 0.5 * speed, out_ts - end_trims[position] * speed)
         pan: tuple[float, float] | None = None
         if crop_track:
             pan = await asyncio.to_thread(estimate_pan, asset.path, in_ts, out_ts)
@@ -258,6 +320,7 @@ async def extract_clips(
                 "asset_id": asset.id,
                 "scene_idx": scene_idx,
                 "source_mtime": source_mtime,
+                "speed": f"{speed:.4f}",
                 "in_ts": f"{in_ts:.3f}",
                 "out_ts": f"{out_ts:.3f}",
                 "width": w,
@@ -291,6 +354,7 @@ async def extract_clips(
                 has_audio=asset.has_audio,
                 is_hdr=is_hdr,
                 pan=pan,
+                speed=speed,
             )
             async with sem:
                 await asyncio.to_thread(run_ffmpeg, cmd, log_file=log_file)
@@ -311,16 +375,26 @@ async def extract_clips(
             scene_index=scene_idx,
             in_ts=in_ts,
             out_ts=out_ts,
-            duration=out_ts - in_ts,
+            duration=(out_ts - in_ts) / speed,
             has_audio=asset.has_audio,
             effects_applied=[],
+            speed=speed,
+            punch_in=punch_in,
+            punch_in_animated=punch_in_animated,
+            force_ken_burns=force_kb,
         )
 
     results: list[ClipInfo | None] = [None] * total
-    tasks = [
-        asyncio.create_task(_one(i, scene_idx))
-        for i, scene_idx in enumerate(reel.scene_indices)
-    ]
+    if plan is not None:
+        tasks = [
+            asyncio.create_task(_one(i, ps.scene_index, ps))
+            for i, ps in enumerate(plan)
+        ]
+    else:
+        tasks = [
+            asyncio.create_task(_one(i, scene_idx, None))
+            for i, scene_idx in enumerate(reel.scene_indices)
+        ]
     for coro in asyncio.as_completed(tasks):
         info = await coro
         # Place by position (clip_NNNN.mp4 encodes position)
@@ -386,8 +460,11 @@ async def extract_timeline_clips(
                 in_ts = max(0.0, snap_start(in_ts, words, nudge))
             if position == n - 1:
                 out_ts = max(in_ts + 0.1, snap_end(out_ts, words, nudge))
+        speed = float(getattr(shot, "speed", 1.0) or 1.0)
         if end_trims is not None and position < n - 1 and position < len(end_trims):
-            out_ts = max(in_ts + 0.5, out_ts - end_trims[position])
+            # Beat trims are MEZZANINE seconds; a sped shot must lose
+            # speed-times as many source seconds to shrink by the same amount.
+            out_ts = max(in_ts + 0.5, out_ts - end_trims[position] * speed)
 
         is_hdr = (asset.probe.color_transfer or "") in HDR_TRANSFERS
         crop_track = should_crop(
@@ -404,6 +481,7 @@ async def extract_timeline_clips(
                 "asset_id": asset.id,
                 "scene_idx": -1,
                 "source_mtime": source_mtime,
+                "speed": f"{speed:.4f}",
                 "in_ts": f"{in_ts:.3f}",
                 "out_ts": f"{out_ts:.3f}",
                 "width": w,
@@ -436,6 +514,7 @@ async def extract_timeline_clips(
                 has_audio=asset.has_audio,
                 is_hdr=is_hdr,
                 pan=pan,
+                speed=speed,
             )
             async with sem:
                 await asyncio.to_thread(run_ffmpeg, cmd, log_file=log_file)
@@ -453,11 +532,15 @@ async def extract_timeline_clips(
             scene_index=-1,
             in_ts=in_ts,
             out_ts=out_ts,
-            duration=out_ts - in_ts,
+            duration=(out_ts - in_ts) / speed,
             has_audio=asset.has_audio,
             effects_applied=[],
             asset_id=asset.id,
             volume=shot.effective_gain,
+            force_ken_burns=bool(getattr(shot, "ken_burns", False)),
+            speed=speed,
+            punch_in=getattr(shot, "punch_in", None),
+            punch_in_animated=bool(getattr(shot, "punch_in_animated", False)),
         )
 
     async def _photo(position: int, shot) -> ClipInfo:

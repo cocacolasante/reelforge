@@ -124,8 +124,22 @@ export const ReelSchema = z.object({
   // Selection v2: generator source + literal first-2s description.
   source: z.string().nullable().optional(),
   opening_description: z.string().nullable().optional(),
+  edit_style: z.string().nullable().optional(),
 });
 export const ReelListSchema = z.object({ reels: z.array(ReelSchema) });
+
+// Smart-mode picks, served by the API so the mood tables live server-side only.
+export const ComposePlanSchema = z.object({
+  mood: z.string(),
+  transition: z.string(),
+  lut: z.string().nullable(),
+  music: z.string(),
+  reason: z.string(),
+  style: z.string(),
+  style_description: z.string(),
+  style_source: z.string(),
+});
+export type ComposePlan = z.infer<typeof ComposePlanSchema>;
 export type Reel = z.infer<typeof ReelSchema>;
 
 // --- Jobs -------------------------------------------------------------------
@@ -239,6 +253,10 @@ export const TimelineShotSchema = z.object({
   transition_after: TransitionStyleSchema.nullable(),
   volume: z.number(),
   muted: z.boolean(),
+  // Edit Quality v1: playback speed + digital punch-in.
+  speed: z.number(),
+  punch_in: z.number().nullable(),
+  punch_in_animated: z.boolean(),
 });
 export const VoiceoverTakeSchema = z.object({
   id: z.string(),

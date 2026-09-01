@@ -166,6 +166,97 @@ def _load_analysis(data_dir: Path, asset_id: str) -> AnalysisReport | None:
         return None
 
 
+# Above this many chain inputs, render hierarchically: long xfade chains
+# buffer early-decoded frames for late inputs (a 12-clip 1080x1920 chain
+# peaked ~6 GB and was OOM-killed).
+MAX_CHAIN_INPUTS = 6
+CHUNK_SIZE = 5
+
+
+def _chunk_slices(n: int, size: int = CHUNK_SIZE) -> list[tuple[int, int]]:
+    """[start, end) clip index ranges, each <= size, covering 0..n. Pure."""
+    out: list[tuple[int, int]] = []
+    i = 0
+    while i < n:
+        out.append((i, min(i + size, n)))
+        i += size
+    return out
+
+
+async def _render_chunks(
+    clips: list,
+    transitions: list[tuple[str, float]],
+    analysis: AnalysisReport,
+    config: ComposeConfig,
+    reel_dir: Path,
+    log_file: Path,
+    progress: ProgressCallback,
+) -> tuple[list, list[tuple[str, float]]]:
+    """Render clip groups to intermediate parts. Each part carries its
+    internal transitions, per-clip effects (Ken Burns / punch-in), and
+    per-shot audio gains; captions/music/LUT/unsharp/loudnorm are left for
+    the final pass — the mezzanine timeline is identical to a single-pass
+    render. Returns (part ClipInfos, boundary transitions)."""
+    from reelforge_core.compose.clips import ClipInfo
+    from reelforge_core.compose.graph_builder import build_final_command
+
+    bare = config.model_copy(
+        update={
+            "normalize_loudness": False,
+            "no_music": True,
+            "effects": config.effects.model_copy(update={"unsharp": False, "lut": None}),
+            "captions": config.captions.model_copy(update={"mode": "off"}),
+        }
+    )
+    tmp_dir = reel_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    slices = _chunk_slices(len(clips))
+    part_infos: list = []
+    boundary: list[tuple[str, float]] = []
+    for gi, (a, b) in enumerate(slices):
+        part_path = tmp_dir / f"part_{gi:02d}.mp4"
+        plan = build_final_command(
+            clips=clips[a:b],
+            analysis=analysis,
+            music_path=None,
+            captions_path=None,
+            config=bare,
+            output_path=part_path,
+            transitions=transitions[a : b - 1],
+        )
+        await progress(
+            _emit(
+                "render",
+                0.02 + 0.38 * (gi / max(1, len(slices))),
+                f"rendering chunk {gi + 1}/{len(slices)}",
+            )
+        )
+        try:
+            await asyncio.to_thread(run_ffmpeg, plan.args, log_file=log_file)
+        except FFmpegError as exc:
+            raise ComposeError(f"chunk render failed: {exc}") from exc
+        part_infos.append(
+            ClipInfo(
+                path=part_path,
+                scene_index=-1,
+                in_ts=0.0,
+                out_ts=plan.mezzanine_duration_sec,
+                duration=plan.mezzanine_duration_sec,
+                has_audio=True,
+                effects_applied=["chunk"],
+            )
+        )
+        if b - 1 < len(transitions):
+            boundary.append(transitions[b - 1])
+    log.info(
+        "hierarchical render: %d clips -> %d chunk(s) of <= %d",
+        len(clips),
+        len(slices),
+        CHUNK_SIZE,
+    )
+    return part_infos, boundary
+
+
 async def compose(
     asset: MediaAsset,
     reel: RankedReel,
@@ -181,17 +272,30 @@ async def compose(
     (reel_dir / "tmp").mkdir(parents=True, exist_ok=True)
     log_file = reel_dir / "ffmpeg_commands.log"
 
-    # Smart-mode: resolve "auto" transition kind + "auto" LUT before any work.
-    # The resolved config is what gets persisted in compose.json so the UI can
-    # show "the AI picked: slideleft + warm LUT + uplift-acoustic".
+    # Smart-mode: resolve the edit style FIRST (it reads the ORIGINAL "auto"
+    # sentinels), then the "auto" transition kind + LUT. The resolved config
+    # is what gets persisted in compose.json so the UI can show "the AI
+    # picked: slideleft + warm LUT + uplift-acoustic".
     from reelforge_core.compose.auto import resolve_smart_config
+    from reelforge_core.compose.styles import MUSIC_MOOD_BIAS, resolve_style
 
+    style = resolve_style(config, reel, analysis)
     config = resolve_smart_config(config, reel, analysis)
 
     # ----- prepare -----
     await progress(_emit("prepare", 0.0))
     library = load_music_library()
-    track = select_track(library, config, reel)
+    # Style music bias (hype -> energetic, chill -> calm) applies only to the
+    # AI-cut flow — an edited timeline keeps the reel's own mood.
+    bias = (
+        MUSIC_MOOD_BIAS.get(style)
+        if not (config.timeline and config.timeline.shots)
+        else None
+    )
+    reel_for_music = (
+        reel.model_copy(update={"suggested_mood": bias}) if bias else reel
+    )
+    track = select_track(library, config, reel_for_music)
 
     # ----- shot plan -----
     # Timeline mode (post-generation editing): the config carries the complete
@@ -203,6 +307,9 @@ async def compose(
     analyses: dict[str, AnalysisReport | None] = {analysis.asset_id: analysis}
     per_cut: list[tuple[str, float] | None] | None = None
     planned_durations: list[float]
+    plan_shots = None  # styles.PlannedShot list (scene mode only)
+    beat_grid = None
+    director_overlay = None  # hook TextOverlay from the edit director
     if timeline is not None:
         from reelforge_core.ingest import probe as _probe
 
@@ -228,43 +335,92 @@ async def compose(
         planned_durations = [s.duration for s in timeline.shots]
     else:
         from reelforge_core.compose.clips import clip_bounds
+        from reelforge_core.compose.styles import plan_edit
 
         n = len(reel.scene_indices)
         # Must mirror extract_clips exactly (incl. the reel-bound clamp) or
         # beat-sync trims are computed against the wrong shot durations.
-        planned_durations = [
-            (lambda b: b[1] - b[0])(
-                clip_bounds(
-                    pos,
-                    n,
-                    analysis.scenes[idx],
-                    config,
-                    analysis,
-                    reel_start=reel.start_sec,
-                    reel_end=reel.end_sec,
-                )
+        base_bounds: list[tuple[int, float, float]] = []
+        for pos, idx in enumerate(reel.scene_indices):
+            b = clip_bounds(
+                pos,
+                n,
+                analysis.scenes[idx],
+                config,
+                analysis,
+                reel_start=reel.start_sec,
+                reel_end=reel.end_sec,
             )
-            for pos, idx in enumerate(reel.scene_indices)
-        ]
+            base_bounds.append((idx, b[0], b[1]))
+
+        # Style grammar: rewrite the plan (beat cuts, ramps, punch-ins, jump
+        # cuts, transitions). The beat grid must exist BEFORE planning so
+        # hype can place cuts on beats; the beat-sync block below reuses it.
+        if (
+            style == "hype"
+            and track is not None
+            and beat_grid is None
+        ):
+            from reelforge_core.compose.beats import detect_beats
+
+            beat_grid = await asyncio.to_thread(detect_beats, Path(track.path))
+        edit_plan = plan_edit(style, base_bounds, reel, analysis, config, beat_grid)
+        if style != "classic":
+            log.info(
+                "edit style %r: %d shot(s) -> %d%s",
+                style,
+                len(base_bounds),
+                len(edit_plan.shots),
+                ("; " + "; ".join(edit_plan.notes)) if edit_plan.notes else "",
+            )
+        director_overlay = None
+        if config.director and style != "classic" and edit_plan.shots:
+            from reelforge_core.compose.director import run_director
+
+            edit_plan, director_overlay, _director_usage = await run_director(
+                edit_plan, reel, analysis, config, beat_grid, reel_dir
+            )
+        plan_shots = edit_plan.shots
+        per_cut = edit_plan.per_cut if any(c is not None for c in edit_plan.per_cut) else None
+        # Caption suggestions never un-mute captions the user turned off.
+        if edit_plan.caption_mode and config.captions.mode != "off":
+            config = config.model_copy(
+                update={
+                    "captions": config.captions.model_copy(
+                        update={
+                            "mode": edit_plan.caption_mode,
+                            "position": edit_plan.caption_position
+                            or config.captions.position,
+                        }
+                    )
+                }
+            )
+        planned_durations = [ps.duration for ps in plan_shots]
     # Per-cut (xfade name, duration) for the planned shots. Photo inserts in
-    # scene mode are added later and get the reel-wide transition.
-    transitions = resolve_transitions(config, len(planned_durations), per_cut)
+    # scene mode are added later and get the reel-wide transition. Clamped so
+    # no xfade outlasts its shorter neighbour — captions and beat sync consume
+    # this same clamped list.
+    from reelforge_core.compose.graph_builder import clamp_transitions
+
+    transitions = clamp_transitions(
+        planned_durations,
+        resolve_transitions(config, len(planned_durations), per_cut),
+    )
     xfade_durs = [d for _, d in transitions]
 
     # Beat sync: analyze the chosen track (tempo + phase) and compute the
     # per-clip end trims that put each crossfade midpoint on a beat. Must
     # happen before clip extraction — the trims change clip bounds.
     end_trims: list[float] | None = None
-    beat_grid = None
     if (
         track is not None
         and config.beat_sync
         and len(planned_durations) > 1
-        and config.transition.kind != "cut"
     ):
         from reelforge_core.compose.beats import compute_beat_end_trims, detect_beats
 
-        beat_grid = await asyncio.to_thread(detect_beats, Path(track.path))
+        if beat_grid is None:
+            beat_grid = await asyncio.to_thread(detect_beats, Path(track.path))
         if beat_grid is not None:
             end_trims = compute_beat_end_trims(
                 planned_durations,
@@ -311,6 +467,9 @@ async def compose(
                 log_file,
                 _clip_progress,
                 end_trims=end_trims,
+                # Final planned shots (style grammar / jump cuts) — extraction
+                # must not re-derive bounds from scene_indices.
+                shot_bounds=plan_shots,
             )
     except FFmpegError as exc:
         raise ComposeError(f"clip extraction failed: {exc}") from exc
@@ -357,9 +516,17 @@ async def compose(
             )
         clips = interleave_photo_clips(clips, rendered)
         log.info("composed with %d photo insert(s)", len(rendered))
-        # The shot count changed; recompute per-cut transitions (reel-wide
-        # default for every cut — photos never carry overrides).
-        transitions = resolve_transitions(config, len(clips))
+        # The shot count changed. Cuts between still-adjacent video shots KEEP
+        # their per-cut transition; cuts touching a photo get the reel-wide
+        # default (photos never carry overrides).
+        from reelforge_core.compose.graph_builder import expand_transitions_for_photos
+
+        transitions = clamp_transitions(
+            [c.duration for c in clips],
+            expand_transitions_for_photos(
+                clips, transitions, resolve_transitions(config, 2)[0]
+            ),
+        )
         xfade_durs = [d for _, d in transitions]
 
     await progress(_emit("clips", 1.0))
@@ -407,7 +574,11 @@ async def compose(
             end_trims=end_trims,
             clips=clips,
             analyses=analyses,
-            overlays=list(timeline.overlays) if timeline is not None else [],
+            overlays=(
+                list(timeline.overlays)
+                if timeline is not None
+                else ([director_overlay] if director_overlay is not None else [])
+            ),
             xfades=xfade_durs,
             voiceover_captions=voiceover_captions,
         )
@@ -445,14 +616,26 @@ async def compose(
                     f"voiceover take {take.label or take.asset_id} is missing on disk ({take.path!r})"
                 )
             voiceovers.append((vo_path, max(0.0, take.start_sec), take.effective_gain))
+    # Long xfade chains buffer early-decoded frames for late inputs — a
+    # 12-clip 1080x1920 chain peaks ~6 GB and gets OOM-killed. Above the
+    # threshold, render hierarchically: chunks of clips (internal transitions
+    # + per-clip effects) to intermediates, then one small final pass with
+    # captions/music/LUT — the mezzanine timeline is identical either way.
+    if len(clips) > MAX_CHAIN_INPUTS:
+        render_clips, render_transitions = await _render_chunks(
+            clips, transitions, analysis, config, reel_dir, log_file, progress
+        )
+    else:
+        render_clips, render_transitions = clips, transitions
+
     plan = build_final_command(
-        clips=clips,
+        clips=render_clips,
         analysis=analysis,
         music_path=music_path,
         captions_path=captions_for_render,
         config=config,
         output_path=mezzanine_path,
-        transitions=transitions,
+        transitions=render_transitions,
         voiceovers=voiceovers,
     )
 

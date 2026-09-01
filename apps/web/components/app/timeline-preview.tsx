@@ -35,7 +35,9 @@ const DEFAULT_XFADE = 0.4;
 const PLAYRES_Y = 1920; // ASS PlayResY the overlays are authored against
 
 export function shotDuration(s: TimelineShot): number {
-  return s.kind === 'photo' ? Math.max(0.2, s.duration_sec) : Math.max(0.1, s.out_ts - s.in_ts);
+  if (s.kind === 'photo') return Math.max(0.2, s.duration_sec);
+  const speed = Math.max(0.25, s.speed || 1);
+  return Math.max(0.1, (s.out_ts - s.in_ts) / speed);
 }
 
 function transitionAfter(s: TimelineShot): number {
@@ -148,15 +150,20 @@ export const TimelinePreview = React.forwardRef<
   /** Push the state of every media element to match time `time`. */
   const applyFrame = React.useCallback((time: number, isPlaying: boolean) => {
     const loc = locate(segsRef.current, time);
-    const wanted = new Map<string, { opacity: number; srcTime: number | null; gain: number }>();
+    const wanted = new Map<string, { opacity: number; srcTime: number | null; gain: number; rate: number }>();
     if (loc) {
       const place = (seg: Segment, opacity: number) => {
         if (seg.shot.kind !== 'video') return;
-        const srcTime = seg.shot.in_ts + Math.max(0, Math.min(seg.dur, time - seg.start));
-        const gain = seg.shot.muted ? 0 : Math.max(0, Math.min(1, seg.shot.volume));
+        const rate = Math.max(0.25, seg.shot.speed || 1);
+        // seg.dur is wall-clock (speed-scaled); source advances `rate`x faster.
+        const srcTime =
+          seg.shot.in_ts + Math.max(0, Math.min(seg.dur, time - seg.start)) * rate;
+        // Sped shots render muted (v1 render rule) — mirror that here.
+        const gain =
+          seg.shot.muted || rate !== 1 ? 0 : Math.max(0, Math.min(1, seg.shot.volume));
         const prev = wanted.get(seg.shot.asset_id);
         // Same asset in both crossfade halves: the incoming shot wins.
-        if (!prev || opacity >= prev.opacity) wanted.set(seg.shot.asset_id, { opacity, srcTime, gain });
+        if (!prev || opacity >= prev.opacity) wanted.set(seg.shot.asset_id, { opacity, srcTime, gain, rate });
       };
       if (loc.outgoing) place(loc.outgoing, 1 - loc.alpha);
       place(loc.primary, loc.outgoing ? loc.alpha : 1);
@@ -169,6 +176,7 @@ export const TimelinePreview = React.forwardRef<
         return;
       }
       el.style.opacity = String(w.opacity);
+      if (el.playbackRate !== w.rate) el.playbackRate = w.rate;
       // Per-shot volume/mute (HTML media caps at 1.0; the render allows up to 3x).
       el.volume = silencedRef.current ? 0 : w.gain * w.opacity;
       el.muted = silencedRef.current || w.gain <= 0;

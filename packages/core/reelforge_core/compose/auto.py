@@ -14,7 +14,6 @@ from typing import Iterable
 from reelforge_core.models import (
     AnalysisReport,
     ComposeConfig,
-    EffectsConfig,
     Mood,
     RankedReel,
     SceneSemantics,
@@ -102,17 +101,22 @@ def resolve_smart_config(
 
     new_effects = config.effects
     if config.effects.lut == "auto":
-        new_effects = EffectsConfig(
-            ken_burns_on_low_energy=config.effects.ken_burns_on_low_energy,
-            ken_burns_zoom=config.effects.ken_burns_zoom,
-            unsharp=config.effects.unsharp,
-            unsharp_amount=config.effects.unsharp_amount,
-            lut=pick_lut_id(reel),
-        )
+        # model_copy keeps every other effects field (a field-by-field rebuild
+        # here once silently dropped `reframe`, reverting user crop choices).
+        new_effects = config.effects.model_copy(update={"lut": pick_lut_id(reel)})
 
     return config.model_copy(
         update={"transition": new_transition, "effects": new_effects}
     )
+
+
+def smart_picks_for_mood(mood: str) -> dict[str, str | None]:
+    """The mood→style picks as data — the single source of truth the API
+    serves to the web UI (which previously duplicated these tables in TS)."""
+    return {
+        "transition": TRANSITION_BY_MOOD.get(mood, "fade"),
+        "lut": LUT_BY_MOOD.get(mood),
+    }
 
 
 def describe_smart_picks(resolved: ComposeConfig, reel: RankedReel) -> dict[str, str]:

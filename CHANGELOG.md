@@ -5,6 +5,21 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## Unreleased
 
 ### Added
+- **Edit Quality v1** — the renderer learned to actually edit
+  (`docs/editing-quality.md`): per-shot speed (slow-mo/ramps) and punch-ins,
+  eased direction-rotating Ken Burns, 15 transition kinds, per-cut
+  transitions in AI-composed reels, beat-placed cuts, jump-cut silence
+  removal, and hierarchical chunked rendering (fixes OOM on fast-cut edits).
+  Four editing-style grammars (hype / talking head / cinematic / chill)
+  plan each reel's cut deterministically; the selection ranker classifies
+  each reel's `content_style` (prompt v3); an AI edit-director refines the
+  plan within the grammar's bounds — stamped (free re-composes), locally
+  validated, and able to add a hook title overlay. Compose panel gains a
+  style dropdown + "AI edit direction" toggle with a server-fed plan
+  preview; the timeline editor gains speed/punch-in controls, the full
+  transition menu, and a 0.15s shot floor. Also fixes: smart mode dropping
+  the reframe setting, the editor's dead per-shot Ken Burns toggle, and
+  silently-broken xfades on short shots.
 - **Selection v2** — full overhaul of reel selection (generate wide → score
   cheap → rank rich → refine edges → dedup on time; `docs/selection.md`):
   - Three candidate generators: sentence-aligned spans from the word timeline,

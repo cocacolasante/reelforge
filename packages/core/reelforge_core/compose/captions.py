@@ -340,7 +340,9 @@ def build_captions(
     shots: list[tuple[str | None, float | None, float | None, float]] = []
     if clips is not None:
         for c in clips:
-            if c.is_photo:
+            if c.is_photo or getattr(c, "speed", 1.0) != 1.0:
+                # Photos map to no source span; sped shots are muted (v1 rule)
+                # so their words are suppressed — both still advance mezz time.
                 shots.append((None, None, None, c.duration))
             else:
                 shots.append((c.asset_id or analysis.asset_id, c.in_ts, c.out_ts, c.duration))

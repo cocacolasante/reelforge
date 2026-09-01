@@ -99,6 +99,17 @@ SYSTEM_PROMPT_V2 = (
     "opening_description: at most 80 characters stating what is LITERALLY on "
     "screen and said in the first 2 seconds — from the first contact-sheet "
     "frame and the opening line. No marketing language; describe, don't sell.\n\n"
+    "content_style: which editing grammar suits this candidate best.\n"
+    "- hype: action/sports/high-energy visuals that want fast beat-cut "
+    "editing, speed ramps, punch-ins.\n"
+    "- talking_head: a person talking to camera; wants jump cuts and "
+    "prominent captions.\n"
+    "- cinematic: scenery, travel, atmosphere; wants long dissolves and "
+    "slow camera drift.\n"
+    "- chill: low-key ambient content; wants gentle fades and minimal "
+    "editing.\n"
+    "- classic: none of the above clearly fits — conservative editing.\n"
+    "Judge from the contact sheets and transcript, not the mood label.\n\n"
     "Call the record_rankings tool exactly once with rankings for ALL "
     "candidates. Do not omit candidates. Do not include any text outside the "
     "tool call.\n\n"
@@ -190,7 +201,14 @@ _V2_ITEM["properties"]["opening_description"] = {
     "maxLength": 80,
     "description": "What is literally on screen and said in the first 2 seconds.",
 }
-_V2_ITEM["required"].extend(["rank_position", "opening_description"])
+_V2_ITEM["properties"]["content_style"] = {
+    "type": "string",
+    "enum": ["classic", "hype", "talking_head", "cinematic", "chill"],
+    "description": "The editing grammar that suits this candidate best.",
+}
+_V2_ITEM["required"].extend(
+    ["rank_position", "opening_description", "content_style"]
+)
 del _V2_ITEM
 
 
@@ -215,7 +233,10 @@ USER_DIRECTION_TEMPLATE = (
     "score prompt_relevance on how well the span could carry that feel.\n"
     "2. Style: if the instruction expresses a desired feel, tone, or energy "
     "(e.g. 'make it feel intense'), reflect it in suggested_mood (still from "
-    "the fixed vocabulary) and write the title and hook in that tone.\n"
+    "the fixed vocabulary) and write the title and hook in that tone. If it "
+    "names or implies an editing style (fast cuts/hype, talking head/vlog, "
+    "cinematic, chill), set content_style to match — the user's wording wins "
+    "over your own classification.\n"
     "Keep the four original dimensions at their normal meanings — do not "
     "inflate them for relevant candidates; prompt_relevance is reported "
     "separately."
@@ -500,6 +521,9 @@ def _coerce_rankings(
             rank_position = int(rank_position) if rank_position is not None else None
             opening = entry.get("opening_description")
             opening = str(opening)[:80] if opening else None
+            edit_style = entry.get("content_style")
+            if edit_style not in ("classic", "hype", "talking_head", "cinematic", "chill"):
+                edit_style = None
             reel = RankedReel(
                 candidate_id=cid,
                 scene_indices=candidate.scene_indices,
@@ -517,6 +541,7 @@ def _coerce_rankings(
                 source=candidate.source,
                 rank_position=rank_position,
                 opening_description=opening,
+                edit_style=edit_style,
             )
         except Exception as exc:
             log.warning(

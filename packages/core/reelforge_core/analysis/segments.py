@@ -11,7 +11,8 @@ module splits those scenes at the most natural nearby break:
 3. an even grid.
 
 Pure functions — no I/O. The pipeline re-extracts thumbnails and rewrites
-scenes.json after splitting.
+scenes.json after splitting. `word_gaps` and `snap_boundary` are public:
+compose-side jump cuts (compose/jumpcuts.py) and the style planner reuse them.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ DEFAULT_SPLIT_TARGET_SEC = 40.0
 MIN_SPEECH_GAP_SEC = 0.3
 
 
-def _word_gaps(transcript: Transcript | None) -> list[tuple[float, float]]:
+def word_gaps(transcript: Transcript | None) -> list[tuple[float, float]]:
     """(gap_midpoint, gap_length) for every inter-word pause >= MIN_SPEECH_GAP_SEC."""
     if transcript is None:
         return []
@@ -42,7 +43,7 @@ def _word_gaps(transcript: Transcript | None) -> list[tuple[float, float]]:
     return gaps
 
 
-def _snap_boundary(
+def snap_boundary(
     ideal: float,
     window: float,
     lo: float,
@@ -91,7 +92,7 @@ def split_long_scenes(
     returns them unchanged. Boundaries are strictly increasing — snap windows
     are capped at 35% of the piece length so adjacent boundaries can't cross.
     """
-    gaps = _word_gaps(transcript)
+    gaps = word_gaps(transcript)
     out: list[tuple[float, float]] = []
     for start, end in intervals:
         dur = end - start
@@ -108,7 +109,7 @@ def split_long_scenes(
         for i in range(1, parts):
             ideal = start + i * part_len
             lo = boundaries[-1]
-            boundaries.append(_snap_boundary(ideal, window, lo, end, gaps, loudness))
+            boundaries.append(snap_boundary(ideal, window, lo, end, gaps, loudness))
         boundaries.append(end)
         for a, b in zip(boundaries, boundaries[1:]):
             out.append((a, b))

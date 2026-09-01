@@ -67,7 +67,25 @@ import { formatDuration } from '@/lib/format';
 
 // ---------- helpers ----------
 
-const TRANSITIONS = ['fade', 'dissolve', 'slideleft', 'wipeleft', 'fadeblack', 'cut'] as const;
+const TRANSITIONS = [
+  'cut',
+  'fade',
+  'fadeblack',
+  'fadewhite',
+  'dissolve',
+  'slideleft',
+  'slideright',
+  'slideup',
+  'slidedown',
+  'wipeleft',
+  'wiperight',
+  'smoothleft',
+  'smoothright',
+  'circleopen',
+  'circleclose',
+] as const;
+const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3] as const;
+const PUNCH_INS = [1.15, 1.3, 1.5] as const;
 
 /** ASS &HAABBGGRR -> #RRGGBB */
 function assToHex(ass: string): string {
@@ -88,7 +106,8 @@ function hexToAss(hex: string): string {
 }
 
 function shotDuration(s: TimelineShot): number {
-  return s.kind === 'photo' ? Math.max(0.2, s.duration_sec) : Math.max(0.1, s.out_ts - s.in_ts);
+  if (s.kind === 'photo') return Math.max(0.2, s.duration_sec);
+  return Math.max(0.1, (s.out_ts - s.in_ts) / Math.max(0.25, s.speed || 1));
 }
 
 function totalDuration(shots: TimelineShot[]): number {
@@ -113,6 +132,9 @@ function videoShot(asset_id: string, in_ts: number, out_ts: number): TimelineSho
     ken_burns: true,
     transition_after: null,
     volume: 1,
+    speed: 1,
+    punch_in: null,
+    punch_in_animated: false,
     muted: false,
   };
 }
@@ -127,6 +149,9 @@ function photoShot(asset_id: string): TimelineShot {
     ken_burns: true,
     transition_after: null,
     volume: 1,
+    speed: 1,
+    punch_in: null,
+    punch_in_animated: false,
     muted: true,
   };
 }
@@ -545,8 +570,8 @@ function ShotRow({
 
   const nudge = (field: 'in_ts' | 'out_ts', delta: number) => {
     let v = round1(shot[field] + delta);
-    if (field === 'in_ts') v = Math.max(0, Math.min(v, shot.out_ts - 0.5));
-    else v = Math.max(shot.in_ts + 0.5, Math.min(v, srcDur));
+    if (field === 'in_ts') v = Math.max(0, Math.min(v, shot.out_ts - 0.15));
+    else v = Math.max(shot.in_ts + 0.15, Math.min(v, srcDur));
     onPatch({ [field]: v } as Partial<TimelineShot>);
   };
 
@@ -663,6 +688,50 @@ function ShotRow({
               <span className={'w-10 text-muted-foreground ' + (shot.muted ? 'line-through' : '')}>
                 {Math.round(shot.volume * 100)}%
               </span>
+            </div>
+          ) : null}
+
+          {!isPhoto ? (
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <Label className="text-xs text-muted-foreground">Speed</Label>
+              <select
+                value={String(shot.speed || 1)}
+                onChange={(e) => onPatch({ speed: Number(e.target.value) })}
+                className="h-7 rounded-md border bg-background px-2 text-xs"
+                title="Playback speed (non-1x shots render muted)"
+              >
+                {SPEEDS.map((v) => (
+                  <option key={v} value={String(v)}>{v}x</option>
+                ))}
+              </select>
+              <Label className="ml-2 text-xs text-muted-foreground">Punch-in</Label>
+              <select
+                value={shot.punch_in ? String(shot.punch_in) : '__off__'}
+                onChange={(e) =>
+                  onPatch({ punch_in: e.target.value === '__off__' ? null : Number(e.target.value) })
+                }
+                className="h-7 rounded-md border bg-background px-2 text-xs"
+                title="Digital zoom applied at render (not shown in preview)"
+              >
+                <option value="__off__">off</option>
+                {PUNCH_INS.map((v) => (
+                  <option key={v} value={String(v)}>{Math.round((v - 1) * 100)}%</option>
+                ))}
+              </select>
+              {shot.punch_in ? (
+                <label className="flex items-center gap-1 text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={shot.punch_in_animated}
+                    onChange={(e) => onPatch({ punch_in_animated: e.target.checked })}
+                    className="h-3.5 w-3.5 accent-primary"
+                  />
+                  drift
+                </label>
+              ) : null}
+              {(shot.speed || 1) !== 1 ? (
+                <span className="text-muted-foreground">audio muted at {shot.speed}x</span>
+              ) : null}
             </div>
           ) : null}
 

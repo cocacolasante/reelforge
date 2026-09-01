@@ -296,20 +296,22 @@ async def test_no_prompt_uses_v2_golden(
     assert client.calls[0]["tools"][0] == RECORD_RANKINGS_V2
     item = client.calls[0]["tools"][0]["input_schema"]["properties"]["rankings"]["items"]
     assert "prompt_relevance" not in item["properties"]
-    assert {"rank_position", "opening_description"} <= set(item["properties"])
-    assert "rank_position" in item["required"] and "opening_description" in item["required"]
+    assert {"rank_position", "opening_description", "content_style"} <= set(item["properties"])
+    for req in ("rank_position", "opening_description", "content_style"):
+        assert req in item["required"]
     assert client.calls[0]["max_tokens"] == 16000
     for r in selection.reels:
         assert r.prompt_relevance is None
         assert r.overall == round(r.scores.weighted, 2)
         assert r.rank_position is not None
         assert r.opening_description
+        assert r.edit_style in ("classic", "hype", "talking_head", "cinematic", "chill")
 
     # Stamp golden: v2 prompt version + prescore version + shortlist hash.
     stamp = json.loads(
         (isolated_data_dir / "working" / "aidp2" / "ranking_raw.json.stamp").read_text()
     )
-    assert stamp["ranking_prompt_version"] == "v2"
+    assert stamp["ranking_prompt_version"] == "v3"
     assert stamp["prescore_version"] == "p1"
     assert set(stamp) == {
         "ranking_model",

@@ -26,6 +26,7 @@ import { API_BASE } from '@/lib/api/client';
 import { humanMessage } from '@/lib/api/errors';
 import { formatBytes, formatDuration, formatTimestamp } from '@/lib/format';
 import {
+  useComposePlan,
   useEnqueueCompose,
   useProjectPhotos,
   useEnqueueExport,
@@ -43,33 +44,6 @@ const PRESETS = [
   { id: 'mov_prores_422', label: 'MOV · ProRes 422', description: 'Editorial (Standard)', ratio: 8.0 },
   { id: 'mov_prores_hq', label: 'MOV · ProRes HQ', description: 'Editorial (HQ)', ratio: 12.0 },
 ] as const;
-
-// Mirror of TRANSITION_BY_MOOD / LUT_BY_MOOD in packages/core/reelforge_core/compose/auto.py.
-// Used purely to preview the AI's planned picks; the server is the source of truth.
-const TRANSITION_BY_MOOD: Record<string, string> = {
-  calm: 'fade',
-  tense: 'fade',
-  joyful: 'dissolve',
-  somber: 'fadeblack',
-  energetic: 'slideleft',
-  mysterious: 'fadeblack',
-  romantic: 'dissolve',
-  triumphant: 'slideleft',
-  melancholic: 'fadeblack',
-  neutral: 'fade',
-};
-const LUT_BY_MOOD: Record<string, string | null> = {
-  calm: 'warm',
-  tense: 'cinematic',
-  joyful: 'vivid',
-  somber: 'cool',
-  energetic: 'vivid',
-  mysterious: 'cool',
-  romantic: 'warm',
-  triumphant: 'cinematic',
-  melancholic: 'cool',
-  neutral: null,
-};
 
 export default function ReelDetailPage({
   params,
@@ -93,6 +67,8 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
 
   // Local compose-config state (intentionally not persisted across reload).
   const [smart, setSmart] = React.useState(true);
+  const [style, setStyle] = React.useState('auto');
+  const [director, setDirector] = React.useState(true);
   const [aspect, setAspect] = React.useState<'9:16' | '16:9' | '1:1'>('9:16');
   const [captionMode, setCaptionMode] = React.useState<'off' | 'static' | 'karaoke'>('karaoke');
   const [transition, setTransition] = React.useState('fade');
@@ -146,6 +122,8 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
           captions: { mode: captionMode },
           smart_mode: true,
           transition: { kind: 'auto', duration_sec: 0.4 },
+          ...(style !== 'auto' ? { style } : {}),
+          ...(director ? {} : { director: false }),
           effects: {
             ken_burns_on_low_energy: true,
             unsharp: true,
@@ -203,8 +181,13 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
     }
   };
 
-  const plannedTransition = TRANSITION_BY_MOOD[r.suggested_mood] ?? 'fade';
-  const plannedLut = LUT_BY_MOOD[r.suggested_mood] ?? null;
+  // Smart-mode picks come from the server (single source of truth).
+  const composePlan = useComposePlan(reelId);
+  const plannedTransition = composePlan.data?.transition ?? '…';
+  const plannedLut = composePlan.data?.lut ?? null;
+  const plannedStyle = style !== 'auto' ? style : composePlan.data?.style ?? '…';
+  const plannedStyleDesc =
+    style !== 'auto' ? '' : composePlan.data?.style_description ?? '';
 
   return (
     <div className="container space-y-4 py-6">
@@ -329,15 +312,52 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
                 </div>
               </label>
               {smart ? (
-                <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-1 border-t border-primary/20 pt-3 text-xs">
-                  <span className="text-muted-foreground">Transition</span>
-                  <span className="font-mono">{plannedTransition}</span>
-                  <span className="text-muted-foreground">Color grade</span>
-                  <span className="font-mono">{plannedLut ?? 'none'}</span>
-                  <span className="text-muted-foreground">Music</span>
-                  <span className="font-mono">auto-match ({r.suggested_mood})</span>
-                  <span className="text-muted-foreground">Effects</span>
-                  <span className="font-mono">Ken Burns + unsharp</span>
+                <div className="mt-3 space-y-3 border-t border-primary/20 pt-3 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-muted-foreground">Edit style</span>
+                    <select
+                      value={style}
+                      onChange={(e) => setStyle(e.target.value)}
+                      className="h-7 rounded-md border bg-background px-2 text-xs"
+                    >
+                      <option value="auto">auto ({composePlan.data?.style ?? '…'})</option>
+                      <option value="classic">classic</option>
+                      <option value="hype">hype</option>
+                      <option value="talking_head">talking head</option>
+                      <option value="cinematic">cinematic</option>
+                      <option value="chill">chill</option>
+                    </select>
+                    <label className="ml-1 flex items-center gap-1 text-muted-foreground">
+                      <input
+                        type="checkbox"
+                        checked={director}
+                        onChange={(e) => setDirector(e.target.checked)}
+                        className="h-3.5 w-3.5 accent-primary"
+                      />
+                      AI edit direction
+                    </label>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+                    <span className="text-muted-foreground">Style</span>
+                    <span className="font-mono">
+                      {plannedStyle}
+                      {plannedStyleDesc ? ` — ${plannedStyleDesc}` : ''}
+                    </span>
+                    <span className="text-muted-foreground">Transition</span>
+                    <span className="font-mono">
+                      {plannedStyle === 'hype' || plannedStyle === 'talking_head'
+                        ? 'style-driven cuts'
+                        : plannedTransition}
+                    </span>
+                    <span className="text-muted-foreground">Color grade</span>
+                    <span className="font-mono">{plannedLut ?? 'none'}</span>
+                    <span className="text-muted-foreground">Music</span>
+                    <span className="font-mono">auto-match ({r.suggested_mood})</span>
+                    <span className="text-muted-foreground">Director</span>
+                    <span className="font-mono">
+                      {director ? 'on — refines cuts, may add a hook title' : 'off'}
+                    </span>
+                  </div>
                 </div>
               ) : null}
             </section>

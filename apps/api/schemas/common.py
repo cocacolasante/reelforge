@@ -126,6 +126,8 @@ class ReelOut(BaseModel):
     # and the ranker's literal first-2-seconds description. None on pre-v2 rows.
     source: Optional[str] = None
     opening_description: Optional[str] = None
+    # v3: editing-grammar classification (auto style for compose).
+    edit_style: Optional[str] = None
 
 
 class ReelList(BaseModel):

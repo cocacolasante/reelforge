@@ -158,10 +158,12 @@ def test_build_command_low_energy_scenes_get_kenburns() -> None:
     fc = plan.filter_complex
     # Ken Burns is now constant-zoom + animated crop (zoompan was ~10x
     # slower). One scale+crop pair per low-energy clip; 1080x1920 * 1.10
-    # rounds to 1188x2112.
+    # rounds to 1188x2112. CP1: drift is eased (pow) and direction rotates
+    # with position (clip 0 TL->BR, clip 1 BR->TL).
     assert "zoompan" not in fc
     assert fc.count("scale=1188:2112,crop=1080:1920:") == 2
-    assert "x='(iw-ow)*min(t/10.000\\,1)'" in fc
+    assert "x='(iw-ow)*(1-pow(1-min(t/10.000\\,1)\\,2))'" in fc
+    assert "x='(iw-ow)*pow(1-min(t/10.000\\,1)\\,2)'" in fc
 
 
 def test_build_command_includes_deterministic_flags() -> None:

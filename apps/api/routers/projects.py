@@ -373,6 +373,7 @@ async def list_project_reels(
                         prompt_relevance=r.prompt_relevance,
                         source=r.source,
                         opening_description=r.opening_description,
+                        edit_style=r.edit_style,
                         mezzanine_path=mezz_path,
                     )
                 )
@@ -387,6 +388,7 @@ async def list_project_reels(
                 existing.prompt_relevance = r.prompt_relevance
                 existing.source = r.source
                 existing.opening_description = r.opening_description
+                existing.edit_style = r.edit_style
                 # v2: candidate_id hashes the bounds, but refinement (CP7) can
                 # move bounds under a stable id — always refresh geometry.
                 existing.start_sec = r.start_sec
@@ -416,6 +418,7 @@ async def list_project_reels(
                     "prompt_relevance": r.prompt_relevance,
                     "source": r.source,
                     "opening_description": r.opening_description,
+                    "edit_style": r.edit_style,
                 }
             )
     # Re-rank merged set by overall score so the UI shows the best content first

@@ -172,6 +172,7 @@ def _hydrate_reels_from_disk(
                 prompt_relevance=r.prompt_relevance,
                 source=r.source,
                 opening_description=r.opening_description,
+                edit_style=r.edit_style,
             )
         )
     return out
@@ -196,6 +197,7 @@ async def list_reels_for_asset(
             existing.scene_indices_json = json.dumps(r.scene_indices)
             existing.source = r.source
             existing.opening_description = r.opening_description
+            existing.edit_style = r.edit_style
         if existing is None:
             db.add(
                 dbmod.Reel(
@@ -216,6 +218,7 @@ async def list_reels_for_asset(
                     prompt_relevance=r.prompt_relevance,
                     source=r.source,
                     opening_description=r.opening_description,
+                    edit_style=r.edit_style,
                     mezzanine_path=(
                         str(
                             working_dir_for(asset_id)

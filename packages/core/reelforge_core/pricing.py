@@ -77,6 +77,11 @@ AVG_RANKING_OUTPUT_PER_CANDIDATE = 200   # v2 adds rank_position + opening_descr
 # Contact sheet ≈ width*height/750 image tokens; 3 tiles at 180px height from
 # 16:9 source ≈ 960x180 ≈ 230 — rounded up for taller-than-16:9 tiles.
 AVG_CONTACT_SHEET_TOKENS = 250
+# Edit director (compose): one call per (changed) plan. Calibrated against a
+# live 22-shot hype run: 4,525 in / 408 out.
+AVG_DIRECTOR_SYSTEM_TOKENS = 900
+AVG_DIRECTOR_PER_SHOT_TOKENS = 165
+AVG_DIRECTOR_OUTPUT_TOKENS = 400
 
 
 def estimate_semantics_cost(

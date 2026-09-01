@@ -39,6 +39,29 @@ class BeatGrid:
         """Seconds since the most recent beat at time `t`."""
         return (t - self.phase_sec) % self.interval
 
+    def snap(self, t: float) -> float:
+        """The beat timestamp nearest to `t`. Pure."""
+        offset = self.phase_within_beat(t)
+        prev_beat = t - offset
+        return prev_beat if offset <= self.interval / 2 else prev_beat + self.interval
+
+
+def beats_in_range(grid: BeatGrid, start: float, end: float) -> list[float]:
+    """Every beat timestamp in [start, end], ascending. Pure — the raw
+    material for placing cuts ON beats (style grammars) rather than merely
+    trimming toward them."""
+    if end < start or grid.interval <= 0:
+        return []
+    import math
+
+    k = math.ceil((start - grid.phase_sec) / grid.interval - 1e-9)
+    out: list[float] = []
+    t = grid.phase_sec + k * grid.interval
+    while t <= end + 1e-9:
+        out.append(round(t, 4))
+        t += grid.interval
+    return out
+
 
 def _decode_mono(path: Path, max_sec: float) -> "np.ndarray":  # noqa: F821
     import numpy as np

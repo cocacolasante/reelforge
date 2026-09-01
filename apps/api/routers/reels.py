@@ -68,6 +68,7 @@ def _to_reel_out(r: dbmod.Reel, mezz_ready: bool) -> ReelOut:
         prompt_relevance=r.prompt_relevance,
         source=r.source,
         opening_description=r.opening_description,
+        edit_style=r.edit_style,
     )
 
 
@@ -282,6 +283,34 @@ async def _project_sources(
     return videos, photos, audios
 
 
+@router.get("/reels/{reel_id}/compose_plan")
+async def get_compose_plan(
+    reel_id: str, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """What smart mode would pick for this reel — served from the server's
+    mood tables so the web UI never duplicates them."""
+    r = await db.get(dbmod.Reel, reel_id)
+    if r is None:
+        raise ApiError(404, "REEL_NOT_FOUND", f"reel {reel_id} not found")
+    from reelforge_core.compose.auto import smart_picks_for_mood
+    from reelforge_core.compose.styles import STYLE_DESCRIPTIONS
+
+    picks = smart_picks_for_mood(r.suggested_mood)
+    style = r.edit_style or "classic"
+    return {
+        "mood": r.suggested_mood,
+        "transition": picks["transition"],
+        "lut": picks["lut"],
+        "music": "auto-match",
+        "reason": f"mood={r.suggested_mood}",
+        # Edit Quality v1: the grammar that will drive the AI cut (the
+        # ranker's classification; heuristics fill in for pre-v3 reels).
+        "style": style,
+        "style_description": STYLE_DESCRIPTIONS.get(style, ""),
+        "style_source": "ranker" if r.edit_style else "fallback",
+    }
+
+
 @router.get("/reels/{reel_id}/edit", response_model=ReelEditOut)
 async def get_reel_edit(reel_id: str, db: AsyncSession = Depends(get_db)) -> ReelEditOut:
     r = await db.get(dbmod.Reel, reel_id)
@@ -345,8 +374,10 @@ async def put_reel_edit(
                 raise ApiError(400, "INVALID_CONFIG", f"shot {i + 1}: {a.original_filename} is a photo, not footage")
             if shot.in_ts < 0 or shot.out_ts <= shot.in_ts:
                 raise ApiError(400, "INVALID_CONFIG", f"shot {i + 1}: out must be after in")
-            if shot.out_ts - shot.in_ts < 0.5:
-                raise ApiError(400, "INVALID_CONFIG", f"shot {i + 1}: shots must be at least 0.5s")
+            # 0.15s floor enables flash cuts; the render-side xfade clamp
+            # (graph_builder.clamp_transitions) keeps transitions safe on them.
+            if shot.out_ts - shot.in_ts < 0.15:
+                raise ApiError(400, "INVALID_CONFIG", f"shot {i + 1}: shots must be at least 0.15s")
             if a.duration_sec and shot.out_ts > a.duration_sec + 0.05:
                 raise ApiError(
                     400, "INVALID_CONFIG",

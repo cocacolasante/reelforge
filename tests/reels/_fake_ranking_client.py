@@ -52,9 +52,12 @@ def _ranking_for(candidate_id: str, seed: int = 0, relevance: int | None = None)
         "justification": f"Ranked because of reasons specific to {candidate_id}.",
         "suggested_mood": moods[seed % len(moods)],
         "scores": base_scores,
-        # v2 required fields — harmless extras under a v1-style schema.
+        # v2/v3 required fields — harmless extras under a v1-style schema.
         "rank_position": seed + 1,
         "opening_description": f"Opening frame of {candidate_id}"[:80],
+        "content_style": ["classic", "hype", "talking_head", "cinematic", "chill"][
+            seed % 5
+        ],
     }
     if relevance is not None:
         entry["prompt_relevance"] = relevance

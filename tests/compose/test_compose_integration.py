@@ -231,3 +231,116 @@ async def test_compose_deterministic_byte_identical(
     second_bytes = Path(second.mezzanine_path).read_bytes()
     # Identical config + source → identical mezzanine
     assert first_bytes == second_bytes
+
+
+@pytest.mark.asyncio
+async def test_compose_timeline_with_speed_punchin_and_mixed_cuts(
+    synth_source: Path,
+    isolated_data_dir: Path,
+) -> None:
+    """CP1 integration: real ffmpeg render with a 2x shot, a punched-in shot,
+    and per-cut transition variety from the new vocabulary."""
+    from reelforge_core.models import ReelTimeline, TimelineShot
+
+    asset = probe(synth_source)
+    analysis, reel = _make_analysis_and_reel(asset.id)
+    timeline = ReelTimeline(
+        shots=[
+            TimelineShot(
+                kind="video",
+                asset_id=asset.id,
+                path=str(synth_source),
+                in_ts=0.0,
+                out_ts=6.0,
+                speed=2.0,  # -> 3s of mezzanine
+                transition_after=TransitionStyle(kind="smoothleft", duration_sec=0.4),
+            ),
+            TimelineShot(
+                kind="video",
+                asset_id=asset.id,
+                path=str(synth_source),
+                in_ts=10.0,
+                out_ts=16.0,
+                punch_in=1.3,
+            ),
+        ]
+    )
+    config = ComposeConfig(
+        aspect="9:16",
+        video_preset="ultrafast",
+        no_music=True,
+        beat_sync=False,
+        captions=CaptionStyle(mode="off"),
+        effects=EffectsConfig(unsharp=False, ken_burns_on_low_energy=False, lut=None),
+        timeline=timeline,
+        smart_mode=False,
+        transition=TransitionStyle(kind="fade", duration_sec=0.4),
+    )
+
+    manifest = await compose(asset, reel, analysis, config)
+    mezz = Path(manifest.mezzanine_path)
+    assert mezz.exists() and mezz.stat().st_size > 0
+    probe_data = _ffprobe(mezz)
+    dur = float(probe_data["format"]["duration"])
+    # 3.0 (sped) + 6.0 - 0.4 xfade = 8.6s.
+    assert dur == pytest.approx(8.6, abs=0.3)
+
+
+@pytest.mark.asyncio
+async def test_compose_jump_cuts_remove_silence(
+    synth_source: Path,
+    isolated_data_dir: Path,
+) -> None:
+    """CP2 integration: jump_cuts="on" splits a shot around dead air and the
+    render loses exactly the removed silence."""
+    from reelforge_core.models import Transcript, TranscriptSegment, TranscriptWord
+
+    def _w(t0: float, t1: float) -> TranscriptWord:
+        return TranscriptWord(start=t0, end=t1, word="w", probability=0.9)
+
+    # Speech 0.2-3.0 and 6.0-9.8 inside scene 0; scene 1 continuous 10.2-19.8.
+    words = []
+    t = 0.2
+    while t < 2.8:
+        words.append(_w(t, t + 0.3))
+        t += 0.4
+    t = 6.0
+    while t < 9.6:
+        words.append(_w(t, t + 0.3))
+        t += 0.4
+    t = 10.2
+    while t < 19.6:
+        words.append(_w(t, t + 0.3))
+        t += 0.4
+    transcript = Transcript(
+        language="en",
+        language_probability=1.0,
+        duration=20.0,
+        segments=[TranscriptSegment(start=0.2, end=19.8, text="x", words=words)],
+    )
+
+    asset = probe(synth_source)
+    analysis, reel = _make_analysis_and_reel(asset.id)
+    analysis = analysis.model_copy(update={"transcript": transcript})
+    reel = reel.model_copy(
+        update={"scene_indices": [0, 1], "end_sec": 20.0, "duration_sec": 20.0}
+    )
+    config = ComposeConfig(
+        aspect="9:16",
+        video_preset="ultrafast",
+        no_music=True,
+        beat_sync=False,
+        jump_cuts="on",
+        captions=CaptionStyle(mode="off"),
+        effects=EffectsConfig(unsharp=False, ken_burns_on_low_energy=False, lut=None),
+        smart_mode=False,
+        transition=TransitionStyle(kind="fade", duration_sec=0.4),
+    )
+
+    manifest = await compose(asset, reel, analysis, config)
+    mezz = Path(manifest.mezzanine_path)
+    assert mezz.exists()
+    dur = float(_ffprobe(mezz)["format"]["duration"])
+    # Scene 0 splits at the 3.0-6.0 silence: shots (0-3.15)(5.85-10)(10-20)
+    # -> 3.15 + 4.15 + 10 - 0.04 (jump cut) - 0.4 (scene fade) = 16.86s.
+    assert dur == pytest.approx(16.86, abs=0.35)
