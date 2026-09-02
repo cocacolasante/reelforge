@@ -37,7 +37,10 @@ in Docker; the only host requirement is Docker Engine ≥ 24 + Compose v2.
       (hype/talking_head/cinematic/chill), ranker style classification
       (prompt v3), AI edit-director (stamped, locally validated).
       `docs/editing-quality.md`.
-- [ ] Phase 12+ — not started
+- [x] Phase 12 — AI Mix: cross-clip reels (mine short moments from every
+      clip → one `record_mix` sequencing call → style grammar → multi-source
+      timeline → inline render). `docs/mixes.md`.
+- [ ] Phase 13+ — not started
 
 ## Topology
 ```
@@ -549,6 +552,21 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   STYLE_BOUNDS or reverted per-entry — the director must never be able to
   fail a render. Director stamp = fingerprint(plan, style, model, d1) in the
   reel dir; unchanged re-composes are zero-token.
+- **AI Mix (cross-clip reels).** `reelforge_core/mixes/` (mining /
+  sequencer / planner / store) + `apps/api/routers/mixes.py` + worker
+  `create_mix_job`. Invariants: the `mix-` **id prefix is the mix
+  discriminator** (`child_reel_ids_json` stays NULL — that column
+  discriminates montages); the mezzanine renders under
+  `working/{primary}/reels/{mix_id}/` — never pre-write a montage-style
+  `_montage/` path (breaks preview); `compose_reel_job`'s `reel_stub`
+  param is a FALLBACK only — the reels.json lookup stays primary so a stub
+  can never shadow a real reel; the worker writes the sequenced
+  title/edit_json back via the sync store (`mixes/store.py`,
+  publish/store.py pattern); `validate_sequence` + `fallback_sequence`
+  mean a sequencing-model failure can never fail the render; generated
+  timelines must satisfy every PUT /edit rule (≤60 shots, ≥0.15s, real
+  transition kinds) — the editor is the mix's source of truth, which is
+  also why trim/edit-reset 400 for `mix-` ids.
 - **Only libx264 + AAC.** No NVENC, no hardware encode. Determinism and
   quality come first; we can revisit in Phase 7 after measuring.
 - **Do not use `-c copy` for clip extraction.** Stream-copy with `-ss` snaps to

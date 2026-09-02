@@ -193,6 +193,7 @@ async def compose_reel_job(
     asset_id: str,
     reel_id: str,
     config_dict: dict | None = None,
+    reel_stub: dict | None = None,
 ) -> dict:
     job_id = ctx["job_id"]
     redis = ctx["redis"]
@@ -224,6 +225,12 @@ async def compose_reel_job(
         raise
 
     reel = next((r for r in selection.reels if r.candidate_id == reel_id), None)
+    if reel is None and reel_stub is not None:
+        # Synthetic reels (AI mixes) live only as DB rows; the API passes a
+        # stub built from the row so compose works without a reels.json entry.
+        from reelforge_core.models import RankedReel
+
+        reel = RankedReel(**reel_stub)
     if reel is None:
         msg = f"reel {reel_id} not found in selection for asset {asset_id}"
         await db.record_job_failure(job_id, msg, msg)
@@ -579,4 +586,224 @@ async def publish_reel_job(ctx: dict, publication_id: str) -> dict:
     await db.record_job_success(job_id, result)
     await write_terminal(redis, job_id, "done", "done")
     log.info("publish_reel_job done", extra=extra)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# create_mix_job (AI Mix: cross-clip reels)
+# ---------------------------------------------------------------------------
+
+
+async def create_mix_job(
+    ctx: dict,
+    project_id: str,
+    mix_id: str,
+    primary_asset_id: str,
+    sources: list,  # [(asset_id, source_path, filename)] for analyzed assets
+    mix_config: dict | None = None,
+) -> dict:
+    """Mine short moments from every analyzed clip, sequence them with one AI
+    call, bake style pacing into a multi-source timeline, persist it to the
+    mix Reel row, and render it inline."""
+    from dataclasses import replace as _dc_replace
+
+    from reelforge_core.mixes.mining import (
+        mine_moments,
+        moment_bounds_for,
+        pool_moments,
+    )
+    from reelforge_core.mixes.planner import plan_mix
+    from reelforge_core.mixes.sequencer import sequence_mix
+    from reelforge_core.mixes.store import update_mix_reel
+    from reelforge_core.models import (
+        ProgressEvent,
+        RankedReel,
+        ReelScores,
+    )
+    from reelforge_core.reels.pipeline import _extract_contact_sheets
+
+    job_id = ctx["job_id"]
+    redis = ctx["redis"]
+    cfg = mix_config or {}
+    target_sec = float(cfg.get("target_duration_sec", 45))
+    extra = {"job_id": job_id, "project_id": project_id, "reel_id": mix_id}
+    log.info("create_mix_job start", extra=extra)
+    await db.record_job_start(job_id, kind="create_mix", asset_id=primary_asset_id)
+    on_progress = make_throttled_progress_writer(redis, job_id)
+
+    async def _phase(overall: float, message: str) -> None:
+        await on_progress(
+            ProgressEvent(  # type: ignore[arg-type]
+                stage="prepare", stage_progress=0.0, overall_progress=overall, message=message
+            )
+        )
+
+    try:
+        # ----- load analyses -----
+        await _phase(0.02, "loading analyses")
+        analyses: dict[str, AnalysisReport | None] = {}
+        names: dict[str, str] = {}
+        paths: dict[str, str] = {}
+        for aid, src_path, filename in sources:
+            names[aid] = filename
+            paths[aid] = src_path
+            ap = working_dir_for(aid) / "analysis.json"
+            try:
+                analyses[aid] = AnalysisReport.model_validate_json(ap.read_text())
+            except Exception:
+                log.warning("mix: unreadable analysis for %s; skipping", aid[:12])
+        usable = {aid: a for aid, a in analyses.items() if a is not None}
+        if len(usable) < 2:
+            raise RuntimeError("mix needs at least 2 analyzed clips")
+
+        # ----- mine + pool -----
+        await _phase(0.05, "mining moments")
+        bounds = moment_bounds_for(target_sec)
+        per_asset = {aid: mine_moments(a, bounds) for aid, a in usable.items()}
+        pool = pool_moments(per_asset)
+        if len(pool) < 3:
+            raise RuntimeError(
+                f"only {len(pool)} usable moment(s) across the project — "
+                "clips may be too short for a mix"
+            )
+        log.info(
+            "mix: pooled %d moments from %d clips", len(pool), len(per_asset),
+            extra=extra,
+        )
+
+        # ----- contact sheets (per asset; cached alongside selection's) -----
+        await _phase(0.10, "extracting contact sheets")
+        sheets: dict[str, Path] = {}
+        for aid, moments in per_asset.items():
+            in_pool = [m for m in pool if m.asset_id == aid]
+            if not in_pool:
+                continue
+            feats = {m.moment_id: m.features for m in in_pool}
+            got = await _extract_contact_sheets(
+                [m.candidate for m in in_pool], usable[aid], feats, working_dir_for(aid)
+            )
+            sheets.update(got)
+
+        # ----- sequence -----
+        await _phase(0.14, f"sequencing {len(pool)} moments")
+        seq, usage = await sequence_mix(
+            pool,
+            analyses,
+            names,
+            target_sec=target_sec,
+            prompt=cfg.get("prompt") or None,
+            model=cfg.get("mix_model", "claude-sonnet-4-5"),
+            sheets=sheets,
+        )
+        if usage.input_tokens:
+            try:
+                await record_anthropic_usage(
+                    job_id=job_id,
+                    model=cfg.get("mix_model", "claude-sonnet-4-5"),
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    project_id=project_id,
+                )
+            except Exception:  # pragma: no cover
+                log.exception("failed to record mix usage", extra=extra)
+        style = cfg.get("style") if cfg.get("style") not in (None, "auto") else seq.content_style
+        log.info(
+            "mix: sequenced %d shots (style=%s, fallback=%s)",
+            len(seq.shots), style, seq.fallback, extra=extra,
+        )
+
+        # ----- beat grid (for hype planning; compose re-picks the same track
+        # deterministically from (mix_id, seed) + mood) -----
+        beat_grid = None
+        if style == "hype":
+            from reelforge_core.compose.beats import detect_beats
+            from reelforge_core.compose.music import load_music_library, select_track
+
+            probe_reel = RankedReel(
+                candidate_id=mix_id, scene_indices=[], start_sec=0.0, end_sec=target_sec,
+                duration_sec=target_sec, title=seq.title, hook=seq.hook, justification="",
+                scores=ReelScores(narrative_coherence=70, hook_strength=70,
+                                  emotional_payoff=70, standalone_clarity=70),
+                overall=70.0, rank=1, suggested_mood=seq.suggested_mood,  # type: ignore[arg-type]
+            )
+            track = select_track(load_music_library(), ComposeConfig(), probe_reel)
+            if track is not None:
+                import asyncio as _asyncio
+
+                beat_grid = await _asyncio.to_thread(detect_beats, Path(track.path))
+
+        # ----- plan + persist -----
+        await _phase(0.18, "planning the edit")
+        timeline = plan_mix(seq.shots, analyses, style, beat_grid)
+        update_mix_reel(
+            mix_id,
+            edit_json=timeline.model_dump_json(),  # paths are empty (API-style)
+            title=seq.title,
+            hook=seq.hook,
+            suggested_mood=seq.suggested_mood,
+            edit_style=style,
+            duration_sec=round(timeline.total_duration, 3),
+        )
+
+        # ----- compose inline -----
+        resolved = timeline.model_copy(
+            update={
+                "shots": [
+                    s.model_copy(update={"path": paths.get(s.asset_id, "")})
+                    for s in timeline.shots
+                ]
+            }
+        )
+        stub = RankedReel(
+            candidate_id=mix_id,
+            scene_indices=[],
+            start_sec=0.0,
+            end_sec=round(timeline.total_duration, 3),
+            duration_sec=round(timeline.total_duration, 3),
+            title=seq.title,
+            hook=seq.hook,
+            justification="AI mix",
+            scores=ReelScores(narrative_coherence=70, hook_strength=70,
+                              emotional_payoff=70, standalone_clarity=70),
+            overall=70.0,
+            rank=1,
+            suggested_mood=seq.suggested_mood,  # type: ignore[arg-type]
+            edit_style=style,  # type: ignore[arg-type]
+        )
+        compose_config = ComposeConfig(
+            aspect=cfg.get("aspect", "9:16"),
+            target_fps=int(cfg.get("fps", 30)),
+            timeline=resolved,
+            style="classic",  # pacing is baked into the timeline
+            director=False,
+        )
+        asset = await _load_asset(primary_asset_id)
+        primary_analysis = usable[primary_asset_id]
+
+        async def _scaled(ev) -> None:
+            await on_progress(
+                _dc_replace(ev, overall_progress=0.2 + 0.8 * ev.overall_progress)
+            )
+
+        await _phase(0.20, "rendering")
+        manifest = await compose(asset, stub, primary_analysis, compose_config, progress=_scaled)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        log.error("create_mix_job failed: %s", exc, extra=extra, exc_info=True)
+        await db.record_job_failure(job_id, str(exc), tb)
+        await write_terminal(redis, job_id, "error", str(exc))
+        raise
+
+    result = {
+        "mezzanine_path": manifest.mezzanine_path,
+        "reel_id": mix_id,
+        "project_id": project_id,
+        "duration_sec": manifest.duration_sec,
+        "shots": len(timeline.shots),
+        "style": style,
+        "sequencer_fallback": seq.fallback,
+    }
+    await db.record_job_success(job_id, result)
+    await write_terminal(redis, job_id, "done", "done")
+    log.info("create_mix_job done", extra=extra)
     return result

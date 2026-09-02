@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json as _json
+
 import json
 from pathlib import Path
 from typing import Any
@@ -106,13 +108,42 @@ async def enqueue_compose(
         body["photo_inserts"] = resolved
     config = ComposeConfig(**body)
 
+    # Synthetic reels (AI mixes) exist only as DB rows — hand the worker a
+    # RankedReel stub so compose works without a reels.json entry.
+    reel_stub = None
+    if reel_id.startswith("mix-"):
+        try:
+            scores = _json.loads(reel.scores_json)
+        except Exception:
+            scores = {}
+        reel_stub = {
+            "candidate_id": reel.id,
+            "scene_indices": [],
+            "start_sec": reel.start_sec,
+            "end_sec": reel.end_sec,
+            "duration_sec": reel.duration_sec,
+            "title": reel.title,
+            "hook": reel.hook,
+            "justification": reel.justification or "AI mix",
+            "scores": {
+                "narrative_coherence": int(scores.get("narrative_coherence", 70) or 70),
+                "hook_strength": int(scores.get("hook_strength", 70) or 70),
+                "emotional_payoff": int(scores.get("emotional_payoff", 70) or 70),
+                "standalone_clarity": int(scores.get("standalone_clarity", 70) or 70),
+            },
+            "overall": reel.overall_score,
+            "rank": max(1, reel.rank),
+            "suggested_mood": reel.suggested_mood,
+            "edit_style": reel.edit_style,
+        }
+
     job_row = await enqueue_job(
         db,
         arq,
         project_id=reel.project_id,
         kind="compose",
         function_name="compose_reel_job",
-        function_args=[reel.asset_id, reel_id, config.model_dump()],
+        function_args=[reel.asset_id, reel_id, config.model_dump(), reel_stub],
         config=config,
         asset_id=reel.asset_id,
         reel_id=reel_id,

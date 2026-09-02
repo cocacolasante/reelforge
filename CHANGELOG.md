@@ -5,6 +5,19 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## Unreleased
 
 ### Added
+- **AI Mix** — one reel meshing the best moments from EVERY clip in a
+  project (`docs/mixes.md`). One click on the reels page: mines short
+  moments per clip (Selection v2 generators + prescore), pools them
+  balanced across sources, sequences them into a single arc with ONE
+  multimodal Claude call (`record_mix`, locally validated with a
+  deterministic fallback — a model failure can never fail the render),
+  bakes an editing-style grammar into a multi-source `ReelTimeline`, and
+  renders it inline. Target length 15s–5min, optional Direction prompt,
+  style override. The result is a normal reel — preview, timeline editor,
+  export, publish all work unchanged. New endpoints:
+  `POST/GET /projects/{id}/mixes`; `compose_reel_job` gained a `reel_stub`
+  fallback so mixes re-compose without a reels.json entry (real reels.json
+  lookups stay primary); trim + edit-reset return 400 for `mix-` ids.
 - **Edit Quality v1** — the renderer learned to actually edit
   (`docs/editing-quality.md`): per-shot speed (slow-mo/ramps) and punch-ins,
   eased direction-rotating Ken Burns, 15 transition kinds, per-cut

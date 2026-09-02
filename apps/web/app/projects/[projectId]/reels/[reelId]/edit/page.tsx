@@ -299,14 +299,18 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button
-            variant="outline"
-            onClick={() => setResetOpen(true)}
-            disabled={!edit.data?.has_edits && !dirty}
-          >
-            <RotateCcw className="h-4 w-4" />
-            Reset to AI cut
-          </Button>
+          {/* An AI mix has no scene-derived AI cut to fall back to — the
+              timeline IS the mix (and the API 400s the reset). */}
+          {!reelId.startsWith('mix-') ? (
+            <Button
+              variant="outline"
+              onClick={() => setResetOpen(true)}
+              disabled={!edit.data?.has_edits && !dirty}
+            >
+              <RotateCcw className="h-4 w-4" />
+              Reset to AI cut
+            </Button>
+          ) : null}
           <Button variant="secondary" onClick={() => void doSave()} disabled={!dirty || save.isPending}>
             <Save className="h-4 w-4" />
             {save.isPending ? 'Saving…' : 'Save'}

@@ -11,6 +11,7 @@ from apps.worker.jobs import (
     analyze_asset,
     compile_montage_job,
     compose_reel_job,
+    create_mix_job,
     export_reel_job,
     publish_reel_job,
     select_reels_job,
@@ -73,6 +74,7 @@ class WorkerSettings:
         export_reel_job,
         compile_montage_job,
         publish_reel_job,
+        create_mix_job,
     ]
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
     # Lets the API abort in-flight jobs (e.g. when a source clip is deleted

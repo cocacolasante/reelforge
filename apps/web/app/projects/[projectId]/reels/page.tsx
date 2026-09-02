@@ -3,7 +3,7 @@
 import * as React from 'react';
 import Link from 'next/link';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowRight, Film, Layers } from 'lucide-react';
+import { ArrowRight, Film, Layers, Sparkles } from 'lucide-react';
 import { AppShell } from '@/components/layouts/app-shell';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
@@ -11,6 +11,13 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Slider } from '@/components/ui/slider';
 import { JobProgress } from '@/components/app/job-progress';
 import { useProject } from '@/lib/api/hooks';
@@ -40,6 +47,17 @@ interface ProjectReel {
   source?: string | null;
   opening_description?: string | null;
   edit_style?: string | null;
+}
+
+interface MixOut {
+  id: string;
+  title: string;
+  hook: string;
+  duration_sec: number;
+  suggested_mood: string;
+  edit_style?: string | null;
+  mezzanine_ready: boolean;
+  created_at: string;
 }
 
 interface MontageOut {
@@ -78,6 +96,11 @@ function Body({ projectId }: { projectId: string }) {
     queryFn: () => api<{ montages: MontageOut[] }>(`/projects/${projectId}/montages`),
     refetchOnMount: 'always',
   });
+  const mixesQuery = useQuery({
+    queryKey: ['project-mixes', projectId],
+    queryFn: () => api<{ mixes: MixOut[] }>(`/projects/${projectId}/mixes`),
+    refetchOnMount: 'always',
+  });
 
   if (project.isLoading) {
     return <div className="container py-10"><div className="h-8 w-40 animate-pulse rounded bg-card/40" /></div>;
@@ -87,6 +110,7 @@ function Body({ projectId }: { projectId: string }) {
   }
   const reels = reelsQuery.data?.reels ?? [];
   const montages = montagesQuery.data?.montages ?? [];
+  const mixes = mixesQuery.data?.mixes ?? [];
 
   // Show the skeleton during the initial load AND while a refetch is in
   // flight with nothing to show yet — the cache is often pre-seeded with an
@@ -119,7 +143,7 @@ function Body({ projectId }: { projectId: string }) {
     );
   }
 
-  if (reels.length === 0 && montages.length === 0) {
+  if (reels.length === 0 && montages.length === 0 && mixes.length === 0) {
     return (
       <div className="container py-10">
         <Alert>
@@ -160,6 +184,51 @@ function Body({ projectId }: { projectId: string }) {
           {reelsQuery.data?.asset_count === 1 ? '' : 's'}.
         </p>
       </header>
+
+      {mixes.length > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-primary" />
+              AI mixes
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {mixes.map((m) => (
+              <Link
+                key={m.id}
+                href={`/projects/${projectId}/reels/${m.id}`}
+                className="flex items-center justify-between rounded-lg border bg-card/60 px-4 py-3 transition-colors hover:border-primary/60"
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate font-medium">{m.title}</span>
+                    {m.edit_style ? (
+                      <Badge variant="outline">{m.edit_style.replace('_', ' ')}</Badge>
+                    ) : null}
+                    <Badge variant="muted">{m.suggested_mood}</Badge>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {formatDuration(m.duration_sec)}
+                    {m.hook ? ` · ${m.hook}` : ''}
+                  </div>
+                </div>
+                <Badge variant={m.mezzanine_ready ? 'secondary' : 'muted'}>
+                  {m.mezzanine_ready ? 'ready' : 'working…'}
+                </Badge>
+              </Link>
+            ))}
+          </CardContent>
+        </Card>
+      ) : null}
+
+      <MixBuilder
+        projectId={projectId}
+        assetCount={reelsQuery.data?.asset_count ?? 0}
+        onCreated={() => {
+          void mixesQuery.refetch();
+        }}
+      />
 
       {montages.length > 0 ? (
         <Card>
@@ -257,6 +326,152 @@ function ReelCard({ projectId, reel }: { projectId: string; reel: ProjectReel })
         </CardContent>
       </Card>
     </Link>
+  );
+}
+
+const MIX_STYLES = [
+  ['auto', 'Auto (AI picks)'],
+  ['hype', 'Hype / action'],
+  ['talking_head', 'Talking head'],
+  ['cinematic', 'Cinematic'],
+  ['chill', 'Chill / ambient'],
+  ['classic', 'Classic'],
+] as const;
+
+function MixBuilder({
+  projectId,
+  assetCount,
+  onCreated,
+}: {
+  projectId: string;
+  assetCount: number;
+  onCreated: () => void;
+}) {
+  const [duration, setDuration] = React.useState<number[]>([45]);
+  const [prompt, setPrompt] = React.useState('');
+  const [mixStyle, setMixStyle] = React.useState<string>('auto');
+  const [jobId, setJobId] = React.useState<string | null>(null);
+  const qc = useQueryClient();
+
+  const createMix = useMutation({
+    mutationFn: () =>
+      api<{ id: string }>(`/projects/${projectId}/mixes`, {
+        method: 'POST',
+        body: {
+          target_duration_sec: duration[0],
+          prompt: prompt.trim() || null,
+          style: mixStyle,
+        },
+      }),
+    onSuccess: (job) => {
+      setJobId(job.id);
+      onCreated();
+    },
+  });
+
+  if (assetCount < 2) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Sparkles className="h-4 w-4" />
+            AI mix
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-muted-foreground">
+            Upload and analyze at least two clips to have the AI mesh the best
+            moments across all of them into one reel.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="border-dashed">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-primary" />
+          AI mix
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-sm text-muted-foreground">
+          One click: the AI mines the best short moments from every clip in
+          this project, sequences them into a single arc, and renders it. The
+          result is a normal reel — preview, edit, export, publish.
+        </p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label>Target length: {formatDuration(duration[0])}</Label>
+            <Slider
+              value={duration}
+              min={15}
+              max={300}
+              step={5}
+              onValueChange={setDuration}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label>Style</Label>
+            <Select value={mixStyle} onValueChange={setMixStyle}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {MIX_STYLES.map(([key, label]) => (
+                  <SelectItem key={key} value={key}>
+                    {label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <div className="space-y-1.5">
+          <Label>Direction (optional)</Label>
+          <Input
+            value={prompt}
+            maxLength={500}
+            placeholder='e.g. "focus on the jumps and crashes, high energy"'
+            onChange={(e) => setPrompt(e.target.value)}
+          />
+        </div>
+        {createMix.error ? (
+          <Alert variant="destructive">
+            <AlertDescription>{humanMessage(createMix.error)}</AlertDescription>
+          </Alert>
+        ) : null}
+        <div className="flex items-center gap-3">
+          <Button
+            onClick={() => createMix.mutate()}
+            disabled={createMix.isPending || !!jobId}
+          >
+            <Sparkles className="h-4 w-4" />
+            {createMix.isPending ? 'Queueing…' : 'Create AI mix'}
+          </Button>
+          <span className="text-xs text-muted-foreground">
+            Mines moments from {assetCount} clips, then sequences + renders.
+          </span>
+        </div>
+        {jobId ? (
+          <JobProgress
+            jobId={jobId}
+            variant="compose"
+            onDone={() => {
+              setJobId(null);
+              onCreated();
+              void qc.invalidateQueries({ queryKey: ['project-mixes', projectId] });
+            }}
+            onFail={() => {
+              setJobId(null);
+              onCreated();
+            }}
+          />
+        ) : null}
+      </CardContent>
+    </Card>
   );
 }
 

@@ -93,6 +93,12 @@ async def patch_trim(
     r = await db.get(dbmod.Reel, reel_id)
     if r is None:
         raise ApiError(404, "REEL_NOT_FOUND", f"reel {reel_id} not found")
+    if reel_id.startswith("mix-"):
+        raise ApiError(
+            400,
+            "INVALID_CONFIG",
+            "A mix has no source span to trim — adjust its shots in the editor.",
+        )
 
     new_start_offset = (
         body.trim_start_offset_sec
@@ -438,5 +444,13 @@ async def reset_reel_edit(reel_id: str, db: AsyncSession = Depends(get_db)) -> N
     r = await db.get(dbmod.Reel, reel_id)
     if r is None:
         raise ApiError(404, "REEL_NOT_FOUND", f"reel {reel_id} not found")
+    if reel_id.startswith("mix-"):
+        # A mix IS its timeline; resetting would leave a bogus single-shot
+        # fallback of the primary asset.
+        raise ApiError(
+            400,
+            "INVALID_CONFIG",
+            "A mix is defined by its timeline — edit it instead of resetting.",
+        )
     r.edit_json = None
     await db.commit()

@@ -102,6 +102,10 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
     return <div className="container py-10"><div className="h-8 w-48 animate-pulse rounded bg-card/40" /></div>;
   }
   const r = reel.data;
+  // AI mixes are defined entirely by their timeline: trim offsets and the
+  // "render the AI cut instead" fallback are meaningless (and the API rejects
+  // trim edits for mix- ids).
+  const isMix = reelId.startsWith('mix-');
   const previewSrc = r.mezzanine_ready ? `${API_BASE}/api/v1/reels/${r.id}/preview` : null;
   const mezzanineBytesGuess = 1_500_000; // worst-case default for size estimates before we know
   const cappedDuration = maxDuration?.[0] ?? r.duration_sec;
@@ -171,7 +175,7 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
       ...baseConfig,
       ...trimOffsets,
       photo_inserts,
-      ...(r.has_edits && renderAiCut ? { ignore_edits: true } : {}),
+      ...(r.has_edits && renderAiCut && !isMix ? { ignore_edits: true } : {}),
     };
     try {
       const job = await compose.mutateAsync({ reelId, config });
@@ -364,7 +368,7 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
 
             {/* Max length — hidden for reels too short to meaningfully cap
                 (Radix Slider misbehaves when min > max). */}
-            {r.duration_sec > 6 ? (
+            {!isMix && r.duration_sec > 6 ? (
             <section className="space-y-2">
               <div className="flex items-baseline justify-between">
                 <Label>
@@ -502,7 +506,15 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
               </>
             ) : null}
 
-            {r.has_edits ? (
+            {isMix ? (
+              <Alert>
+                <AlertTitle>AI mix</AlertTitle>
+                <AlertDescription>
+                  This reel is defined by its cross-clip timeline — open the
+                  editor to change shots, transitions, or text.
+                </AlertDescription>
+              </Alert>
+            ) : r.has_edits ? (
               <Alert>
                 <AlertTitle>This reel has edits</AlertTitle>
                 <AlertDescription>
