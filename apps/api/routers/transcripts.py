@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends
@@ -11,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api import db as dbmod
 from apps.api.deps import get_db
 from apps.api.schemas.errors import ApiError
-from reelforge_core.analysis.pipeline import working_dir_for
+from reelforge_core.analysis.pipeline import _load_transcript_json, working_dir_for
 from reelforge_core.models import Transcript
 from reelforge_core.transcript_store import (
     delete_override,
@@ -41,10 +40,14 @@ async def get_transcript(
         raise ApiError(
             404, "ANALYSIS_NOT_READY", f"no transcript available for asset {asset_id}"
         )
-    raw = json.loads(tpath.read_text())
-    if raw.get("transcript") is None:
-        return {"transcript": None, "source": "whisper"}
-    return {"transcript": raw, "source": "whisper"}
+    # Two on-disk shapes (bare dump for speech, {"transcript": null} for
+    # silence) — reading only the wrapper returned null for every clip with
+    # speech.
+    transcript = _load_transcript_json(tpath)
+    return {
+        "transcript": transcript.model_dump() if transcript is not None else None,
+        "source": "whisper",
+    }
 
 
 @router.put("/assets/{asset_id}/transcript")

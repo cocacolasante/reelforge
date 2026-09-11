@@ -117,6 +117,41 @@ def resolve_post_refine_overlaps(
     return kept
 
 
+def enforce_clean_edges(
+    topk: list[RankedReel],
+    reserve: list[RankedReel],
+    config: SelectionConfig,
+    events: list,
+    duration: float,
+) -> list[RankedReel]:
+    """Final gate: a reel whose edge still cuts an action event (the guard
+    couldn't fix it and refinement didn't) is dropped, and open slots are
+    backfilled from `reserve` with clean, non-colliding reels. When nothing
+    clean exists at all the list comes back unchanged — some reels beat none.
+    Pure."""
+    from reelforge_core.reels.events import edge_ok
+
+    if not events:
+        return topk
+
+    def _clean(r: RankedReel) -> bool:
+        return edge_ok(r.start_sec, "start", events, duration) and edge_ok(
+            r.end_sec, "end", events, duration
+        )
+
+    kept = [r for r in topk if _clean(r)]
+    kept_ids = {r.candidate_id for r in kept}
+    for reel in reserve:
+        if len(kept) >= len(topk):
+            break
+        if reel.candidate_id in kept_ids or not _clean(reel):
+            continue
+        if all(overlap_ratio(reel, k) < config.overlap_threshold for k in kept):
+            kept.append(reel)
+            kept_ids.add(reel.candidate_id)
+    return kept if kept else topk
+
+
 def assign_ranks_and_truncate(
     kept: list[RankedReel], top_k: int
 ) -> list[RankedReel]:

@@ -105,9 +105,11 @@ def generate_candidates(
     analysis: AnalysisReport, config: SelectionConfig
 ) -> list[ReelCandidate]:
     """Union over all candidate generators, deduping exact (start_ms, end_ms)
-    collisions — first generator wins. Capped at config.max_candidates
-    (sentence kept first, then scene, then moment; within a generator the
-    survivors are evenly strided through time so coverage stays uniform)."""
+    collisions — first generator wins. With `config.event_guard` every edge is
+    then moved off detected action events (reels/events.py; moved spans get a
+    new identity). Capped at config.max_candidates (sentence kept first, then
+    scene, then moment; within a generator the survivors are evenly strided
+    through time so coverage stays uniform)."""
     # Function-local import: generators import _candidate_id/covering_scenes
     # from this module, so a top-level import would be circular.
     from reelforge_core.reels.generators.moment import generate_moment_candidates
@@ -127,6 +129,10 @@ def generate_candidates(
                 continue
             seen.add(key)
             out.append(c)
+    if config.event_guard:
+        from reelforge_core.reels.events import guard_candidates
+
+        out = guard_candidates(out, analysis, config)
     return _cap_candidates(out, config.max_candidates)
 
 

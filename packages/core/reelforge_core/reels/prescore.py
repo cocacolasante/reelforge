@@ -8,14 +8,21 @@ is deliberately simple and documented so it can be tuned against
 Formula (PRESCORE_VERSION bumps whenever weights change — it is part of the
 ranking resume stamp):
 
-    +25  starts_on_unit_boundary      (opens on a natural speech seam)
-    +15  ends_on_unit_boundary
+    +25  starts_on_unit_boundary      (opens on a speech seam; talky spans only)
+    +15  ends_on_unit_boundary        (talky spans only)
     -40  starts_mid_word              (opens mid-word — the cardinal sin)
     -25  ends_mid_word
     +10 * min(energy_peak_z, 3)       (contains a real event)
     +15  if energy_peak_pos < 0.2     (the event lands early — hook material)
     + 5 * min(n_scene_cuts, 4)        (visual variety)
     +10  if speech_ratio > 0.5        (substantial spoken content)
+    -35  edge_cuts_event              (an edge slices an action event the
+                                       edge guard couldn't fix)
+    +10 * min(events_inside, 2)       (contains whole action events)
+
+"Talky" means speech_ratio >= TALKY_SPEECH_RATIO. On action footage people
+talk before and after the action, so rewarding speech-aligned edges there
+(p1) pulled cuts to right before the wave and right after the fall.
 
 Ties break toward shorter duration (cheaper to fill), then earlier start.
 """
@@ -27,7 +34,7 @@ from dataclasses import asdict, dataclass
 
 from reelforge_core.models import AnalysisReport, ReelCandidate
 
-PRESCORE_VERSION = "p1"
+PRESCORE_VERSION = "p2"
 # A candidate edge within this many seconds of an utterance-unit edge counts
 # as "on" it (scene cuts rarely coincide exactly with word timestamps).
 BOUNDARY_EPS = 0.25
@@ -36,6 +43,9 @@ BOUNDARY_EPS = 0.25
 # not eat the whole shortlist, but the ranker still sees a few variants of a
 # strong moment.
 SHORTLIST_OVERLAP_MAX = 0.85
+# Utterance-boundary bonuses apply only at or above this spoken-time fraction
+# (the talking_head heuristic in compose/styles.py uses the same threshold).
+TALKY_SPEECH_RATIO = 0.4
 
 
 @dataclass(frozen=True)
@@ -50,6 +60,8 @@ class PrescoreFeatures:
     lufs_range: float
     n_scene_cuts: int
     source: str
+    edge_cuts_event: bool = False  # an edge sits in an action event's no-cut window
+    events_inside: int = 0  # action events wholly inside the span
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -59,6 +71,7 @@ def compute_features(
     candidates: list[ReelCandidate], analysis: AnalysisReport
 ) -> dict[str, PrescoreFeatures]:
     """Features for every candidate, sharing one pass over the analysis."""
+    from reelforge_core.reels.events import detect_events, edge_ok, event_inside
     from reelforge_core.reels.features import flatten_words
     from reelforge_core.reels.generators.moment import combined_scores
     from reelforge_core.reels.generators.sentence import build_units
@@ -79,6 +92,7 @@ def compute_features(
     lufs = sorted((p.time_sec, p.lufs) for p in analysis.loudness if p.lufs > -79.9)
     lufs_ts = [t for t, _ in lufs]
     cut_ts = sorted(s.start_sec for s in analysis.scenes)
+    events = detect_events(analysis)
 
     def _near(t: float, edges: list[float]) -> bool:
         i = bisect_left(edges, t)
@@ -121,6 +135,11 @@ def compute_features(
             lufs_range=round(lufs_range, 2),
             n_scene_cuts=n_cuts,
             source=c.source,
+            edge_cuts_event=not (
+                edge_ok(start, "start", events, analysis.duration)
+                and edge_ok(end, "end", events, analysis.duration)
+            ),
+            events_inside=sum(1 for ev in events if event_inside(ev, start, end)),
         )
     return out
 
@@ -128,9 +147,10 @@ def compute_features(
 def prescore(f: PrescoreFeatures) -> float:
     """The documented linear formula. Pure."""
     s = 0.0
-    if f.starts_on_unit_boundary:
+    talky = f.speech_ratio >= TALKY_SPEECH_RATIO
+    if talky and f.starts_on_unit_boundary:
         s += 25.0
-    if f.ends_on_unit_boundary:
+    if talky and f.ends_on_unit_boundary:
         s += 15.0
     if f.starts_mid_word:
         s -= 40.0
@@ -143,6 +163,9 @@ def prescore(f: PrescoreFeatures) -> float:
     s += 5.0 * min(f.n_scene_cuts, 4)
     if f.speech_ratio > 0.5:
         s += 10.0
+    if f.edge_cuts_event:
+        s -= 35.0
+    s += 10.0 * min(f.events_inside, 2)
     return round(s, 3)
 
 

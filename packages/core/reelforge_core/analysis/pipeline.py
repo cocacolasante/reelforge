@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from reelforge_core.analysis.audio import measure_loudness
+from reelforge_core.analysis.audio import LOUDNESS_VERSION, measure_loudness
 from reelforge_core.analysis.scenes import detect_scenes
 from reelforge_core.analysis.semantics import analyze_semantics
 from reelforge_core.analysis.transcribe import transcribe
@@ -74,6 +74,32 @@ def _source_mtime(source: Path) -> float:
         return 0.0
 
 
+def _loudness_stamp(mtime: float) -> dict:
+    # `version` invalidates every loudness.json written before the ebur128
+    # framelog fix (a flat -80 track) — see audio.LOUDNESS_VERSION.
+    return {"source_mtime": mtime, "version": LOUDNESS_VERSION}
+
+
+def _energy_stamp(mtime: float, config: AnalysisConfig) -> dict:
+    # Energy's loudness_delta half is derived from loudness.json, so a
+    # loudness change must recompute energy too.
+    return {
+        "source_mtime": mtime,
+        "sample_fps": config.energy_sample_fps,
+        "loudness_version": LOUDNESS_VERSION,
+    }
+
+
+def _load_transcript_json(path: Path) -> Transcript | None:
+    """transcript.json has two on-disk shapes: transcribe() writes a bare
+    Transcript dump when there is speech and {"transcript": null} when there
+    isn't (voiceover takes use {"transcript": {...}}). Accept both — reading
+    only the wrapper silently dropped every speech transcript on resume."""
+    raw = json.loads(path.read_text())
+    payload = raw.get("transcript") if "transcript" in raw else raw
+    return None if payload is None else Transcript.model_validate(payload)
+
+
 async def analyze(
     asset: MediaAsset,
     config: AnalysisConfig,
@@ -124,11 +150,7 @@ async def analyze(
     }
     transcript: Transcript | None
     if config.resume and _stamp_matches(transcript_path, transcript_stamp):
-        raw = json.loads(transcript_path.read_text())
-        if raw.get("transcript") is None:
-            transcript = None
-        else:
-            transcript = Transcript.model_validate(raw)
+        transcript = _load_transcript_json(transcript_path)
         await progress(ProgressEvent("transcribe", 1.0, compute_overall("transcribe", 1.0)))
         log.info("transcribe: resume cache hit")
     else:
@@ -137,7 +159,7 @@ async def analyze(
 
     # --- loudness --------------------------------------------------------------
     loudness_path = wd / "loudness.json"
-    loudness_stamp = {"source_mtime": mtime}
+    loudness_stamp = _loudness_stamp(mtime)
     loudness: list[LoudnessPoint]
     if config.resume and _stamp_matches(loudness_path, loudness_stamp):
         loudness = [
@@ -153,7 +175,7 @@ async def analyze(
     # Per-second motion + loudness-delta track for the moment-anchored
     # candidate generator. Independent of scenes, so it runs before the split.
     energy_path = wd / "energy.json"
-    energy_stamp = {"source_mtime": mtime, "sample_fps": config.energy_sample_fps}
+    energy_stamp = _energy_stamp(mtime, config)
     energy: list[EnergyPoint]
     await progress(ProgressEvent("energy", 0.0, compute_overall("energy", 0.0)))
     if config.resume and _stamp_matches(energy_path, energy_stamp):

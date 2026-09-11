@@ -50,3 +50,17 @@ def test_empty_bin_becomes_neg80() -> None:
     points = bin_loudness(samples, duration_sec=2.0)
     assert points[0].lufs == -20.0
     assert points[1].lufs == -80.0
+
+
+# ffmpeg 5.1 `framelog=info` line format: a TARGET field sits between t: and
+# M:, and the momentary window reports -120.7 while it fills. The first line
+# is verbatim from a real GoPro run.
+FFMPEG51 = """\
+[Parsed_ebur128_0 @ 0xaaaae8391910] t: 0.0999375  TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS       LRA:   0.0 LU  FTPK: -24.4 dBFS  TPK: -24.4 dBFS
+[Parsed_ebur128_0 @ 0xaaaae8391910] t: 0.499938   TARGET:-23 LUFS    M: -31.4 S:-120.7     I: -31.4 LUFS       LRA:   0.0 LU  FTPK: -20.1 dBFS  TPK: -19.8 dBFS
+"""
+
+
+def test_parser_handles_ffmpeg51_lines_and_clamps_silence_floor() -> None:
+    samples = parse_ebur128_stderr(FFMPEG51.splitlines())
+    assert samples == [(0.0999375, -80.0), (0.499938, -31.4)]

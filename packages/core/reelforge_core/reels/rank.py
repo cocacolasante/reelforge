@@ -74,9 +74,12 @@ SYSTEM_PROMPT_V2 = (
     "piece of footage for a 30-60 second standalone reel (the kind that would "
     "work on TikTok, Instagram Reels, or YouTube Shorts).\n\n"
     "You will receive every viable candidate span at once. Each candidate "
-    "comes as a 3-frame contact sheet (opening frame / energy peak / closing "
-    "frame) followed by its data as JSON: per-scene summaries and tags, "
-    "word-timestamped transcript, per-second energy, and the heuristic "
+    "comes as a 5-frame contact sheet — 2s BEFORE the start / opening frame / "
+    "energy peak / closing frame / 2s AFTER the end; the two outer frames have "
+    "a RED BORDER and are NOT part of the clip (a black tile means the footage "
+    "ends there) — followed by its data as JSON: per-scene summaries and "
+    "tags, word-timestamped transcript plus the words just outside each edge, "
+    "per-second energy, detected action events near it, and the heuristic "
     "features that pre-selected it. Candidates arrive in heuristic prescore "
     "order — treat that order as a weak prior, not the answer.\n\n"
     "You are seeing the whole set: first decide the ORDERING — which would "
@@ -90,15 +93,26 @@ SYSTEM_PROMPT_V2 = (
     "a complete point? A random 45 seconds of B-roll scores low. A clear "
     "setup-development-payoff scores high.\n"
     "- hook_strength: would someone scrolling past stop in the first 2 seconds? "
-    "Judge from the FIRST contact-sheet frame and the opening line. Strong "
+    "Judge from the OPENING frame (second tile) and the opening line. Strong "
     "opening visual, unexpected moment, or compelling question scores high.\n"
     "- emotional_payoff: does the span deliver an emotional or informational "
     "punch? Laughter, revelation, surprise, release of tension all score high.\n"
     "- standalone_clarity: does the span make sense without the surrounding "
     "video? Heavy reliance on prior context scores low.\n\n"
+    "Action footage — where the cut falls matters as much as the content. "
+    "People talk BEFORE the action ('here it comes', 'another one coming') and "
+    "react AFTER it ('it just smashed me'). A candidate whose closing line or "
+    "words_after_end announce something that happens after its end, whose red "
+    "after-end frame shows the wave/jump/fall arriving, or that lists an "
+    "action event as after_end / crosses_end, is missing its payoff: score "
+    "emotional_payoff and narrative_coherence low. One that opens on the "
+    "aftermath (the red before-start frame shows the action, or an event is "
+    "listed as before_start / crosses_start) has a weak hook. The best action "
+    "candidates contain the whole event: build-up, the moment, a beat of "
+    "reaction.\n\n"
     "opening_description: at most 80 characters stating what is LITERALLY on "
-    "screen and said in the first 2 seconds — from the first contact-sheet "
-    "frame and the opening line. No marketing language; describe, don't sell.\n\n"
+    "screen and said in the first 2 seconds — from the opening frame (second "
+    "tile) and the opening line. No marketing language; describe, don't sell.\n\n"
     "content_style: which editing grammar suits this candidate best.\n"
     "- hype: action/sports/high-energy visuals that want fast beat-cut "
     "editing, speed ramps, punch-ins.\n"
@@ -337,13 +351,17 @@ def build_candidate_context(
     features: Any | None = None,
     units: list | None = None,
     energy_z: list[tuple[float, float]] | None = None,
+    events: list | None = None,
 ) -> dict:
-    """The per-candidate JSON the ranker sees (v2).
+    """The per-candidate JSON the ranker sees (v4).
 
     `features` is the candidate's PrescoreFeatures, `units` the asset's
-    utterance units, `energy_z` the asset-wide (time, combined z) series —
-    callers compute each once and share across candidates.
+    utterance units, `energy_z` the asset-wide (time, combined z) series,
+    `events` the asset's detected action events — callers compute each once
+    and share across candidates. The words just outside each edge and the
+    nearby events show the model what a cut there would leave out.
     """
+    from reelforge_core.reels.events import events_near
     scenes = [analysis.scenes[i] for i in candidate.scene_indices]
     # Semantics is keyed by scene_index, which equals the list position; look up safely.
     sem_by_index = {s.scene_index: s for s in analysis.semantics}
@@ -396,9 +414,20 @@ def build_candidate_context(
         "transcript_words": transcript_words,
         "opening_line": opening_line,
         "closing_line": closing_line,
+        "words_before_start": [
+            [t, w] for t, w in _span_words(analysis.transcript, start - OUTSIDE_WORDS_SEC, start)
+        ],
+        "words_after_end": [
+            [t, w] for t, w in _span_words(analysis.transcript, end, end + OUTSIDE_WORDS_SEC)
+        ],
         "energy_series": energy_series,
+        "action_events": events_near(events or [], start, end),
         "prescore_features": features.to_dict() if features is not None else None,
     }
+
+
+# words_before_start / words_after_end reach this far past each edge.
+OUTSIDE_WORDS_SEC = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -615,16 +644,21 @@ async def _rank_once(
     from reelforge_core.reels.generators.moment import combined_scores
     from reelforge_core.reels.generators.sentence import build_units
 
+    from reelforge_core.reels.events import detect_events
+
     units = build_units(analysis.transcript)
     energy_z = combined_scores(analysis)
+    events = detect_events(analysis)
 
     blocks: list[dict] = [
         {
             "type": "text",
             "text": (
                 "Candidates follow in heuristic prescore order (a weak prior, "
-                "not the answer). Each candidate: a 3-frame contact sheet "
-                "(opening / energy peak / closing frame), then its data as JSON."
+                "not the answer). Each candidate: a 5-frame contact sheet "
+                "(before-start / opening / energy peak / closing / after-end; "
+                "the red-bordered outer frames are outside the clip), then its "
+                "data as JSON."
             ),
         }
     ]
@@ -651,6 +685,7 @@ async def _rank_once(
             features=(features or {}).get(c.candidate_id),
             units=units,
             energy_z=energy_z,
+            events=events,
         )
         blocks.append({"type": "text", "text": json.dumps(ctx, indent=2)})
     messages: list[dict] = [{"role": "user", "content": blocks}]

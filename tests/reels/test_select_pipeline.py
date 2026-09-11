@@ -311,8 +311,8 @@ async def test_no_prompt_uses_v2_golden(
     stamp = json.loads(
         (isolated_data_dir / "working" / "aidp2" / "ranking_raw.json.stamp").read_text()
     )
-    assert stamp["ranking_prompt_version"] == "v3"
-    assert stamp["prescore_version"] == "p1"
+    assert stamp["ranking_prompt_version"] == "v4"
+    assert stamp["prescore_version"] == "p2"
     assert set(stamp) == {
         "ranking_model",
         "ranking_prompt_version",

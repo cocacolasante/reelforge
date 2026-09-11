@@ -31,26 +31,42 @@ from reelforge_core.models import (
 
 log = logging.getLogger(__name__)
 
-REFINE_PROMPT_VERSION = "r1"
+REFINE_PROMPT_VERSION = "r3"
 REFINE_WINDOW_SEC = 6.0
 SNAP_MAX_NUDGE_SEC = 0.6
 
 REFINE_SYSTEM_PROMPT = (
     "You are a senior short-form video editor fine-tuning the cut points of "
-    "already-selected reels. For each reel you get its current bounds, the "
-    "word-timestamped transcript around each edge, utterance-boundary times, "
-    "per-second energy, and the reel's hook and opening description.\n\n"
+    "already-selected reels. For each reel you get an 8-frame edge strip — "
+    "3s before the start / 1.5s before / the start / 1.5s in | 1.5s before "
+    "the end / the end / 1.5s after / 3s after; frames with a RED BORDER are "
+    "OUTSIDE the current reel (black = past the footage edge) — then its "
+    "current bounds, the word-timestamped transcript around each edge, "
+    "utterance-boundary times, per-second energy, detected action events near "
+    "the edges (with where each sits relative to the current bounds), and the "
+    "reel's hook and opening description.\n\n"
     "Propose new_start_sec / new_end_sec for each reel:\n"
     "- Move each edge at most 6 seconds from its current position.\n"
     "- Keep the duration within the allowed range given per reel.\n"
-    "- When speech is present, land edges on utterance boundaries — never "
-    "mid-word. Prefer OPENING on the strongest line: if a better hook line "
-    "starts just before or after the current start, move to it.\n"
-    "- Without speech, prefer edges where energy is low (a lull) and keep the "
-    "peak inside the reel, early rather than late.\n"
+    "- ACTION FIRST. Never end a reel during an action event or in the "
+    "seconds before one: if the red after-end frames or the words near the "
+    "end show action coming ('here it comes', 'another one coming'), move the "
+    "end past it and keep about 1.5s of the reaction. Never open mid-event or "
+    "on its aftermath: open about 3s before the event so the build-up is "
+    "visible. A line announcing action is lead-in; a reaction line ('that "
+    "smashed me') is follow-through — it belongs after the action, never in "
+    "place of it.\n"
+    "- If the duration limit won't let the reel contain an event it is heading "
+    "into, end BEFORE that event's build-up — before any line announcing it — "
+    "or move the start later so the event fits. Never end between the "
+    "announcement and the action.\n"
+    "- Never cut mid-word. When the reel is mostly talking, land edges on "
+    "utterance boundaries and prefer OPENING on the strongest line.\n"
+    "- Otherwise prefer edges in a lull.\n"
     "- If the current bounds are already right, return them unchanged.\n\n"
-    "Call the record_refinements tool exactly once with an entry for EVERY "
-    "reel. reason: one short sentence."
+    "Edges that still cut an action event are rejected locally. Call the "
+    "record_refinements tool exactly once with an entry for EVERY reel. "
+    "reason: one short sentence."
 )
 
 RECORD_REFINEMENTS: dict[str, Any] = {
@@ -84,9 +100,11 @@ RECORD_REFINEMENTS: dict[str, Any] = {
 
 
 def build_refinement_context(
-    reel: RankedReel, analysis: AnalysisReport, units: list
+    reel: RankedReel, analysis: AnalysisReport, units: list, events: list | None = None
 ) -> dict:
-    """Everything the model needs to nudge one reel's edges. Pure."""
+    """Everything the model needs to nudge one reel's edges. Pure. `events`
+    are the asset's detected action events."""
+    from reelforge_core.reels.events import events_near
     from reelforge_core.reels.generators.moment import combined_scores
     from reelforge_core.reels.rank import _span_words
 
@@ -118,6 +136,9 @@ def build_refinement_context(
         "unit_boundary_starts": unit_starts,
         "unit_boundary_ends": unit_ends,
         "energy_series": energy,
+        "action_events": events_near(
+            events or [], reel.start_sec, reel.end_sec, margin=REFINE_WINDOW_SEC + 4.0
+        ),
     }
 
 
@@ -131,9 +152,11 @@ def apply_refinement(
     new_end: float,
     analysis: AnalysisReport,
     config: SelectionConfig,
+    events: list | None = None,
 ) -> RankedReel:
     """Validate + apply one refinement. Pure; returns the (possibly
-    unchanged) reel. See module docstring for the rules."""
+    unchanged) reel. See module docstring for the rules. `events` are the
+    asset's detected action events (computed here when omitted)."""
     from reelforge_core.compose.speech_snap import snap_end, snap_start
     from reelforge_core.reels.candidates import covering_scenes
     from reelforge_core.reels.features import flatten_words
@@ -154,6 +177,7 @@ def apply_refinement(
         )
         return reel
 
+    words: list[tuple[float, float]] = []
     if analysis.transcript is not None:
         words = flatten_words(analysis.transcript)
         if _mid_word(start, words):
@@ -162,6 +186,32 @@ def apply_refinement(
         if _mid_word(end, words):
             snapped = min(analysis.duration, snap_end(end, words, SNAP_MAX_NUDGE_SEC))
             end = snapped if not _mid_word(snapped, words) else orig_end
+
+    if config.event_guard:
+        from reelforge_core.reels.events import MAX_GUARD_SHIFT_SEC, detect_events, guard_span
+
+        g = guard_span(
+            start,
+            end,
+            detect_events(analysis) if events is None else events,
+            min_sec=config.effective_min_sec,
+            max_sec=config.effective_max_sec,
+            duration=analysis.duration,
+            words=sorted(words),
+        )
+        # The ±6s window bounds what the MODEL may move; the guard's own
+        # deterministic fix may add up to MAX_GUARD_SHIFT_SEC on top (live
+        # case: a proposal to end past a handstand was clamped mid-event and
+        # the fix — event end + follow-through — landed 13s out).
+        reach = REFINE_WINDOW_SEC + MAX_GUARD_SHIFT_SEC
+        if (
+            g.status == "violation"
+            or abs(g.start - orig_start) > reach
+            or abs(g.end - orig_end) > reach
+        ):
+            log.info("refinement for %s rejected: an edge cuts an action event", reel.candidate_id)
+            return reel
+        start, end = g.start, g.end
 
     if abs(start - orig_start) < 1e-6 and abs(end - orig_end) < 1e-6:
         return reel
@@ -200,11 +250,16 @@ async def refine_reels(
     config: SelectionConfig,
     *,
     client: Any | None = None,
+    strips: dict | None = None,
 ) -> tuple[list[RankedReel], UsageTotals, list[dict]]:
     """One API call refining every reel's bounds. Returns (reels, usage,
-    raw_refinements); on any failure returns the originals untouched."""
+    raw_refinements); on any failure returns the originals untouched.
+    `strips` maps candidate_id -> 8-frame edge-strip JPEG (optional)."""
+    import base64
     import json
+    from pathlib import Path
 
+    from reelforge_core.reels.events import detect_events
     from reelforge_core.reels.generators.sentence import build_units
     from reelforge_core.reels.rank import _accumulate_usage, _call_model
 
@@ -216,12 +271,33 @@ async def refine_reels(
         client = AsyncAnthropic()
 
     units = build_units(analysis.transcript)
-    contexts = [build_refinement_context(r, analysis, units) for r in reels]
-    payload = {
-        "duration_limits_sec": [config.effective_min_sec, config.effective_max_sec],
-        "reels": contexts,
-    }
-    messages = [{"role": "user", "content": json.dumps(payload, indent=2)}]
+    events = detect_events(analysis) if config.event_guard else []
+    blocks: list[dict] = [
+        {
+            "type": "text",
+            "text": (
+                f"duration_limits_sec: [{config.effective_min_sec:g}, "
+                f"{config.effective_max_sec:g}]. {len(reels)} reel(s) follow; each: "
+                "an 8-frame edge strip (when available), then its data as JSON."
+            ),
+        }
+    ]
+    for r in reels:
+        strip = (strips or {}).get(r.candidate_id)
+        if strip is not None:
+            try:
+                data = base64.standard_b64encode(Path(strip).read_bytes()).decode()
+                blocks.append(
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": data},
+                    }
+                )
+            except OSError:
+                log.warning("edge strip unreadable for %s; sending text only", r.candidate_id)
+        ctx = build_refinement_context(r, analysis, units, events)
+        blocks.append({"type": "text", "text": json.dumps(ctx, indent=2)})
+    messages = [{"role": "user", "content": blocks}]
     try:
         resp = await _call_model(
             client,
@@ -255,6 +331,11 @@ def apply_refinements_raw(
         cid = entry.get("candidate_id")
         if cid is not None:
             by_id[cid] = entry
+    events = None
+    if config.event_guard:
+        from reelforge_core.reels.events import detect_events
+
+        events = detect_events(analysis)  # once per selection, not per reel
     out: list[RankedReel] = []
     for reel in reels:
         entry = by_id.get(reel.candidate_id)
@@ -268,6 +349,7 @@ def apply_refinements_raw(
                 float(entry["new_end_sec"]),
                 analysis,
                 config,
+                events,
             )
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("refinement entry for %s malformed: %s", reel.candidate_id, exc)

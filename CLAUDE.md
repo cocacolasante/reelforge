@@ -114,6 +114,13 @@ docker compose logs worker | jq            # structured JSON logs from the worke
   - `analysis/audio_extract.py` — one-shot mono 16 kHz PCM extraction shared by transcribe + loudness.
   - `analysis/transcribe.py` — faster-whisper with VAD + auto device/compute selection.
   - `analysis/audio.py` — ffmpeg `ebur128` → 1-second LUFS bins.
+    **`framelog=info` is load-bearing**: frame lines are logged at the
+    framelog level and `verbose` is hidden at ffmpeg's default loglevel →
+    zero parsed lines → a flat -80 track (shipped that way until 2026-09,
+    blinding energy/moment snapping/scene splitting). Zero parseable lines
+    now raise `LoudnessError`; momentary values clamp at the -80 sentinel;
+    `LOUDNESS_VERSION` is part of the loudness AND energy resume stamps.
+    `tests/test_loudness_pipeline.py` runs real ffmpeg — keep it that way.
   - `analysis/energy.py` — per-second energy track (v2): motion = mean abs
     grey frame diff via SEQUENTIAL decode at `energy_sample_fps` (2.0), using
     the shared helpers in `reelforge_core/vision.py` (also used by
@@ -146,6 +153,29 @@ docker compose logs worker | jq            # structured JSON logs from the worke
     `_default_timeline` in `apps/api/routers/reels.py`. Scene-aligned
     candidates clamp to their own edges (no-op), so pre-v2 behavior is
     byte-identical for them.
+  - `reels/events.py` — action events (activity = max(robust motion z,
+    speech-discounted loudness prominence); hysteresis 3.0/2.0) + the cut
+    guard: no END inside or ≤4s before an event (1.5s follow-through), no
+    START inside, ≤3s before, or ≤1.5s after one. Fixes prefer including the
+    event, stay within 8s and the duration window, never land mid-word;
+    unfixable spans pass through. Applied in `generate_candidates` (moved
+    candidates get a new id), `refine.apply_refinement` (fix outside ±6s →
+    reject) and `mixes/sequencer.validate_sequence` (a trim that re-cuts →
+    revert). `SelectionConfig.event_guard`; debug `events.json`. A no-op on
+    clips with the pre-fix flat loudness track — re-analyze with resume.
+    The models see the events too: prescore p2 (−35 unfixable edge cut,
+    +10/whole event, unit-boundary bonuses only at speech_ratio ≥ 0.4),
+    ranker prompt v4 + refine r2 (red-bordered outside frames,
+    `words_before_start`/`words_after_end`, `action_events` with
+    `event_position`), and the director (d2) reverts nudges that drop event
+    time or re-cut the reel's outer edges. Live-run fixes (2026-09-11):
+    event starts walk back through the visible onset (activity ≥ 1.0, ≤ 3s —
+    detection trailed a rising wave by 4s); all bound comparisons use
+    `BOUND_TOL_SEC` (a reel ending at round(duration, 3) is the file end, not
+    a cut); a moved edge tries BOTH edges of a word it lands in; a guard fix
+    in refinement may reach ±(6 + 8)s; and `dedup.enforce_clean_edges` is
+    the final gate — no top-K reel ships with an edge that cuts an event while
+    a clean reserve reel exists.
   - `reels/evaluate.py` — eval harness: recall@K of `reels.json` against
     hand-labeled picks in `tests/reels/eval/labels/` (mounted into the cli
     service); `./reelforge eval-select`.
@@ -172,12 +202,18 @@ docker compose logs worker | jq            # structured JSON logs from the worke
     The old >80 overlapping-batch path is deleted (first-seen-wins merging
     across batches scored on different scales was never sound); oversize sets
     truncate to the first `LARGE_SET_THRESHOLD` (80) in prescore order.
-  - `reels/contact_sheet.py` — pure sheet command builder: 3 frames
-    (start+0.5 / energy peak / end−0.5) scaled to 180px HEIGHT (fixed height
-    bounds image tokens ≈ w*h/750 across aspects; ~230/sheet), hstacked JPEG
-    q≈75 → `working/{asset_id}/candidates/{candidate_id}.jpg`. Extraction
-    (I/O, parallelism 4, skip-if-exists, best-effort — missing source just
-    means text-only ranking) lives in `reels/pipeline.py`.
+  - `reels/contact_sheet.py` — pure sheet command builder. Contact sheet
+    (ranking + AI-mix): 5 frames — start−2 / start+0.5 / energy peak /
+    end−0.5 / end+2 — the two OUTSIDE frames red-bordered (`drawbox`), black
+    lavfi tiles past the footage edges; edge strip (refinement): 8 frames
+    around the current bounds, outside frames red-bordered. Scaled to 180px
+    HEIGHT (fixed height bounds image tokens ≈ w*h/750 across aspects;
+    ~380/sheet, ~610/strip), hstacked JPEG q≈75 →
+    `working/{asset_id}/candidates/{candidate_id}.{SHEET_VERSION}.jpg` and
+    `edges/{id}_{start_ms}_{end_ms}.{SHEET_VERSION}.jpg`. SHEET_VERSION is in
+    the filename because extraction is skip-if-exists — bump it on any layout
+    change. Rendering (I/O, parallelism 4, best-effort — missing source just
+    means text-only calls) lives in `reels/pipeline.py::_render_sheets`.
   - `reels/refine.py` — CP7 boundary refinement: ONE small API call
     (`record_refinements`, forced tool-use via rank's `_call_model` with
     `tool_name=`) proposing new bounds for the top-K; pure `apply_refinement`
@@ -282,7 +318,12 @@ Per-asset working dir: `/data/working/{asset_id}/`.
 - `semantics.json` — per-scene Claude tool-use result (cached in `/data/reelforge.db`).
 - `analysis.json` — the merged report. **Downstream phases read only this file.**
 
-Resume: each stage checks its `.stamp` matches `(config, source_mtime)` before skipping. Semantics use the SQLite cache keyed on `(asset_id, scene_index, model, prompt_version, thumb_sha256, transcript_slice_sha256)`.
+Resume: each stage checks its `.stamp` matches `(config, source_mtime)` before skipping.
+`transcript.json` has TWO on-disk shapes — a bare `Transcript` dump (speech)
+and a `{"transcript": ...}` wrapper (silent sources, voiceover takes). Read it
+only through `pipeline._load_transcript_json`: until 2026-09 the resume path
+returned None for every bare dump, silently stripping speech from
+analysis.json on `--resume`. Semantics use the SQLite cache keyed on `(asset_id, scene_index, model, prompt_version, thumb_sha256, transcript_slice_sha256)`.
 
 ## Phase 2 artifacts on disk (Selection v2 — see docs/selection.md)
 Same working dir, per asset:

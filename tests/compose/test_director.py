@@ -226,3 +226,65 @@ def test_context_carries_constraints_and_shots():
     assert "cut" in ctx["constraints"]["transition_palette"]
     assert len(ctx["shots"]) == 3 and len(ctx["cuts"]) == 2
     assert ctx["constraints"]["max_nudge_sec"] == 1.5
+    assert ctx["action_events"] == []
+
+
+# ---- action-aware cuts CP2: nudges never cut an action event ----------------
+
+
+def _an_with_event(start_bin: int, end_bin: int):
+    """Flat motion with a burst over [start_bin, end_bin) -> one event there."""
+    from reelforge_core.models import EnergyPoint
+
+    energy = [
+        EnergyPoint(
+            time_sec=i + 0.5,
+            motion=60.0 if start_bin <= i < end_bin else 10.0,
+            loudness_delta=0.0,
+        )
+        for i in range(60)
+    ]
+    return _an().model_copy(update={"energy": energy})
+
+
+def test_nudge_that_trims_away_an_event_is_reverted():
+    plan = EditPlan(
+        style="hype",
+        shots=[PlannedShot(0, 0.0, 3.0), PlannedShot(0, 3.0, 6.0), PlannedShot(0, 6.0, 12.0)],
+        per_cut=[("cut", 0.04), ("cut", 0.04)],
+    )
+    raw = {
+        "shots": [{"index": 2, "nudge_start_sec": 1.5, "reason": "tighter"}],
+        "cuts": [],
+        "hook_text": None,
+    }
+    # Event over [7, 9): moving shot 2's start to 7.5 would drop part of it.
+    new_plan, _, applied = apply_director(plan, raw, _an_with_event(7, 9))
+    assert (new_plan.shots[2].in_ts, new_plan.shots[2].out_ts) == (6.0, 12.0)
+    assert applied == []
+
+
+def test_outer_end_nudged_right_before_an_event_is_reverted():
+    raw = {
+        "shots": [{"index": 2, "nudge_end_sec": 1.0, "reason": "let it breathe"}],
+        "cuts": [],
+        "hook_text": None,
+    }
+    # Event over [14, 16): ending at 11 cuts off its build-up.
+    new_plan, _, _ = apply_director(_plan(), raw, _an_with_event(14, 16))
+    assert new_plan.shots[2].out_ts == 10.0
+
+
+def test_nudges_clear_of_events_still_apply():
+    raw = {
+        "shots": [{"index": 1, "nudge_start_sec": -0.5, "reason": "open earlier"}],
+        "cuts": [],
+        "hook_text": None,
+    }
+    new_plan, _, _ = apply_director(_plan(), raw, _an_with_event(14, 16))
+    assert (new_plan.shots[1].in_ts, new_plan.shots[1].out_ts) == (2.5, 6.0)
+
+
+def test_context_lists_action_events():
+    ctx = build_director_context(_plan("hype"), _reel([0], 0.0, 10.0), _an_with_event(14, 16), None)
+    assert [e["where"] for e in ctx["action_events"]] == ["after_end"]

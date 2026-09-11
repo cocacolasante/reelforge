@@ -5,6 +5,32 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## Unreleased
 
 ### Added
+- **Action-aware cuts — live-run fixes.** A real selection on surf footage
+  exposed four gaps, now closed: detected event starts trailed a rising wave
+  by up to 4s (starts now walk back through the visible onset); a reel
+  ending at the rounded file duration was treated as cutting the wipeout it
+  contained (10ms bound tolerance); a mid-word pull-back could leave no
+  legal end (both word edges are tried); and an unfixable event-cutting
+  reel could still reach the top 5 — a final gate
+  (`dedup.enforce_clean_edges`) now backfills its slot with a clean reel,
+  and guard fixes in refinement may reach past the model's ±6s window.
+  Refinement prompt r3: when an event won't fit, end before its build-up
+  and announcing line, never in between.
+- **Action-aware cuts — the models can see the action.** Contact sheets now
+  include a red-bordered frame 2s before and 2s after each candidate, and the
+  ranker sees the words just outside each edge plus nearby action events
+  (prompt v4) — so "we got another one coming" at the end of a clip reads as
+  a missing payoff. Boundary refinement gets an 8-frame edge strip, event
+  context and action-first rules (r2). Prescore p2 only rewards
+  speech-aligned edges on talky spans, penalizes edges the guard couldn't
+  fix, and rewards whole events. The edit-director (d2) can no longer nudge
+  a shot into an event.
+- **Action-aware cuts — event guard.** Selection detects action events from
+  motion + loudness (`reels/events.py`) and moves candidate edges, boundary
+  refinements and AI-mix trims so no cut lands inside an event, right before
+  one, or right after one — the reels that ended just before a wave hit or
+  opened after the wipeout. Debug artifact `events.json`;
+  `SelectionConfig.event_guard` toggles it.
 - **AI Mix** — one reel meshing the best moments from EVERY clip in a
   project (`docs/mixes.md`). One click on the reels page: mines short
   moments per clip (Selection v2 generators + prescore), pools them
@@ -80,6 +106,25 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `POST /assets/{id}/select` returns 422 `INVALID_CONFIG` for invalid bodies
   (e.g. prompt over 500 chars) instead of a 500.
 
+
+### Fixed
+- **Loudness analysis was silently broken — every bin read -80 (silence)
+  for every clip.** ebur128 ran with `framelog=verbose`, whose per-frame
+  lines sit below ffmpeg's default log level, so the parser saw nothing.
+  Everything built on loudness was blind: the energy track's audio half
+  (wave crashes, splashes, shouts), moment edge-snapping, and loudness-dip
+  scene splitting. Now `framelog=info`; zero parseable lines fail analysis
+  loudly instead of writing a flat track; the loudness + energy resume
+  stamps carry `LOUDNESS_VERSION` so `analyze --resume` recomputes them
+  while scenes, transcripts and semantics stay cached. Re-analyze existing
+  clips to pick it up.
+- **`analyze --resume` silently stripped speech from analysis.json.**
+  `transcribe()` writes a bare `Transcript` dump when there is speech, but
+  the resume reader only understood the `{"transcript": ...}` wrapper, so
+  every resumed run loaded `transcript=None` — and re-ran semantics with
+  empty transcript slices. Both shapes now load via
+  `pipeline._load_transcript_json`; affected clips are repaired by another
+  resume run (the original semantics cache rows still match).
 
 ## [0.7.0] — 2026-04-22
 

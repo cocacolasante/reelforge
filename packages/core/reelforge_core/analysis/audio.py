@@ -26,6 +26,12 @@ log = logging.getLogger(__name__)
 
 EBUR128_LINE = re.compile(r"t:\s*([\d.]+)\s+.*?M:\s*(-?[\d.]+|-inf)")
 NEG_INF = -80.0
+# Part of the loudness AND energy resume stamps (analysis/pipeline.py) — bump
+# whenever loudness.json changes meaning. "l2" invalidates every track written
+# before the framelog fix below, all of which were a flat -80.
+LOUDNESS_VERSION = "l2"
+# Audio shorter than this may legitimately produce no ebur128 frame lines.
+MIN_PARSEABLE_AUDIO_SEC = 1.0
 
 
 def bin_loudness(
@@ -51,7 +57,7 @@ def bin_loudness(
 
 
 def parse_ebur128_stderr(stream: Iterable[str]) -> list[tuple[float, float]]:
-    """Parse ffmpeg -filter_complex ebur128 verbose lines to `(t, momentary_lufs)`."""
+    """Parse ffmpeg ebur128 per-frame log lines to `(t, momentary_lufs)`."""
     out: list[tuple[float, float]] = []
     for line in stream:
         m = EBUR128_LINE.search(line)
@@ -59,7 +65,10 @@ def parse_ebur128_stderr(stream: Iterable[str]) -> list[tuple[float, float]]:
             continue
         t = float(m.group(1))
         raw = m.group(2)
-        lufs = NEG_INF if raw == "-inf" else float(raw)
+        # ebur128 reports -120.7 for digital silence and while its 400 ms
+        # window fills; clamp to the -80 sentinel so silence is one value
+        # (energy.py treats <= -79.9 as silence) and can't drag bin means.
+        lufs = NEG_INF if raw == "-inf" else max(NEG_INF, float(raw))
         out.append((t, lufs))
     return out
 
@@ -72,7 +81,10 @@ def _run_ebur128(wav_path: Path, log_path: Path) -> None:
         "-i",
         str(wav_path),
         "-filter_complex",
-        "ebur128=peak=true:framelog=verbose",
+        # framelog=info is load-bearing: per-frame lines are logged AT the
+        # framelog level, and `verbose` sits below ffmpeg's default loglevel —
+        # the parser then sees zero lines and every bin becomes -80.
+        "ebur128=peak=true:framelog=info",
         "-f",
         "null",
         "-",
@@ -109,6 +121,13 @@ async def measure_loudness(
         samples: list[tuple[float, float]] = []
         with log_path.open("r", encoding="utf-8", errors="replace") as f:
             samples = parse_ebur128_stderr(f)
+        if not samples and asset.probe.duration_s >= MIN_PARSEABLE_AUDIO_SEC:
+            # Never write a flat -80 track for audio that exists: it silently
+            # blinds energy, moment edge-snapping and scene splitting. The log
+            # stays on disk for forensics.
+            raise LoudnessError(
+                f"ebur128 emitted no parseable lines for {asset.path} (log: {log_path})"
+            )
         points = bin_loudness(samples, asset.probe.duration_s)
         log_path.unlink(missing_ok=True)
         return points

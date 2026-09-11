@@ -139,7 +139,7 @@ def test_features_scene_cuts_and_lufs_range_exclude_sentinel():
 
 
 def test_prescore_mid_word_start_ranks_below_clean():
-    clean = prescore(_features(starts_on_unit_boundary=True))
+    clean = prescore(_features(starts_on_unit_boundary=True, speech_ratio=0.45))
     dirty = prescore(_features(starts_mid_word=True))
     assert clean == 25.0
     assert dirty == -40.0
@@ -276,3 +276,32 @@ async def test_rank_truncates_oversize_sets_instead_of_batching() -> None:
     # First-in-order (prescore order) candidates survive.
     assert cand_blocks[0]["candidate_id"] == "c000"
     assert len(result.reels) == LARGE_SET_THRESHOLD
+
+
+# ---- action-aware cuts CP2 (p2) ---------------------------------------------
+
+
+def test_unit_boundary_bonus_only_for_talky_spans():
+    """On action footage speech brackets the action — speech-aligned edges
+    there are exactly the cuts that land right before/after it."""
+    edges = dict(starts_on_unit_boundary=True, ends_on_unit_boundary=True)
+    assert prescore(_features(**edges, speech_ratio=0.2)) == 0.0
+    assert prescore(_features(**edges, speech_ratio=0.4)) == 40.0
+
+
+def test_edge_cutting_an_event_is_penalized_and_whole_events_rewarded():
+    assert prescore(_features(edge_cuts_event=True)) == -35.0
+    assert prescore(_features(events_inside=1)) == 10.0
+    assert prescore(_features(events_inside=5)) == 20.0  # capped at 2
+
+
+def test_features_flag_event_cuts_and_count_whole_events():
+    analysis = make_analysis("f5", [60.0])
+    energy = [
+        EnergyPoint(time_sec=i + 0.5, motion=60.0 if i in (30, 31) else 10.0, loudness_delta=0.0)
+        for i in range(60)
+    ]
+    analysis = analysis.model_copy(update={"energy": energy})  # one event over [30, 32)
+    feats = compute_features([_cand("cuts", 5.0, 29.0), _cand("whole", 20.0, 40.0)], analysis)
+    assert feats["cuts"].edge_cuts_event and feats["cuts"].events_inside == 0
+    assert not feats["whole"].edge_cuts_event and feats["whole"].events_inside == 1

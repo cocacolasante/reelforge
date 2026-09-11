@@ -40,7 +40,7 @@ from reelforge_core.models import (
 
 log = logging.getLogger(__name__)
 
-DIRECTOR_PROMPT_VERSION = "d1"
+DIRECTOR_PROMPT_VERSION = "d2"
 NUDGE_MAX_SEC = 1.5
 PUNCH_IN_MAX = 1.5
 HOOK_TEXT_MAX = 40
@@ -86,7 +86,9 @@ DIRECTOR_SYSTEM_PROMPT = (
     "edit — empty lists are a perfectly good answer.\n\n"
     "You may:\n"
     "- nudge a shot's start/end by up to 1.5s (e.g. open a beat earlier on "
-    "the action, end before it fizzles);\n"
+    "the action, end before it fizzles) — but never into an action event or "
+    "the seconds just before one (see action_events): the reel must keep the "
+    "whole event, and such nudges are discarded;\n"
     "- change a cut's transition WITHIN the style palette given to you;\n"
     "- set a shot's speed (only values from the allowed set) or a punch-in "
     "(1.0-1.5) where the content earns it;\n"
@@ -161,10 +163,16 @@ def build_director_context(
     beat_grid: BeatGrid | None,
 ) -> dict:
     """The JSON the director sees. Pure."""
+    from reelforge_core.reels.events import detect_events, events_near
     from reelforge_core.reels.generators.moment import combined_scores
     from reelforge_core.reels.rank import _span_words
 
     energy = combined_scores(analysis)
+    action_events = (
+        events_near(detect_events(analysis), plan.shots[0].in_ts, plan.shots[-1].out_ts)
+        if plan.shots
+        else []
+    )
     sem_by_idx = {s.scene_index: s for s in analysis.semantics}
     bounds = STYLE_BOUNDS.get(plan.style, STYLE_BOUNDS["classic"])
     shots = []
@@ -200,6 +208,7 @@ def build_director_context(
             "opening_description": reel.opening_description,
         },
         "beat_bpm": round(beat_grid.bpm, 1) if beat_grid else None,
+        "action_events": action_events,
         "shots": shots,
         "cuts": [
             {"index": i, "kind": c[0] if c else "reel-default", "duration_sec": c[1] if c else None}
@@ -221,9 +230,30 @@ def apply_director(
     per_cut = list(plan.per_cut)
     applied: list[str] = []
     words = flatten_words(analysis.transcript) if analysis.transcript else []
+    from reelforge_core.reels.events import detect_events, edge_ok
+
+    events = detect_events(analysis)
 
     def _mid_word(t: float) -> bool:
         return any(ws < t < we for ws, we in words)
+
+    def _cuts_event(i: int, s: PlannedShot, new_in: float, new_out: float) -> bool:
+        """Trimming a shot drops source time — never part of an action event —
+        and the reel's outer edges keep an event's build-up / follow-through."""
+        dropped = []
+        if new_in > s.in_ts:
+            dropped.append((s.in_ts, new_in))
+        if new_out < s.out_ts:
+            dropped.append((new_out, s.out_ts))
+        if any(lo < ev.end_sec and ev.start_sec < hi for lo, hi in dropped for ev in events):
+            return True
+        if i == 0 and new_in != s.in_ts and not edge_ok(new_in, "start", events, analysis.duration):
+            return True
+        return (
+            i == len(shots) - 1
+            and new_out != s.out_ts
+            and not edge_ok(new_out, "end", events, analysis.duration)
+        )
 
     for entry in raw.get("shots", []) or []:
         try:
@@ -242,6 +272,10 @@ def apply_director(
                     new_in = max(0.0, snap_start(new_in, words, 0.6))
                 if _mid_word(new_out):
                     new_out = min(analysis.duration, snap_end(new_out, words, 0.6))
+            if events and (new_in, new_out) != (s.in_ts, s.out_ts) and _cuts_event(
+                i, s, new_in, new_out
+            ):
+                new_in, new_out = s.in_ts, s.out_ts  # keep the whole event
             speed = entry.get("speed")
             speed = float(speed) if speed is not None else s.speed
             if speed not in bounds["speeds"]:

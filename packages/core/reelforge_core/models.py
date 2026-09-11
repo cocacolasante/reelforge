@@ -259,13 +259,17 @@ class SelectionConfig(BaseModel):
     # Best-effort boundary refinement of the top-K (one extra small API call);
     # failures keep the unrefined bounds.
     refine: bool = True
+    # Move candidate / refined / mix-trim edges off detected action events
+    # (reels/events.py) so a cut never lands right before a wave hits or right
+    # after the fall.
+    event_guard: bool = True
     # MMR diversity strength in overall-score points (0 disables). Halved when
     # a prompt is set — the user asked for a theme, don't fight it.
     diversity_lambda: float = Field(default=8.0, ge=0)
     top_k: int = 10
     overlap_threshold: float = 0.5
     ranking_model: str = "claude-sonnet-4-5"
-    ranking_prompt_version: str = "v3"
+    ranking_prompt_version: str = "v4"
     temperature: float = 0.0
     resume: bool = False
     # Natural-language direction, e.g. "clips of falls", "make it feel intense".

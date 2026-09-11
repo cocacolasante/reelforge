@@ -274,3 +274,36 @@ async def test_pipeline_refine_resume_cache_hit(
         pytest.approx(new_end),
     )
     assert third.anthropic_usage["input_tokens"] == 0
+
+
+# ---- action-aware cuts CP2: event context + edge strips ----------------------
+
+
+def test_refinement_context_lists_action_events_near_edges():
+    from reelforge_core.reels.events import ActionEvent
+    from reelforge_core.reels.generators.sentence import build_units
+
+    analysis = make_analysis("rf8", [40.0, 40.0])
+    reel = _reel_from(analysis, 20.0, 55.0)
+    events = [
+        ActionEvent(start_sec=57.0, end_sec=60.0, peak_sec=58.5, strength=5.0),
+        ActionEvent(start_sec=12.0, end_sec=13.0, peak_sec=12.5, strength=4.0),
+    ]
+    ctx = build_refinement_context(reel, analysis, build_units(analysis.transcript), events)
+    assert [e["where"] for e in ctx["action_events"]] == ["after_end", "before_start"]
+
+
+async def test_refine_reels_sends_edge_strips_as_images(tmp_path: Path):
+    from reelforge_core.reels.refine import refine_reels
+
+    analysis = make_analysis("rf9", [100.0], with_audio=False)
+    reel = _reel_from(analysis, 30.0, 70.0)
+    strip = tmp_path / "strip.jpg"
+    strip.write_bytes(b"\xff\xd8\xff\xe0fakejpg")
+    client = FakeRankingClient(script=[])
+    await refine_reels([reel], analysis, SelectionConfig(), client=client, strips={"r1": strip})
+    blocks = client.refine_calls[0]["messages"][0]["content"]
+    assert [b["type"] for b in blocks] == ["text", "image", "text"]
+    assert "duration_limits_sec" in blocks[0]["text"]
+    ctx = json.loads(blocks[2]["text"])
+    assert ctx["candidate_id"] == "r1" and "action_events" in ctx

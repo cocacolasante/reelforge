@@ -141,7 +141,8 @@ async def _refine_step(
         raw = json.loads(raw_path.read_text()).get("refinements", [])
         return apply_refinements_raw(final, raw, analysis, config), UsageTotals()
 
-    refined, usage, raw = await refine_reels(final, analysis, config)
+    strips = await _extract_edge_strips(final, analysis, wd)
+    refined, usage, raw = await refine_reels(final, analysis, config, strips=strips)
     if raw:  # persist only successful calls so a failure retries next run
         write_json_atomic(
             raw_path, {"refinements": raw, "usage": usage.model_dump()}
@@ -165,40 +166,74 @@ async def _extract_contact_sheets(
     """candidate_id -> sheet path for every candidate whose sheet could be
     produced. Best-effort: a missing source or a failed extraction just means
     that candidate is ranked text-only."""
-    import asyncio
-
-    from reelforge_core.compose.graph import run_ffmpeg
     from reelforge_core.reels.contact_sheet import (
-        build_contact_sheet_command,
+        SHEET_OUTSIDE,
+        SHEET_VERSION,
         sheet_frame_times,
     )
 
-    source = Path(analysis.source_path)
-    if not source.exists():
-        log.warning("contact sheets skipped: source missing at %s", source)
-        return {}
     sheets_dir = wd / "candidates"
-    sheets_dir.mkdir(parents=True, exist_ok=True)
-    sem = asyncio.Semaphore(4)
-
-    async def _one(c: ReelCandidate) -> tuple[str, Path] | None:
-        out = sheets_dir / f"{c.candidate_id}.jpg"
-        if out.exists():
-            return c.candidate_id, out
+    jobs = []
+    for c in candidates:
         f = features.get(c.candidate_id)
         times = sheet_frame_times(
-            c.start_sec, c.end_sec, getattr(f, "energy_peak_pos", None)
+            c.start_sec, c.end_sec, getattr(f, "energy_peak_pos", None), analysis.duration
         )
-        cmd = build_contact_sheet_command(source, times, out)
+        out = sheets_dir / f"{c.candidate_id}.{SHEET_VERSION}.jpg"
+        jobs.append((c.candidate_id, times, SHEET_OUTSIDE, out))
+    return await _render_sheets(jobs, analysis, "contact sheet")
+
+
+async def _extract_edge_strips(
+    reels: list[RankedReel], analysis: AnalysisReport, wd: Path
+) -> dict[str, Path]:
+    """candidate_id -> 8-frame edge strip around each reel's CURRENT bounds, for
+    boundary refinement. Best-effort, like contact sheets."""
+    from reelforge_core.reels.contact_sheet import (
+        SHEET_VERSION,
+        STRIP_OUTSIDE,
+        edge_strip_times,
+    )
+
+    strips_dir = wd / "edges"
+    jobs = []
+    for r in reels:
+        name = f"{r.candidate_id}_{round(r.start_sec * 1000)}_{round(r.end_sec * 1000)}"
+        times = edge_strip_times(r.start_sec, r.end_sec, analysis.duration)
+        jobs.append((r.candidate_id, times, STRIP_OUTSIDE, strips_dir / f"{name}.{SHEET_VERSION}.jpg"))
+    return await _render_sheets(jobs, analysis, "edge strip")
+
+
+async def _render_sheets(
+    jobs: list[tuple[str, list, tuple, Path]], analysis: AnalysisReport, label: str
+) -> dict[str, Path]:
+    """Render (key, frame times, outside tile indices, out path) jobs, skipping
+    files that already exist; parallelism 4; failures are logged and skipped."""
+    import asyncio
+
+    from reelforge_core.compose.graph import run_ffmpeg
+    from reelforge_core.reels.contact_sheet import build_contact_sheet_command
+
+    source = Path(analysis.source_path)
+    if not source.exists():
+        log.warning("%ss skipped: source missing at %s", label, source)
+        return {}
+    sem = asyncio.Semaphore(4)
+
+    async def _one(key: str, times: list, outside: tuple, out: Path) -> tuple[str, Path] | None:
+        if out.exists():
+            return key, out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        cmd = build_contact_sheet_command(source, times, out, outside=outside)
         try:
             async with sem:
                 await asyncio.to_thread(run_ffmpeg, cmd, timeout_sec=120)
         except Exception as exc:
-            log.warning("contact sheet failed for %s: %s", c.candidate_id, exc)
+            log.warning("%s failed for %s: %s", label, key, exc)
             return None
-        return c.candidate_id, out
+        return key, out
 
-    results = await asyncio.gather(*(_one(c) for c in candidates))
+    results = await asyncio.gather(*(_one(*job) for job in jobs))
     return dict(r for r in results if r is not None)
 
 
@@ -220,6 +255,11 @@ async def select_reels(
     await progress(_emit("candidates", 0.0))
     candidates = generate_candidates(analysis, config)
     write_json_atomic(wd / "candidates.json", [c.model_dump() for c in candidates])
+    if config.event_guard:
+        from reelforge_core.reels.events import detect_events
+
+        # Debug artifact: the action events the edge guard steered around.
+        write_json_atomic(wd / "events.json", [e.to_dict() for e in detect_events(analysis)])
     await progress(_emit("candidates", 1.0))
     log.info(
         "selection: %d candidates from %d scenes",
@@ -371,6 +411,14 @@ async def select_reels(
         # Refined edges can newly collide; drop the lower-ordered reel and
         # backfill from the post-MMR reserve.
         final = resolve_post_refine_overlaps(final, reserve, config)
+    if config.event_guard:
+        from reelforge_core.reels.dedup import enforce_clean_edges
+        from reelforge_core.reels.events import detect_events
+
+        # Final gate: no reel ships with an edge that still cuts an event.
+        final = enforce_clean_edges(
+            final, reserve, config, detect_events(analysis), analysis.duration
+        )
     final = assign_ranks_and_truncate(final, config.top_k)
     await progress(_emit("dedup", 1.0))
 

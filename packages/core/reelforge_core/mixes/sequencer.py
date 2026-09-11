@@ -21,7 +21,7 @@ from reelforge_core.models import MOOD_VALUES, AnalysisReport, UsageTotals
 
 log = logging.getLogger(__name__)
 
-MIX_PROMPT_VERSION = "m1"
+MIX_PROMPT_VERSION = "m2"
 TRIM_MAX_SEC = 1.0
 MIN_SHOT_SEC = 0.5
 MIN_SEQUENCE_LEN = 3
@@ -40,8 +40,11 @@ STYLE_ENUM = ("classic", "hype", "talking_head", "cinematic", "chill")
 MIX_SYSTEM_PROMPT = (
     "You are a senior short-form editor building ONE reel from highlight "
     "moments mined across SEVERAL source videos of the same project.\n\n"
-    "You will receive every candidate moment: a 3-frame contact sheet plus "
-    "its data (which source video, bounds, transcript, energy, features).\n\n"
+    "You will receive every candidate moment: a 5-frame contact sheet (2s "
+    "BEFORE the moment / start / peak / end / 2s AFTER — the red-bordered "
+    "outer frames are NOT part of the moment; black = past the footage edge) "
+    "plus its data (which source video, bounds, transcript, energy, "
+    "features).\n\n"
     "Sequence a reel with a real arc: open on the strongest hook, build "
     "variety and momentum, land on the payoff. Interleave source videos "
     "when it improves variety or continuity — do not simply play each video "
@@ -165,6 +168,18 @@ def validate_sequence(
             )
         return words_cache[aid]
 
+    events_cache: dict[str, list] = {}
+
+    def _events(aid: str) -> list:
+        # Mined bounds were already moved off action events; a ±1s trim must
+        # not re-cut one (reels/events.py).
+        if aid not in events_cache:
+            from reelforge_core.reels.events import detect_events
+
+            a = analyses.get(aid)
+            events_cache[aid] = detect_events(a) if a is not None else []
+        return events_cache[aid]
+
     entries: list[tuple[MinedMoment, float, float]] = []
     seen: set[str] = set()
     reasons: list[str] = []
@@ -196,6 +211,14 @@ def validate_sequence(
                     in_ts = max(0.0, snap_start(in_ts, w, 0.6))
                 if any(ws < out_ts < we for ws, we in w):
                     out_ts = min(dur_limit, snap_end(out_ts, w, 0.6))
+            evs = _events(m.asset_id)
+            if evs:
+                from reelforge_core.reels.events import edge_ok
+
+                if not edge_ok(in_ts, "start", evs, dur_limit):
+                    in_ts = m.candidate.start_sec
+                if not edge_ok(out_ts, "end", evs, dur_limit):
+                    out_ts = m.candidate.end_sec
             if out_ts - in_ts < MIN_SHOT_SEC:
                 continue
             if _dup_of_kept(m.asset_id, in_ts, out_ts):
@@ -331,8 +354,9 @@ async def sequence_mix(
                 f"Target duration: {target_sec:.0f}s. "
                 f"{len(pool)} candidate moments from "
                 f"{len({m.asset_id for m in pool})} source videos follow, in "
-                "balanced prescore order (a weak prior). Each: contact sheet "
-                "(start / peak / end frames), then its data."
+                "balanced prescore order (a weak prior). Each: a 5-frame "
+                "contact sheet (the red-bordered outer frames lie outside the "
+                "moment), then its data."
             ),
         }
     ]

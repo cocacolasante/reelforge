@@ -114,6 +114,9 @@ async def test_pipeline_resume_uses_cache(
         "semantics should have been fully cache-hit on resume"
     )
     assert all(s.cached for s in second_report.semantics)
+    # Resume must carry the transcript through unchanged (it used to come back
+    # None for any clip with speech).
+    assert second_report.transcript == first_report.transcript
 
     for name, mtime in snapshots.items():
         assert (wd / name).stat().st_mtime == mtime, (

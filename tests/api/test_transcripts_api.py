@@ -59,6 +59,38 @@ async def test_get_transcript_from_whisper(api_client, isolated_data_dir: Path) 
 
 
 @pytest.mark.asyncio
+async def test_get_transcript_from_whisper_with_speech(
+    api_client, isolated_data_dir: Path
+) -> None:
+    """transcribe() writes a BARE Transcript dump for clips with speech — the
+    endpoint used to return null for exactly the clips that have a transcript."""
+    _pid, aid = await _seed_asset(api_client)
+    wd = working_dir_for(aid)
+    transcript = {
+        "language": "en",
+        "language_probability": 0.99,
+        "duration": 30.0,
+        "segments": [
+            {
+                "start": 1.0,
+                "end": 2.0,
+                "text": " Here it comes.",
+                "words": [
+                    {"start": 1.0, "end": 1.3, "word": " Here", "probability": 0.9},
+                    {"start": 1.3, "end": 1.5, "word": " it", "probability": 0.9},
+                    {"start": 1.5, "end": 2.0, "word": " comes.", "probability": 0.9},
+                ],
+            }
+        ],
+    }
+    write_json_atomic(wd / "transcript.json", transcript)
+    r = await api_client.get(f"/api/v1/assets/{aid}/transcript")
+    assert r.status_code == 200
+    assert r.json()["source"] == "whisper"
+    assert r.json()["transcript"] == transcript
+
+
+@pytest.mark.asyncio
 async def test_put_transcript_saves_override(api_client, isolated_data_dir: Path) -> None:
     _pid, aid = await _seed_asset(api_client)
     transcript = {
