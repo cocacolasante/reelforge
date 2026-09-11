@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { Plus, FolderOpen } from 'lucide-react';
 import { AppShell } from '@/components/layouts/app-shell';
+import { DeleteProjectButton } from '@/components/app/delete-project-dialog';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
@@ -88,27 +89,33 @@ function ProjectList() {
   return (
     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
       {data.projects.map((p) => (
-        <Link
-          key={p.id}
-          href={`/projects/${p.id}`}
-          className="group rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <Card className="h-full transition-colors group-hover:border-primary/60">
-            <CardHeader>
-              <CardTitle>{p.name}</CardTitle>
-            </CardHeader>
-            <CardContent className="text-sm text-muted-foreground">
-              <div>Created {formatTimestamp(p.created_at)}</div>
-              {p.source_asset_id ? (
-                <div className="mt-1 text-xs text-emerald-400/80">has source</div>
-              ) : (
-                <div className="mt-1 text-xs text-muted-foreground/70">
-                  no source yet
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </Link>
+        // The delete button sits beside the card link, not inside it — a
+        // button nested in an anchor would navigate on click.
+        <div key={p.id} className="group relative">
+          <Link
+            href={`/projects/${p.id}`}
+            className="block h-full rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <Card className="h-full transition-colors group-hover:border-primary/60">
+              <CardHeader className="pr-12">
+                <CardTitle>{p.name}</CardTitle>
+              </CardHeader>
+              <CardContent className="text-sm text-muted-foreground">
+                <div>Created {formatTimestamp(p.created_at)}</div>
+                {p.source_asset_id ? (
+                  <div className="mt-1 text-xs text-emerald-400/80">has source</div>
+                ) : (
+                  <div className="mt-1 text-xs text-muted-foreground/70">
+                    no source yet
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </Link>
+          <div className="absolute right-2 top-2">
+            <DeleteProjectButton project={p} compact />
+          </div>
+        </div>
       ))}
     </div>
   );

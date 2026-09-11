@@ -42,6 +42,123 @@ async def test_delete_project(api_client) -> None:
 
 
 @pytest.mark.asyncio
+async def test_delete_project_removes_everything_in_it(api_client) -> None:
+    """Every row hanging off the project — including a published reel, which
+    used to trip the reels foreign key — plus each clip's files and any
+    half-finished upload parts are gone."""
+    import apps.api.settings as settings_mod
+    from apps.api import db as dbmod
+
+    r = await api_client.post("/api/v1/projects", json={"name": "del-project"})
+    pid = r.json()["id"]
+    data_dir = settings_mod.settings.data_dir
+    aids = ["a" * 64, "b" * 64]
+    files = []
+    async with dbmod.db_state.sessionmaker() as session:
+        for i, aid in enumerate(aids):
+            upload = data_dir / "uploads" / f"{aid}.mp4"
+            upload.parent.mkdir(parents=True, exist_ok=True)
+            upload.write_bytes(b"x" * 64)
+            working = data_dir / "working" / aid
+            (working / "reels" / f"reel-p{i}").mkdir(parents=True, exist_ok=True)
+            (working / "analysis.json").write_text("{}")
+            outputs = data_dir / "outputs" / aid
+            outputs.mkdir(parents=True, exist_ok=True)
+            (outputs / "mp4_h264_social.mp4").write_bytes(b"y" * 64)
+            files += [upload, working, outputs]
+            session.add(
+                dbmod.Asset(
+                    id=aid,
+                    project_id=pid,
+                    path=str(upload),
+                    original_filename=f"clip{i}.mp4",
+                    duration_sec=60,
+                    width=1920,
+                    height=1080,
+                    fps=30,
+                    has_audio=True,
+                    size_bytes=64,
+                    probe_json="{}",
+                )
+            )
+        parts = data_dir / "upload_parts" / "sess-del"
+        parts.mkdir(parents=True, exist_ok=True)
+        (parts / "part-00000").write_bytes(b"z")
+        files.append(parts)
+        session.add(
+            dbmod.UploadSession(
+                id="sess-del",
+                project_id=pid,
+                filename="third.mp4",
+                content_type="video/mp4",
+                total_bytes=10,
+                chunk_size=5,
+                parts_dir=str(parts),
+            )
+        )
+        session.add(dbmod.Job(id="job-p-run", kind="analyze", project_id=pid, asset_id=aids[0], status="running"))
+        session.add(dbmod.Job(id="job-p-done", kind="select", project_id=pid, asset_id=aids[1], status="done"))
+        await session.commit()
+    # Separate commits: exports/publications need their reel rows to exist.
+    async with dbmod.db_state.sessionmaker() as session:
+        for i, aid in enumerate(aids):
+            session.add(
+                dbmod.Reel(
+                    id=f"reel-p{i}",
+                    project_id=pid,
+                    asset_id=aid,
+                    rank=1,
+                    title="t",
+                    hook="h",
+                    justification="j",
+                    start_sec=0.0,
+                    end_sec=30.0,
+                    duration_sec=30.0,
+                    overall_score=70,
+                    suggested_mood="neutral",
+                    scene_indices_json="[0]",
+                    scores_json='{"narrative_coherence":70,"hook_strength":70,"emotional_payoff":70,"standalone_clarity":70}',
+                )
+            )
+        await session.commit()
+    async with dbmod.db_state.sessionmaker() as session:
+        session.add(dbmod.Export(id="exp-p0", reel_id="reel-p0", preset_id="mp4_h264_social"))
+        session.add(
+            dbmod.Publication(
+                id="pub-p0", reel_id="reel-p0", platform="youtube", preset_id="mp4_h264_social", title="t"
+            )
+        )
+        await session.commit()
+
+    r = await api_client.delete(f"/api/v1/projects/{pid}")
+    assert r.status_code == 204, r.text
+
+    assert (await api_client.get(f"/api/v1/projects/{pid}")).status_code == 404
+    async with dbmod.db_state.sessionmaker() as session:
+        for model, key in (
+            (dbmod.Asset, aids[0]),
+            (dbmod.Asset, aids[1]),
+            (dbmod.Reel, "reel-p0"),
+            (dbmod.Reel, "reel-p1"),
+            (dbmod.Export, "exp-p0"),
+            (dbmod.Publication, "pub-p0"),
+            (dbmod.Job, "job-p-run"),
+            (dbmod.Job, "job-p-done"),
+            (dbmod.UploadSession, "sess-del"),
+        ):
+            assert await session.get(model, key) is None, (model.__name__, key)
+    for f in files:
+        assert not f.exists(), f
+
+
+@pytest.mark.asyncio
+async def test_delete_project_404_when_missing(api_client) -> None:
+    r = await api_client.delete("/api/v1/projects/does-not-exist")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
+
+
+@pytest.mark.asyncio
 async def test_health_endpoint(api_client) -> None:
     r = await api_client.get("/health")
     assert r.status_code == 200

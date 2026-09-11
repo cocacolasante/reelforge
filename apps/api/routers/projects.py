@@ -11,7 +11,7 @@ from typing import Optional
 
 from arq.connections import ArqRedis
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api import db as dbmod
@@ -104,19 +104,78 @@ async def get_project(project_id: str, db: AsyncSession = Depends(get_db)) -> Pr
     return _to_project_out(p)
 
 
+async def _abort_live_jobs(db: AsyncSession, arq: ArqRedis, scope, reason: str) -> None:
+    """Best-effort abort of the queued/running jobs matching `scope`, marking
+    their rows failed. Deleting mid-processing is the common case (a clip turns
+    out to be wrong), and without the abort FFmpeg/Whisper keep burning CPU on
+    files that are about to disappear."""
+    live_jobs = (
+        await db.execute(
+            select(dbmod.Job).where(scope, dbmod.Job.status.in_(("queued", "running")))
+        )
+    ).scalars().all()
+    for job in live_jobs:
+        try:
+            from arq.jobs import Job as ArqJob
+
+            await asyncio.wait_for(
+                ArqJob(job.id, redis=arq).abort(timeout=0.1), timeout=2.0
+            )
+        except Exception:
+            # Abort is best-effort: the worker may not be running, or may not
+            # have abort enabled. The DB row below still reflects reality.
+            log.info("could not abort job %s (%s)", job.id, reason)
+        job.status = "failed"
+        job.error_message = reason
+        job.finished_at = datetime.now(timezone.utc)
+
+
+async def _remove_paths(paths: list[Path], what: str) -> None:
+    """Delete files/dirs off the event loop, best-effort. Call AFTER the
+    commit so a failed DB delete never half-removes data."""
+
+    def _rm_all() -> None:
+        for target in paths:
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - best-effort cleanup
+                log.warning("could not remove %s during %s", target, what)
+
+    await asyncio.to_thread(_rm_all)
+
+
 @router.delete("/projects/{project_id}", status_code=204)
 async def delete_project(
-    project_id: str, db: AsyncSession = Depends(get_db)
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    arq: ArqRedis = Depends(get_arq),
 ) -> None:
+    """Remove a project and everything in it — `delete_asset` for every clip
+    at once: stop its jobs, drop every row that hangs off it, delete the
+    clips' files and any half-finished upload parts."""
     p = await db.get(dbmod.Project, project_id)
     if p is None:
         raise ApiError(404, "PROJECT_NOT_FOUND", f"project {project_id} not found")
-    # Collect filesystem targets BEFORE deleting the rows that point at them.
+    name = p.name
     assets = (
         await db.execute(
             select(dbmod.Asset).where(dbmod.Asset.project_id == project_id)
         )
     ).scalars().all()
+    asset_ids = [a.id for a in assets]
+    job_scope = dbmod.Job.project_id == project_id
+    if asset_ids:
+        job_scope = or_(job_scope, dbmod.Job.asset_id.in_(asset_ids))
+
+    # 1. Stop anything still running.
+    await _abort_live_jobs(db, arq, job_scope, "project deleted")
+
+    # 2. Collect file targets before the rows that name them are gone.
+    from apps.api.settings import settings
+
     sessions = (
         await db.execute(
             select(dbmod.UploadSession).where(
@@ -124,8 +183,6 @@ async def delete_project(
             )
         )
     ).scalars().all()
-    from apps.api.settings import settings
-
     paths_to_remove: list[Path] = []
     for a in assets:
         paths_to_remove.append(settings.data_dir / "working" / a.id)
@@ -135,17 +192,15 @@ async def delete_project(
         if s.parts_dir:
             paths_to_remove.append(Path(s.parts_dir))
 
-    # Cascade: delete dependent rows first (SQLite FK cascade isn't reliable
-    # across SQLModel versions without ON DELETE CASCADE DDL).
-    await db.execute(
-        delete(dbmod.Export).where(
-            dbmod.Export.reel_id.in_(
-                select(dbmod.Reel.id).where(dbmod.Reel.project_id == project_id)
-            )
-        )
-    )
+    # 3. Cascade the rows, children first (SQLite FK cascade isn't reliable
+    # across SQLModel versions without ON DELETE CASCADE DDL). Publications
+    # reference reels too — skipping them made deleting a project with a
+    # published reel fail on the foreign key.
+    reel_ids = select(dbmod.Reel.id).where(dbmod.Reel.project_id == project_id)
+    await db.execute(delete(dbmod.Publication).where(dbmod.Publication.reel_id.in_(reel_ids)))
+    await db.execute(delete(dbmod.Export).where(dbmod.Export.reel_id.in_(reel_ids)))
     await db.execute(delete(dbmod.Reel).where(dbmod.Reel.project_id == project_id))
-    await db.execute(delete(dbmod.Job).where(dbmod.Job.project_id == project_id))
+    await db.execute(delete(dbmod.Job).where(job_scope))
     await db.execute(
         delete(dbmod.UploadSession).where(dbmod.UploadSession.project_id == project_id)
     )
@@ -153,20 +208,10 @@ async def delete_project(
     await db.delete(p)
     await db.commit()
 
-    # Remove the project's files off the event loop. Runs after the commit so
-    # a failed DB delete never half-removes data; multi-GB uploads make this
-    # worth doing properly rather than leaking forever.
-    def _rm_all(paths: list[Path]) -> None:
-        for target in paths:
-            try:
-                if target.is_dir():
-                    shutil.rmtree(target, ignore_errors=True)
-                else:
-                    target.unlink(missing_ok=True)
-            except OSError:  # pragma: no cover - best-effort cleanup
-                log.warning("could not remove %s during project delete", target)
-
-    await asyncio.to_thread(_rm_all, paths_to_remove)
+    # 4. Remove files after the commit; multi-GB uploads make this worth doing
+    # properly rather than leaking forever.
+    await _remove_paths(paths_to_remove, "project delete")
+    log.info("deleted project %s (%s) with %d asset(s)", project_id, name, len(assets))
 
 
 @router.get(
@@ -213,28 +258,7 @@ async def delete_asset(
         raise ApiError(404, "ASSET_NOT_FOUND", f"asset {asset_id} not found")
 
     # 1. Stop anything running on this asset.
-    live_jobs = (
-        await db.execute(
-            select(dbmod.Job).where(
-                dbmod.Job.asset_id == asset_id,
-                dbmod.Job.status.in_(("queued", "running")),
-            )
-        )
-    ).scalars().all()
-    for job in live_jobs:
-        try:
-            from arq.jobs import Job as ArqJob
-
-            await asyncio.wait_for(
-                ArqJob(job.id, redis=arq).abort(timeout=0.1), timeout=2.0
-            )
-        except Exception:
-            # Abort is best-effort: the worker may not be running, or may not
-            # have abort enabled. The DB row below still reflects reality.
-            log.info("could not abort job %s for deleted asset", job.id)
-        job.status = "failed"
-        job.error_message = "asset deleted"
-        job.finished_at = datetime.now(timezone.utc)
+    await _abort_live_jobs(db, arq, dbmod.Job.asset_id == asset_id, "asset deleted")
 
     # 2. Collect file targets before the rows that name them are gone.
     from apps.api.settings import settings
@@ -296,17 +320,7 @@ async def delete_asset(
     await db.commit()
 
     # 4. Remove files off the event loop, after the commit.
-    def _rm_all(paths: list[Path]) -> None:
-        for target in paths:
-            try:
-                if target.is_dir():
-                    shutil.rmtree(target, ignore_errors=True)
-                else:
-                    target.unlink(missing_ok=True)
-            except OSError:  # pragma: no cover - best-effort cleanup
-                log.warning("could not remove %s during asset delete", target)
-
-    await asyncio.to_thread(_rm_all, paths_to_remove)
+    await _remove_paths(paths_to_remove, "asset delete")
     log.info("deleted asset %s (%s)", asset_id, asset.original_filename)
 
 

@@ -61,7 +61,13 @@ export function useDeleteProject() {
   return useMutation({
     mutationFn: (projectId: string) =>
       api<void>(`/projects/${projectId}`, { method: 'DELETE' }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['projects'] }),
+    onSuccess: (_data, projectId) => {
+      // Drop the deleted project's cached views so nothing refetches a 404.
+      for (const key of ['project', 'assets', 'project-reels', 'project-mixes', 'project-montages']) {
+        qc.removeQueries({ queryKey: [key, projectId] });
+      }
+      return qc.invalidateQueries({ queryKey: ['projects'] });
+    },
   });
 }
 

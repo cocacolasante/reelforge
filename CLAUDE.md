@@ -662,11 +662,18 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   → delete the asset row → `rmtree` working/outputs + the upload file off the
   event loop. Deleting mid-analysis is the common case (clip too big/wrong),
   so skipping the abort leaves FFmpeg burning CPU on a deleted file.
-- **API: `DELETE /projects/{id}` leaves files on disk.** DB rows are
-  cascaded manually (SQLite FK DELETE CASCADE isn't reliable across SQLModel
-  versions without explicit DDL). Files under `/data/working/...` and
-  `/data/outputs/...` are NOT deleted. Full wipe = `rm -rf ./data/working
-  ./data/outputs` on the host.
+- **API: `DELETE /projects/{id}` removes everything in the project** — the
+  same sequence as `DELETE /assets/{id}` for every clip at once (shared
+  `_abort_live_jobs` / `_remove_paths` helpers): abort live jobs →
+  publications → exports → reels → jobs → upload sessions → assets → the
+  project row, commit, then rmtree each clip's working/outputs dirs, the
+  uploaded source files and upload parts. Rows are cascaded manually
+  (SQLite FK DELETE CASCADE isn't reliable across SQLModel versions without
+  explicit DDL) — a new table referencing reels/assets must be added to BOTH
+  deletes, or the foreign key fails the request (publications once did).
+  `anthropic_usage` rows are kept for cost history. UI: trash button on the
+  home page project cards + "Delete project" in the project header
+  (`components/app/delete-project-dialog.tsx`).
 - **API: no Alembic.** Phase 5 uses `SQLModel.metadata.create_all()` plus a
   one-shot legacy-jobs-table drop. When schema evolution matters, layer
   Alembic in (Phase 7 polish).

@@ -5,6 +5,12 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## Unreleased
 
 ### Added
+- **Delete projects from the UI.** A trash button on each project card and
+  a "Delete project" button in the project header open a confirmation that
+  lists what goes (clips, footage size, reels, renders, exports, mixes).
+  `DELETE /projects/{id}` now matches clip deletion: running jobs are
+  aborted first, and publications are removed with their reels — a project
+  with a published reel previously failed to delete on the foreign key.
 - **Action-aware cuts — live-run fixes.** A real selection on surf footage
   exposed four gaps, now closed: detected event starts trailed a rising wave
   by up to 4s (starts now walk back through the visible onset); a reel

@@ -8,6 +8,7 @@ import { ArrowRight, Plus, Sparkles, Trash2, Wand2 } from 'lucide-react';
 import { AppShell } from '@/components/layouts/app-shell';
 import { Uploader } from '@/components/app/uploader';
 import { JobProgress } from '@/components/app/job-progress';
+import { DeleteProjectButton } from '@/components/app/delete-project-dialog';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -151,12 +152,17 @@ function ProjectDetail({ projectId }: { projectId: string }) {
             {project.data?.name}
           </h1>
         </div>
-        {reelCount > 0 ? (
-          <Button onClick={() => router.push(`/projects/${projectId}/reels`)}>
-            View {reelCount} reel{reelCount === 1 ? '' : 's'}
-            <ArrowRight className="h-4 w-4" />
-          </Button>
-        ) : null}
+        <div className="flex flex-wrap items-center gap-2">
+          {reelCount > 0 ? (
+            <Button onClick={() => router.push(`/projects/${projectId}/reels`)}>
+              View {reelCount} reel{reelCount === 1 ? '' : 's'}
+              <ArrowRight className="h-4 w-4" />
+            </Button>
+          ) : null}
+          {project.data ? (
+            <DeleteProjectButton project={project.data} onDeleted={() => router.push('/')} />
+          ) : null}
+        </div>
       </header>
 
       {/* Source clips */}
