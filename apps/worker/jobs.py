@@ -176,6 +176,9 @@ async def select_reels_job(
         "reels_path": str(reels_path),
         "asset_id": asset_id,
         "reel_count": len(selection.reels),
+        # Lets the UI tell "nothing matched your direction" (candidates were
+        # ranked and all rejected) from "nothing to rank at all".
+        "candidates_generated": selection.candidates_generated,
     }
     await db.record_job_success(job_id, result)
     await write_terminal(redis, job_id, "done", "done")
@@ -608,6 +611,8 @@ async def create_mix_job(
     from dataclasses import replace as _dc_replace
 
     from reelforge_core.mixes.mining import (
+        LONG_FORM_THRESHOLD_SEC,
+        dedupe_overlap_for,
         mine_moments,
         moment_bounds_for,
         pool_moments,
@@ -659,7 +664,12 @@ async def create_mix_job(
         # ----- mine + pool -----
         await _phase(0.05, "mining moments")
         bounds = moment_bounds_for(target_sec)
-        per_asset = {aid: mine_moments(a, bounds) for aid, a in usable.items()}
+        overlap = dedupe_overlap_for(target_sec)
+        long_form = target_sec > LONG_FORM_THRESHOLD_SEC
+        per_asset = {
+            aid: mine_moments(a, bounds, overlap, fit_short_clips=long_form)
+            for aid, a in usable.items()
+        }
         pool = pool_moments(per_asset)
         if len(pool) < 3:
             raise RuntimeError(
@@ -734,7 +744,18 @@ async def create_mix_job(
 
         # ----- plan + persist -----
         await _phase(0.18, "planning the edit")
-        timeline = plan_mix(seq.shots, analyses, style, beat_grid)
+        envelopes = None
+        if style == "talking_head":
+            import asyncio as _asyncio
+
+            from reelforge_core.compose.silence import load_speech_envelope
+
+            # Measured silence for the jump cuts (transcript gaps otherwise).
+            envelopes = {
+                aid: await _asyncio.to_thread(load_speech_envelope, working_dir_for(aid) / "audio.wav")
+                for aid in analyses
+            }
+        timeline = plan_mix(seq.shots, analyses, style, beat_grid, envelopes)
         update_mix_reel(
             mix_id,
             edit_json=timeline.model_dump_json(),  # paths are empty (API-style)
@@ -806,4 +827,101 @@ async def create_mix_job(
     await db.record_job_success(job_id, result)
     await write_terminal(redis, job_id, "done", "done")
     log.info("create_mix_job done", extra=extra)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# suggest_broll_job (AI B-roll suggestions for the timeline editor)
+# ---------------------------------------------------------------------------
+
+
+async def suggest_broll_job(
+    ctx: dict,
+    project_id: str,
+    reel_id: str,
+    timeline: dict,
+    videos: list,  # [(asset_id, filename)] — every project video
+    photos: list,  # [(asset_id, filename, path)]
+    prompt: str | None = None,
+) -> dict:
+    """One AI call proposing B-roll layers for an edited timeline. The result
+    (validated suggestions + an optional note) rides the job row; nothing is
+    written to the reel — the editor accepts or rejects each suggestion."""
+    import asyncio as _asyncio
+
+    from reelforge_core.broll.suggest import (
+        PhotoSource,
+        VideoSource,
+        photo_thumbnail,
+        suggest_broll,
+    )
+    from reelforge_core.models import AnalysisReport, ComposeConfig, ReelTimeline
+    from reelforge_core.transcript_store import load_override_sync
+
+    job_id = ctx["job_id"]
+    redis = ctx["redis"]
+    extra = {"job_id": job_id, "project_id": project_id, "reel_id": reel_id}
+    log.info("suggest_broll_job start", extra=extra)
+    await db.record_job_start(job_id, kind="broll", asset_id=None)
+    model = ComposeConfig().director_model
+    try:
+        tl = ReelTimeline.model_validate(timeline)
+        video_sources: list[VideoSource] = []
+        transcripts: dict = {}
+        for aid, filename in videos:
+            wd = working_dir_for(aid)
+            ap = wd / "analysis.json"
+            if not ap.exists():
+                continue
+            try:
+                rep = AnalysisReport.model_validate_json(ap.read_text())
+            except Exception:
+                log.warning("unreadable analysis.json for %s; skipping", aid, extra=extra)
+                continue
+            video_sources.append(VideoSource(aid, filename, rep, wd))
+            try:
+                override = await _asyncio.to_thread(load_override_sync, aid)
+            except Exception:
+                override = None
+            # Same precedence as captions: a user-edited transcript wins.
+            transcripts[aid] = override or rep.transcript
+        photo_sources = [
+            PhotoSource(
+                aid,
+                filename,
+                await _asyncio.to_thread(photo_thumbnail, Path(path), working_dir_for(aid)),
+            )
+            for aid, filename, path in photos
+        ]
+        res = await suggest_broll(
+            tl, video_sources, photo_sources, transcripts, model=model, prompt=prompt
+        )
+        if res.usage.input_tokens:
+            try:
+                await record_anthropic_usage(
+                    job_id=job_id,
+                    model=model,
+                    input_tokens=res.usage.input_tokens,
+                    output_tokens=res.usage.output_tokens,
+                    project_id=project_id,
+                )
+            except Exception:  # pragma: no cover
+                log.exception("failed to record broll usage", extra=extra)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        log.error("suggest_broll_job failed: %s", exc, extra=extra, exc_info=True)
+        await db.record_job_failure(job_id, str(exc), tb)
+        await write_terminal(redis, job_id, "error", str(exc))
+        raise
+
+    result = {
+        "reel_id": reel_id,
+        "suggestions": res.suggestions,
+        "note": res.note,
+        "input_tokens": res.usage.input_tokens,
+        "output_tokens": res.usage.output_tokens,
+    }
+    await db.record_job_success(job_id, result)
+    await write_terminal(redis, job_id, "done", "done")
+    log.info("suggest_broll_job done: %d suggestion(s)", len(res.suggestions), extra=extra)
     return result

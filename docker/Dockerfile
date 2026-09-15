@@ -9,6 +9,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg libass9 fontconfig fonts-inter \
         curl ca-certificates tini \
+        # mediapipe's native library links libEGL/libGLES even for CPU
+        # inference; opencv-contrib-python (non-headless) needs libGL.
+        libegl1 libgles2 libgl1 \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home --uid 1000 --shell /bin/bash reelforge
 ENTRYPOINT ["/usr/bin/tini", "--"]
@@ -39,6 +42,14 @@ RUN chmod +x /usr/local/bin/reelforge /usr/local/bin/api-entrypoint.sh /usr/loca
     && bash /app/assets/music/synthesize_placeholders.sh /app/assets/music \
     # Synthesize the bundled LUTs (warm/cool/cinematic/vivid). ~460 KB total.
     && bash /app/assets/luts/synthesize_luts.sh /app/assets/luts \
+    # MediaPipe face landmarker for eye-contact correction (~3.7 MB, pinned).
+    && mkdir -p /app/assets/models \
+    && curl -fsSL -o /app/assets/models/face_landmarker.task \
+        https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task \
+    # Haar face cascade for auto-reframe: the opencv-contrib-python 5 wheel
+    # ships CascadeClassifier but no cv2/data XMLs (BSD, pinned tag).
+    && curl -fsSL -o /app/assets/models/haarcascade_frontalface_default.xml \
+        https://raw.githubusercontent.com/opencv/opencv/4.10.0/data/haarcascades/haarcascade_frontalface_default.xml \
     && chown -R reelforge:reelforge /data /models /app
 USER reelforge
 ENV PATH="/app/.venv/bin:/usr/local/bin:$PATH" \

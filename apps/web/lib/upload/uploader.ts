@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { create } from 'zustand';
 import { api, API_BASE } from '@/lib/api/client';
-import { APIError } from '@/lib/api/errors';
+import { APIError, humanMessage } from '@/lib/api/errors';
 import {
   AssetSchema,
   UploadSessionSchema,
@@ -73,6 +73,56 @@ function uploadContentType(file: File): string {
 
 type ChunkState = 'idle' | 'uploading' | 'done' | 'failed';
 
+/** One file's result within a multi-file batch. */
+export interface UploadOutcome {
+  name: string;
+  assetId?: string;
+  /** Set when the file was skipped (rejected up front, or cancelled). */
+  error?: string;
+}
+
+/** Why a file can't be uploaded at all, or null when it looks fine. The server
+ * (ffprobe) is still the real gate; this catches the obvious cases before a
+ * multi-GB transfer. */
+export function validateFile(file: File): APIError | null {
+  if (isUnsupportedPhoto(file)) {
+    return new APIError(
+      'UPLOAD_UNSUPPORTED_TYPE',
+      400,
+      `“${file.name}” is an Apple HEIC photo, which can't be decoded yet. ` +
+        `In Photos use File → Export → Export Photo and choose JPEG, or ` +
+        `switch Settings → Camera → Formats to “Most Compatible”.`,
+    );
+  }
+  if (!looksLikeVideo(file) && !looksLikePhoto(file)) {
+    return new APIError(
+      'UPLOAD_UNSUPPORTED_TYPE',
+      400,
+      `“${file.name}” doesn't look like a video or photo (type ${
+        file.type || 'unknown'
+      }). Video: MP4, MOV, M4V, WebM, MKV, AVI, MTS/M2TS. ` +
+        `Photos: JPEG, PNG, WebP, GIF, TIFF.`,
+    );
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    return new APIError(
+      'UPLOAD_TOO_LARGE',
+      413,
+      `“${file.name}” is ${(file.size / 1024 ** 3).toFixed(1)} GB — the ` +
+        `limit is 5 GB. Trim the clip first, or raise MAX_UPLOAD_GB in .env.`,
+    );
+  }
+  if (file.size === 0) {
+    return new APIError(
+      'UPLOAD_UNSUPPORTED_TYPE',
+      400,
+      `“${file.name}” is empty (0 bytes). If it lives on a camera card or ` +
+        `cloud drive, copy it to local disk first.`,
+    );
+  }
+  return null;
+}
+
 export interface UploaderStatusSnapshot {
   status:
     | 'idle'
@@ -96,6 +146,12 @@ export interface UploaderStatusSnapshot {
   chunkStates: Record<number, ChunkState>;
   error: APIError | null;
   asset: Asset | null;
+  // Multi-file uploads: files wait here and go one at a time through the
+  // single-upload machinery above (sessions, chunk pool, resume).
+  queue: File[];
+  /** Files in the current batch, accepted + rejected. */
+  batchTotal: number;
+  finished: UploadOutcome[];
 }
 
 interface InternalState extends UploaderStatusSnapshot {
@@ -124,6 +180,9 @@ const initial = (): InternalState => ({
   chunkStates: {},
   error: null,
   asset: null,
+  queue: [],
+  batchTotal: 0,
+  finished: [],
   pauseRequested: false,
   abortControllers: {},
   running: false,
@@ -171,6 +230,30 @@ export function resetUploaderStore(projectId: string): void {
   if (snap.status === 'uploading' || snap.status === 'creatingSession') return;
   for (const ac of Object.values(snap.abortControllers)) ac.abort();
   snap.reset();
+}
+
+const ACTIVE_STATUSES = new Set([
+  'creatingSession',
+  'uploading',
+  'pausing',
+  'paused',
+  'resuming',
+  'completing',
+  'failed',
+]);
+
+/** Whether the project's uploader has something the user must still see: a
+ * batch in flight or queued, a failed upload awaiting retry, or reasons for
+ * skipped files. Pages use it to keep the uploader mounted — hiding it once
+ * the project has its first clip used to vanish the panel mid-batch. */
+export function useUploaderActive(projectId: string): boolean {
+  return storeFor(projectId)(
+    (s) =>
+      s.running ||
+      s.queue.length > 0 ||
+      ACTIVE_STATUSES.has(s.status) ||
+      s.finished.some((o) => o.error),
+  );
 }
 
 // ---------- helpers ----------
@@ -311,57 +394,12 @@ export function useUploader(projectId: string) {
   }, [projectId]);
 
   function selectFile(file: File) {
-    if (isUnsupportedPhoto(file)) {
-      store.setState({
-        status: 'failed',
-        error: new APIError(
-          'UPLOAD_UNSUPPORTED_TYPE',
-          400,
-          `“${file.name}” is an Apple HEIC photo, which can't be decoded yet. ` +
-            `In Photos use File → Export → Export Photo and choose JPEG, or ` +
-            `switch Settings → Camera → Formats to “Most Compatible”.`,
-        ),
-      });
+    const invalid = validateFile(file);
+    if (invalid) {
+      store.setState({ status: 'failed', error: invalid });
       return;
     }
-    if (!looksLikeVideo(file) && !looksLikePhoto(file)) {
-      store.setState({
-        status: 'failed',
-        error: new APIError(
-          'UPLOAD_UNSUPPORTED_TYPE',
-          400,
-          `“${file.name}” doesn't look like a video or photo (type ${
-            file.type || 'unknown'
-          }). Video: MP4, MOV, M4V, WebM, MKV, AVI, MTS/M2TS. ` +
-            `Photos: JPEG, PNG, WebP, GIF, TIFF.`,
-        ),
-      });
-      return;
-    }
-    if (file.size > MAX_UPLOAD_BYTES) {
-      store.setState({
-        status: 'failed',
-        error: new APIError(
-          'UPLOAD_TOO_LARGE',
-          413,
-          `“${file.name}” is ${(file.size / 1024 ** 3).toFixed(1)} GB — the ` +
-            `limit is 5 GB. Trim the clip first, or raise MAX_UPLOAD_GB in .env.`,
-        ),
-      });
-      return;
-    }
-    if (file.size === 0) {
-      store.setState({
-        status: 'failed',
-        error: new APIError(
-          'UPLOAD_UNSUPPORTED_TYPE',
-          400,
-          `“${file.name}” is empty (0 bytes). If it lives on a camera card or ` +
-            `cloud drive, copy it to local disk first.`,
-        ),
-      });
-      return;
-    }
+    windowRef.current = [];
     store.setState({
       status: 'idle',
       file,
@@ -408,10 +446,25 @@ export function useUploader(projectId: string) {
       });
       await runChunkPool(session.received_chunk_indices);
     } catch (err) {
+      const apiErr = err instanceof APIError ? err : new APIError('NETWORK_ERROR', 0, String(err));
+      if (!store.getState().uploadId) {
+        // Failed before any bytes went up (the server refused the session, or
+        // the network dropped): nothing to resume, so record it as skipped and
+        // keep the batch moving instead of stalling the queue.
+        store.setState((state) => ({
+          running: false,
+          status: 'idle',
+          file: null,
+          error: null,
+          finished: [...state.finished, { name: snap.file!.name, error: humanMessage(apiErr) }],
+        }));
+        advance();
+        return;
+      }
       store.setState({
         running: false,
         status: 'failed',
-        error: err instanceof APIError ? err : new APIError('NETWORK_ERROR', 0, String(err)),
+        error: apiErr,
       });
     }
   }
@@ -479,6 +532,52 @@ export function useUploader(projectId: string) {
     }
   }
 
+  /** True while a file is mid-transfer (or paused / waiting on a retry) —
+   * new files queue behind it instead of starting. */
+  function busy(): boolean {
+    const snap = store.getState();
+    if (snap.running) return true;
+    if (['creatingSession', 'uploading', 'pausing', 'paused', 'resuming', 'completing'].includes(snap.status)) {
+      return true;
+    }
+    return snap.status === 'failed' && !!snap.uploadId;
+  }
+
+  /** Start the next queued file, if nothing is in flight. */
+  function advance(): boolean {
+    const snap = store.getState();
+    if (busy() || snap.queue.length === 0) return false;
+    const [next, ...rest] = snap.queue;
+    store.setState({ queue: rest });
+    selectFile(next);
+    void start();
+    return true;
+  }
+
+  /** Add files to the batch. Files that can't be uploaded are recorded as
+   * skipped (with the reason) so one bad file never blocks the rest. */
+  function enqueue(files: File[]) {
+    if (files.length === 0) return;
+    const snap = store.getState();
+    const startingFresh = !busy() && snap.queue.length === 0;
+    const accepted: File[] = [];
+    const rejected: UploadOutcome[] = [];
+    for (const f of files) {
+      const err = validateFile(f);
+      if (err) rejected.push({ name: f.name, error: err.message });
+      else accepted.push(f);
+    }
+    store.setState({
+      queue: [...snap.queue, ...accepted],
+      // A new batch after a finished one starts its tally from zero.
+      finished: startingFresh && snap.status !== 'uploading' ? rejected : [...snap.finished, ...rejected],
+      batchTotal: (startingFresh ? 0 : snap.batchTotal) + files.length,
+      ...(startingFresh ? { status: 'idle' as const, error: null, asset: null } : {}),
+    });
+    advance();
+  }
+
+  /** Cancel the current file; the rest of the batch carries on. */
   async function cancel() {
     const snap = store.getState();
     for (const ac of Object.values(snap.abortControllers)) ac.abort();
@@ -490,6 +589,28 @@ export function useUploader(projectId: string) {
       }
     }
     clearPersistedSession(projectId);
+    const inBatch = snap.batchTotal > 1 || snap.queue.length > 0;
+    const keep = inBatch
+      ? {
+          queue: snap.queue,
+          batchTotal: snap.batchTotal,
+          finished: snap.file
+            ? [...snap.finished, { name: snap.file.name, error: 'Cancelled' }]
+            : snap.finished,
+        }
+      : null;
+    store.getState().reset();
+    windowRef.current = [];
+    if (keep) {
+      store.setState(keep);
+      advance();
+    }
+  }
+
+  /** Cancel the current file and drop everything still queued. */
+  async function cancelAll() {
+    store.setState({ queue: [] });
+    await cancel();
     store.getState().reset();
   }
 
@@ -626,7 +747,14 @@ export function useUploader(projectId: string) {
         schema: AssetSchema,
       });
       clearPersistedSession(projectId);
-      store.setState({ status: 'done', asset, running: false });
+      store.setState((state) => ({
+        status: 'done',
+        asset,
+        running: false,
+        finished: [...state.finished, { name: asset.original_filename, assetId: asset.id }],
+      }));
+      // Next file in the batch, if any.
+      advance();
     } catch (err) {
       store.setState({
         status: 'failed',
@@ -650,10 +778,12 @@ export function useUploader(projectId: string) {
     actions: {
       selectFile,
       start,
+      enqueue,
       pause,
       resume,
       attachAndResume,
       cancel,
+      cancelAll,
       retry,
       reset,
     },

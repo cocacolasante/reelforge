@@ -19,6 +19,39 @@ log = logging.getLogger(__name__)
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 
 
+class _SkipCache(Exception):
+    """A clip that must not enter the cache (e.g. eye contact was requested
+    but couldn't run, so the clip isn't what its key promises)."""
+
+
+def _eye_key(config: ComposeConfig) -> dict:
+    """Clip-cache key part for eye-contact correction — present only when
+    it's on, so every existing cached clip keeps its key."""
+    if not config.eye_contact:
+        return {}
+    from reelforge_core.compose.eyecontact import EYE_CONTACT_VERSION
+
+    return {"eye_contact": EYE_CONTACT_VERSION}
+
+
+async def _maybe_eye_contact(
+    out_path: Path, asset: MediaAsset, config: ComposeConfig, log_file: Path | None
+) -> bool:
+    """Run eye-contact correction on a freshly extracted clip when requested.
+    Returns whether the clip may be cached (False when correction errored)."""
+    if not config.eye_contact:
+        return True
+    from reelforge_core.compose.eyecontact import apply_eye_contact
+
+    result = await apply_eye_contact(out_path, asset.id, asset.path, config, log_file)
+    if result.get("applied"):
+        log.info(
+            "eye contact: %s corrected (mean %.1fpx, max %.1fpx)",
+            out_path.name, result.get("mean_px", 0.0), result.get("max_px", 0.0),
+        )
+    return result.get("error") is None
+
+
 @dataclass
 class ClipInfo:
     path: Path
@@ -331,6 +364,8 @@ async def extract_clips(
                 "crf": config.clip_crf,
                 "preset": config.clip_preset,
                 "pan": "none" if pan is None else f"{pan[0]:.4f}-{pan[1]:.4f}",
+                # Only when on, so existing cached clips keep their keys.
+                **_eye_key(config),
             },
         )
         cached = file_cache.lookup(cache_key)
@@ -358,8 +393,11 @@ async def extract_clips(
             )
             async with sem:
                 await asyncio.to_thread(run_ffmpeg, cmd, log_file=log_file)
+                cacheable = await _maybe_eye_contact(out_path, asset, config, log_file)
             # Copy into the cache directory and register.
             try:
+                if not cacheable:
+                    raise _SkipCache
                 cache_target = file_cache.path_for("clip", cache_key, "mp4")
                 import shutil as _shutil
                 _shutil.copy2(out_path, cache_target)
@@ -368,6 +406,8 @@ async def extract_clips(
                 file_cache.evict_if_over_cap(
                     "clip", file_cache.cap_from_env("clip", 20.0)
                 )
+            except _SkipCache:
+                pass
             except Exception:  # pragma: no cover
                 log.exception("clip cache write failed for %s", cache_key)
         return ClipInfo(
@@ -492,6 +532,7 @@ async def extract_timeline_clips(
                 "crf": config.clip_crf,
                 "preset": config.clip_preset,
                 "pan": "none" if pan is None else f"{pan[0]:.4f}-{pan[1]:.4f}",
+                **_eye_key(config),
             },
         )
         cached = file_cache.lookup(cache_key)
@@ -518,13 +559,18 @@ async def extract_timeline_clips(
             )
             async with sem:
                 await asyncio.to_thread(run_ffmpeg, cmd, log_file=log_file)
+                cacheable = await _maybe_eye_contact(out_path, asset, config, log_file)
             try:
+                if not cacheable:
+                    raise _SkipCache
                 cache_target = file_cache.path_for("clip", cache_key, "mp4")
                 import shutil as _shutil
 
                 _shutil.copy2(out_path, cache_target)
                 file_cache.register(cache_key, "clip", cache_target)
                 file_cache.evict_if_over_cap("clip", file_cache.cap_from_env("clip", 20.0))
+            except _SkipCache:
+                pass
             except Exception:  # pragma: no cover
                 log.exception("clip cache write failed for %s", cache_key)
         return ClipInfo(

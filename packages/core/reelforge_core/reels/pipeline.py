@@ -242,6 +242,30 @@ async def _render_sheets(
 # ---------------------------------------------------------------------------
 
 
+def fit_to_source(config: SelectionConfig, duration: float) -> SelectionConfig:
+    """Shrink a requested reel length the source can't provide.
+
+    A 300s single reel from a 114s clip enumerates zero candidates, and the
+    UI then (wrongly) blamed the user's direction (builders dojo,
+    2026-09-14). A long_single target longer than the source becomes the
+    source length (the whole clip is the reel); a short-form minimum longer
+    than the source becomes half of it. Otherwise unchanged. Pure."""
+    if duration <= 0:
+        return config
+    if config.output_form == "long_single" and config.long_target_duration_sec:
+        if config.effective_min_sec > duration:
+            return config.model_copy(update={"long_target_duration_sec": round(duration, 3)})
+        return config
+    if config.target_min_sec > duration:
+        return config.model_copy(
+            update={
+                "target_min_sec": round(max(1.0, duration * 0.5), 3),
+                "target_max_sec": round(duration, 3),
+            }
+        )
+    return config
+
+
 async def select_reels(
     analysis: AnalysisReport,
     config: SelectionConfig,
@@ -250,6 +274,17 @@ async def select_reels(
     t_start = time.monotonic()
     wd = _working_dir(analysis)
     wd.mkdir(parents=True, exist_ok=True)
+    fitted = fit_to_source(config, analysis.duration)
+    if fitted is not config:
+        log.info(
+            "selection: requested length %.0f-%.0fs doesn't fit a %.1fs source; using %.0f-%.0fs",
+            config.effective_min_sec,
+            config.effective_max_sec,
+            analysis.duration,
+            fitted.effective_min_sec,
+            fitted.effective_max_sec,
+        )
+        config = fitted
 
     # ----- candidates -----
     await progress(_emit("candidates", 0.0))

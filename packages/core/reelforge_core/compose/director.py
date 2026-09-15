@@ -58,6 +58,9 @@ STYLE_BOUNDS: dict[str, dict[str, Any]] = {
         "max_cut_dur": 0.05,
         "speeds": {1.0},
         "min_shot": 0.4,
+        # The audio-measured jump cuts own talking-head cut points: a live
+        # director nudge re-added a 0.94s pause and another clipped a word.
+        "max_nudge": 0.0,
     },
     "cinematic": {
         "palette": {"fade", "dissolve", "fadeblack", "circleopen", "circleclose"},
@@ -200,7 +203,7 @@ def build_director_context(
             "max_transition_sec": bounds["max_cut_dur"],
             "allowed_speeds": sorted(bounds["speeds"]),
             "min_shot_sec": bounds["min_shot"],
-            "max_nudge_sec": NUDGE_MAX_SEC,
+            "max_nudge_sec": bounds.get("max_nudge", NUDGE_MAX_SEC),
         },
         "reel": {
             "title": reel.title,
@@ -261,10 +264,11 @@ def apply_director(
             if not 0 <= i < len(shots):
                 continue
             s = shots[i]
+            max_nudge = bounds.get("max_nudge", NUDGE_MAX_SEC)
             new_in = s.in_ts + float(entry.get("nudge_start_sec") or 0.0)
             new_out = s.out_ts + float(entry.get("nudge_end_sec") or 0.0)
-            new_in = min(max(new_in, s.in_ts - NUDGE_MAX_SEC), s.in_ts + NUDGE_MAX_SEC)
-            new_out = min(max(new_out, s.out_ts - NUDGE_MAX_SEC), s.out_ts + NUDGE_MAX_SEC)
+            new_in = min(max(new_in, s.in_ts - max_nudge), s.in_ts + max_nudge)
+            new_out = min(max(new_out, s.out_ts - max_nudge), s.out_ts + max_nudge)
             new_in = max(0.0, new_in)
             new_out = min(analysis.duration, new_out)
             if words:

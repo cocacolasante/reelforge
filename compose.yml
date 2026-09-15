@@ -43,6 +43,13 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      # A native crash (segfault in OpenCV / CTranslate2 / FFmpeg bindings)
+      # prints every thread's Python traceback to the logs instead of dying
+      # silently with exit 139.
+      PYTHONFAULTHANDLER: "1"
+    # A crashed worker used to stay down, stranding its in-flight jobs (the
+    # grantmind analyses, 2026-09-14) until arq's in-progress locks expired.
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy

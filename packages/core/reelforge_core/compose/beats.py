@@ -133,10 +133,14 @@ def compute_beat_end_trims(
     grid: BeatGrid,
     max_trim: float,
     min_clip_sec: float = 1.0,
+    max_trims: list[float | None] | None = None,
 ) -> list[float]:
     """Per-clip end trims (len n-1; clips 0..n-2) that put each crossfade's
     midpoint on a beat. Sequential: earlier trims shift later transitions.
     A transition whose beat is further than `max_trim` away is left alone.
+    `max_trims` optionally caps each clip's trim (None = uncapped) — the
+    compose pipeline passes each shot's speech-free tail so a trim can never
+    cut the end of a word.
     """
     n = len(durations)
     trims = [0.0] * max(0, n - 1)
@@ -152,7 +156,10 @@ def compute_beat_end_trims(
         offset = sum(adjusted[: k + 1]) - sum(xfades[: k + 1])
         center = offset + xfades[k] / 2.0
         trim = grid.phase_within_beat(center)
-        if trim <= 1e-4 or trim > max_trim:
+        cap = max_trim
+        if max_trims is not None and k < len(max_trims) and max_trims[k] is not None:
+            cap = min(max_trim, max_trims[k])
+        if trim <= 1e-4 or trim > cap:
             continue
         if adjusted[k] - trim < min_clip_sec + xfades[k]:
             continue

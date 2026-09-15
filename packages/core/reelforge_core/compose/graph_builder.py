@@ -187,9 +187,12 @@ def build_final_command(
     output_path: Path,
     transitions: list[tuple[str, float]] | None = None,
     voiceovers: list[tuple[Path, float, float]] | None = None,
+    layers: list | None = None,
 ) -> RenderPlan:
     """`voiceovers`: (path, start_sec on the mezzanine, linear gain) per take.
-    Muted takes should be omitted by the caller."""
+    Muted takes should be omitted by the caller. `layers`: rendered
+    `compose.layers.LayerInput`s (B-roll) composited over the main picture —
+    final pass only, never chunk parts."""
     if not clips:
         raise ValueError("build_final_command requires at least one clip")
 
@@ -219,6 +222,12 @@ def build_final_command(
             continue
         vo_inputs.append((len(clips) + (1 if music_path is not None else 0) + len(vo_inputs), vo_start, vo_gain))
         args += ["-i", str(vo_path)]
+    layer_indices: list[int] = []
+    for layer in layers or []:
+        layer_indices.append(
+            len(clips) + (1 if music_path is not None else 0) + len(vo_inputs) + len(layer_indices)
+        )
+        args += ["-i", str(layer.path)]
 
     graph = FilterGraph()
 
@@ -368,6 +377,29 @@ def build_final_command(
         )
         v_chain = next_v
         a_chain = next_a
+
+    # ----- picture layers (B-roll) over the main picture -----
+    # Each layer clip is shifted to its mezzanine start; overlay passes the
+    # main picture through before the layer's first frame and (eof_action=
+    # pass) after its last, so only one layer frame is ever buffered. Added
+    # before grade + captions so B-roll is graded and text stays on top.
+    for k, (layer, idx) in enumerate(zip(layers or [], layer_indices)):
+        prep = f"format=yuva420p,setpts=PTS-STARTPTS+{layer.start:.3f}/TB"
+        if layer.fade > 0:
+            prep += (
+                f",fade=t=in:st={layer.start:.3f}:d={layer.fade:.3f}:alpha=1"
+                f",fade=t=out:st={max(layer.start, layer.end - layer.fade):.3f}"
+                f":d={layer.fade:.3f}:alpha=1"
+            )
+        graph.add(FilterNode(filter_name=prep, inputs=[f"[{idx}:v]"], outputs=[f"[ly{k}]"]))
+        graph.add(
+            FilterNode(
+                filter_name=f"overlay=x={layer.x}:y={layer.y}:eof_action=pass",
+                inputs=[v_chain, f"[ly{k}]"],
+                outputs=[f"[vly{k}]"],
+            )
+        )
+        v_chain = f"[vly{k}]"
 
     # ----- effects on final video stream -----
     if config.effects.unsharp:

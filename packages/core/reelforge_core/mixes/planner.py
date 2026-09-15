@@ -39,7 +39,7 @@ from reelforge_core.models import (
     TransitionStyle,
 )
 
-MAX_MIX_SHOTS = 60  # mirror of the editor's MAX_TIMELINE_SHOTS
+MAX_MIX_SHOTS = 300  # mirror of the editor's MAX_TIMELINE_SHOTS
 
 
 def _energy_z_for(
@@ -61,12 +61,14 @@ def plan_mix(
     analyses: dict[str, AnalysisReport | None],
     style: str,
     beat_grid: BeatGrid | None,
+    envelopes: dict | None = None,
 ) -> ReelTimeline:
-    """Sequenced shots -> fully styled multi-source ReelTimeline. Pure."""
+    """Sequenced shots -> fully styled multi-source ReelTimeline. Pure.
+    `envelopes` (asset_id -> SpeechEnvelope) drive talking-head jump cuts."""
     if style == "hype":
         timeline_shots = _plan_hype(shots, analyses, beat_grid)
     elif style == "talking_head":
-        timeline_shots = _plan_talking_head(shots, analyses)
+        timeline_shots = _plan_talking_head(shots, analyses, envelopes)
     elif style == "cinematic":
         timeline_shots = _plan_uniform(
             shots, palette=[("dissolve", 0.8), ("fadeblack", 0.8)], ken_burns=True
@@ -223,6 +225,7 @@ def _plan_hype(
 def _plan_talking_head(
     shots: list[tuple[str, float, float]],
     analyses: dict[str, AnalysisReport | None],
+    envelopes: dict | None = None,
 ) -> list[TimelineShot]:
     from reelforge_core.compose.jumpcuts import split_on_silences
 
@@ -231,7 +234,10 @@ def _plan_talking_head(
     for aid, s, e in shots:
         a = analyses.get(aid)
         transcript = a.transcript if a is not None else None
-        pieces = split_on_silences((s, e), transcript)
+        envelope = (envelopes or {}).get(aid)
+        pieces = split_on_silences(
+            (s, e), transcript, envelope=envelope, trim_edges=envelope is not None
+        )
         if len(built) + len(pieces) > MAX_MIX_SHOTS:
             pieces = [(s, e)]
         for ps, pe in pieces:

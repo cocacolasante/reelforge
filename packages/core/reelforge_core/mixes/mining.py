@@ -27,6 +27,14 @@ from reelforge_core.reels.prescore import (
 SHORT_MIX_BOUNDS = (2.0, 8.0)  # target <= LONG_MIX_THRESHOLD_SEC
 LONG_MIX_BOUNDS = (4.0, 12.0)
 LONG_MIX_THRESHOLD_SEC = 90.0
+# Long-form videos (a multi-clip "long single span", up to 30 min) are built
+# from whole SECTIONS, not highlights: 4-12s moments would need hundreds of
+# shots and the video would feel like a trailer.
+LONG_FORM_THRESHOLD_SEC = 300.0
+LONG_FORM_BOUNDS = (20.0, 90.0)
+# Sections in one clip may barely overlap, or the sequencer spends the pool on
+# near-copies of the same explanation.
+LONG_FORM_DEDUPE_OVERLAP = 0.3
 
 # Cap on candidates mined per asset before pooling (keeps enumeration and
 # feature computation bounded on fast-cut footage).
@@ -53,17 +61,43 @@ class MinedMoment:
 
 def moment_bounds_for(target_duration_sec: float) -> tuple[float, float]:
     """Ingredient duration window for a given mix length. Pure."""
+    if target_duration_sec > LONG_FORM_THRESHOLD_SEC:
+        return LONG_FORM_BOUNDS
     if target_duration_sec > LONG_MIX_THRESHOLD_SEC:
         return LONG_MIX_BOUNDS
     return SHORT_MIX_BOUNDS
 
 
+def dedupe_overlap_for(target_duration_sec: float) -> float:
+    """How much two mined spans of one clip may overlap. Pure."""
+    return LONG_FORM_DEDUPE_OVERLAP if target_duration_sec > LONG_FORM_THRESHOLD_SEC else DEDUPE_OVERLAP
+
+
+def fit_bounds_to_clip(bounds: tuple[float, float], duration_sec: float) -> tuple[float, float]:
+    """A clip shorter than the ingredient minimum (a 26s intro vs 20-90s
+    sections) still contributes: the window shrinks to what the clip has.
+    Pure."""
+    lo, hi = bounds
+    if duration_sec <= 0 or duration_sec >= lo:
+        return bounds
+    lo = max(1.0, round(duration_sec * 0.6, 3))
+    return lo, max(lo, round(duration_sec, 3))
+
+
 def mine_moments(
-    analysis: AnalysisReport, bounds: tuple[float, float]
+    analysis: AnalysisReport,
+    bounds: tuple[float, float],
+    dedupe_overlap: float = DEDUPE_OVERLAP,
+    fit_short_clips: bool = False,
 ) -> list[MinedMoment]:
-    """Short-span candidates for one asset, scored and dedeuped, best first."""
+    """Candidate spans for one asset, scored and dedeuped, best first.
+    `fit_short_clips` (long-form sections only) lets a clip shorter than the
+    window still contribute; highlight mining keeps skipping clips too short
+    for a real moment."""
     from reelforge_core.reels import generate_candidates
 
+    if fit_short_clips:
+        bounds = fit_bounds_to_clip(bounds, analysis.duration)
     cfg = SelectionConfig(
         target_min_sec=bounds[0],
         target_max_sec=bounds[1],
@@ -87,7 +121,7 @@ def mine_moments(
     kept: list[MinedMoment] = []
     for m in moments:
         if any(
-            _time_overlap(m.candidate, k.candidate) > DEDUPE_OVERLAP for k in kept
+            _time_overlap(m.candidate, k.candidate) > dedupe_overlap for k in kept
         ):
             continue
         kept.append(m)

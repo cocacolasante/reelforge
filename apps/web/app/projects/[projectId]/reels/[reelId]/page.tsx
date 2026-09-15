@@ -63,6 +63,10 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
   const exportsQ = useExports(reelId);
   const music = useMusicLibrary();
   const compose = useEnqueueCompose();
+  // Every hook must run before the loading/error early returns below —
+  // calling this one after them crashed the page (React #310) as soon as the
+  // reel finished loading.
+  const composePlan = useComposePlan(reelId);
   const [composeJobId, setComposeJobId] = React.useState<string | null>(null);
 
   // Local compose-config state (intentionally not persisted across reload).
@@ -77,6 +81,7 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
   const [noEffects, setNoEffects] = React.useState(false);
   const [crf, setCrf] = React.useState<number[]>([18]);
   const [quality, setQuality] = React.useState<'draft' | 'standard' | 'high'>('standard');
+  const [eyeContact, setEyeContact] = React.useState(false);
   // Photo inserts: which project photos to weave in, where, and for how long.
   const [photoIds, setPhotoIds] = React.useState<string[]>([]);
   const [photoPlacement, setPhotoPlacement] =
@@ -124,6 +129,7 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
           video_crf: crf[0],
           quality,
           captions: { mode: captionMode },
+          ...(eyeContact ? { eye_contact: true } : {}),
           smart_mode: true,
           transition: { kind: 'auto', duration_sec: 0.4 },
           ...(style !== 'auto' ? { style } : {}),
@@ -142,6 +148,7 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
           video_crf: crf[0],
           quality,
           captions: { mode: captionMode },
+          ...(eyeContact ? { eye_contact: true } : {}),
           smart_mode: false,
           transition: { kind: transition, duration_sec: transitionDur[0] },
           effects: {
@@ -186,7 +193,6 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
   };
 
   // Smart-mode picks come from the server (single source of truth).
-  const composePlan = useComposePlan(reelId);
   const plannedTransition = composePlan.data?.transition ?? '…';
   const plannedLut = composePlan.data?.lut ?? null;
   const plannedStyle = style !== 'auto' ? style : composePlan.data?.style ?? '…';
@@ -549,6 +555,24 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
               onSeconds={setPhotoSeconds}
             />
             ) : null}
+
+            {/* Eye contact */}
+            <section className="space-y-1">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={eyeContact}
+                  onChange={(e) => setEyeContact(e.target.checked)}
+                  className="h-4 w-4 accent-primary"
+                />
+                Eye contact correction
+              </label>
+              <p className="text-xs text-muted-foreground">
+                Nudges your eyes toward the camera when you glance at notes or a screen. Softens big
+                glances rather than erasing them, and adds about 1.5–2 minutes of processing per
+                minute of footage.
+              </p>
+            </section>
 
             {/* Quality */}
             <section className="space-y-2">

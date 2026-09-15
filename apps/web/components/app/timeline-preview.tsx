@@ -4,7 +4,14 @@ import * as React from 'react';
 import { AlertTriangle, Pause, Play } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { API_BASE } from '@/lib/api/client';
-import type { ReelTimeline, SourceAudio, SourcePhoto, SourceVideo, TimelineShot } from '@/lib/api/schemas';
+import type {
+  PictureLayer,
+  ReelTimeline,
+  SourceAudio,
+  SourcePhoto,
+  SourceVideo,
+  TimelineShot,
+} from '@/lib/api/schemas';
 import { formatDuration } from '@/lib/format';
 
 /**
@@ -78,6 +85,37 @@ function locate(segs: Segment[], t: number): Located | null {
   return { primary, outgoing: null, alpha: 1 };
 }
 
+/** Stable element key for a B-roll layer (older saves may lack ids). */
+export function layerKey(layer: PictureLayer, index: number): string {
+  return layer.id || `layer-${index}`;
+}
+
+/** 0..1 visibility of a layer at `t`, with its fade (never > a third of it). */
+export function layerOpacity(layer: PictureLayer, t: number): number {
+  if (t < layer.start_sec || t >= layer.end_sec) return 0;
+  const fade = Math.min(Math.max(0, layer.fade_ms) / 1000, (layer.end_sec - layer.start_sec) / 3);
+  if (fade <= 0) return 1;
+  return Math.max(0, Math.min(1, (t - layer.start_sec) / fade, (layer.end_sec - t) / fade));
+}
+
+// Mirrors compose/layers.py::layer_box on the preview's 9:16 frame: a box of
+// pip_scale x the frame, inset 4% of the frame's shorter side (its width).
+const FRAME_ASPECT = 9 / 16;
+const PIP_MARGIN_FRAC = 0.04;
+
+function layerBoxStyle(layer: PictureLayer): React.CSSProperties {
+  if (layer.mode === 'full') return { inset: 0, width: '100%', height: '100%' };
+  const size = `${layer.pip_scale * 100}%`;
+  const mx = `${PIP_MARGIN_FRAC * 100}%`;
+  const my = `${PIP_MARGIN_FRAC * FRAME_ASPECT * 100}%`;
+  return {
+    width: size,
+    height: size,
+    ...(layer.pip_corner === 'tl' || layer.pip_corner === 'bl' ? { left: mx } : { right: mx }),
+    ...(layer.pip_corner === 'tl' || layer.pip_corner === 'tr' ? { top: my } : { bottom: my }),
+  };
+}
+
 function assToHex(ass: string): string {
   const h = ass.replace(/^&H/i, '').replace(/&$/, '').padStart(8, '0');
   return `#${h.slice(-2)}${h.slice(-4, -2)}${h.slice(-6, -4)}`;
@@ -114,6 +152,9 @@ export const TimelinePreview = React.forwardRef<
   const frameRef = React.useRef<HTMLDivElement>(null);
   const videoEls = React.useRef(new Map<string, HTMLVideoElement>());
   const audioEls = React.useRef(new Map<string, HTMLAudioElement>());
+  // B-roll video layers, keyed by LAYER (not asset): a cutaway from the same
+  // file as the main shot needs its own element.
+  const layerEls = React.useRef(new Map<string, HTMLVideoElement>());
   const clock = React.useRef<{ wall: number; t: number } | null>(null);
   const silencedRef = React.useRef(silenced);
   silencedRef.current = silenced;
@@ -212,6 +253,30 @@ export const TimelinePreview = React.forwardRef<
         return;
       }
       const srcTime = time - take.start_sec;
+      const drift = Math.abs(el.currentTime - srcTime);
+      if (!isPlaying || drift > 0.35) {
+        if (drift > 0.05) el.currentTime = srcTime;
+      }
+      if (isPlaying) {
+        if (el.paused) void el.play().catch(() => {});
+      } else if (!el.paused) {
+        el.pause();
+      }
+    });
+
+    // B-roll video layers: always muted (the render keeps them silent).
+    const layers = timelineRef.current.layers;
+    const byKey = new Map(layers.map((ly, i) => [layerKey(ly, i), ly]));
+    layerEls.current.forEach((el, key) => {
+      const layer = byKey.get(key);
+      const opacity = layer ? layerOpacity(layer, time) : 0;
+      el.style.opacity = String(opacity);
+      el.muted = true;
+      if (!layer || opacity <= 0) {
+        if (!el.paused) el.pause();
+        return;
+      }
+      const srcTime = layer.in_ts + (time - layer.start_sec);
       const drift = Math.abs(el.currentTime - srcTime);
       if (!isPlaying || drift > 0.35) {
         if (drift > 0.05) el.currentTime = srcTime;
@@ -384,6 +449,36 @@ export const TimelinePreview = React.forwardRef<
                 ) : null;
               })
           : null}
+        {/* B-roll layers: over the shots, under text */}
+        {timeline.layers.map((layer, i) => {
+          const key = layerKey(layer, i);
+          const box = layerBoxStyle(layer);
+          const frameClass =
+            'pointer-events-none absolute object-cover ' +
+            (layer.mode === 'pip' ? 'rounded-sm shadow-lg ring-1 ring-white/20' : '');
+          if (layer.kind === 'video') {
+            return (
+              <video
+                key={key}
+                ref={(el) => {
+                  if (el) layerEls.current.set(key, el);
+                  else layerEls.current.delete(key);
+                }}
+                src={`${API_BASE}/api/v1/assets/${layer.asset_id}/media`}
+                preload="auto"
+                playsInline
+                muted
+                className={frameClass}
+                style={{ ...box, opacity: 0 }}
+              />
+            );
+          }
+          const p = photoById.get(layer.asset_id);
+          const opacity = layerOpacity(layer, t);
+          return p && opacity > 0 ? (
+            <img key={key} alt="" src={`${API_BASE}${p.url}`} className={frameClass} style={{ ...box, opacity }} />
+          ) : null;
+        })}
         {/* Text overlays */}
         {visibleOverlays.map(({ o, opacity }) => {
           const fontPx = Math.max(8, o.font_size_px * scale);
@@ -478,9 +573,9 @@ export const TimelinePreview = React.forwardRef<
         </div>
       ) : null}
       <p className="text-[11px] text-muted-foreground">
-        Preview plays your source footage and voiceover takes directly — transitions shown as
-        crossfades; captions, music, color grade, subject reframing and ducking appear in the
-        render. Space to play, ←/→ to step.
+        Preview plays your source footage, B-roll and voiceover takes directly — transitions
+        shown as crossfades; captions, music, color grade, subject reframing and ducking appear
+        in the render. Space to play, ←/→ to step.
       </p>
     </div>
   );

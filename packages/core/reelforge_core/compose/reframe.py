@@ -28,6 +28,20 @@ MAX_DRIFT = 0.25  # max |x1 - x0| so pans stay subtle
 FACE_WEIGHT = 3.0  # face centroids count this much more than motion
 
 
+BUNDLED_FACE_CASCADE = "/app/assets/models/haarcascade_frontalface_default.xml"
+
+
+def _face_cascade_path(cv2) -> str:  # noqa: ANN001
+    """The Haar face cascade: the copy bundled in the image first (the
+    opencv-contrib-python 5 wheel ships no cv2/data XMLs), then OpenCV's own."""
+    import os
+
+    bundled = os.environ.get("REELFORGE_FACE_CASCADE", BUNDLED_FACE_CASCADE)
+    if os.path.exists(bundled):
+        return bundled
+    return cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+
+
 def estimate_pan(
     source: Path, in_ts: float, out_ts: float
 ) -> tuple[float, float]:
@@ -50,9 +64,7 @@ def _estimate(source: Path, in_ts: float, out_ts: float) -> tuple[float, float]:
     if not cap.isOpened():
         return (0.5, 0.5)
     try:
-        cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
+        cascade = cv2.CascadeClassifier(_face_cascade_path(cv2))
         duration = max(0.1, out_ts - in_ts)
         times = [in_ts + duration * (i + 0.5) / N_SAMPLES for i in range(N_SAMPLES)]
 

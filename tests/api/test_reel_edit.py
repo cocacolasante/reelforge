@@ -187,3 +187,70 @@ async def test_compose_injects_saved_timeline_with_paths(api_client) -> None:
     )
     # Conflict detection: the first compose is still queued.
     assert r2.status_code in (200, 409)
+
+
+@pytest.mark.asyncio
+async def test_put_edit_saves_broll_layers_without_paths(api_client) -> None:
+    pid, vid, reel_id, photo = await _seed(api_client)
+    timeline = {
+        "shots": [{"kind": "video", "asset_id": vid, "in_ts": 0, "out_ts": 20}],
+        "layers": [
+            {"kind": "video", "asset_id": vid, "start_sec": 2, "end_sec": 5, "in_ts": 60,
+             "path": "/etc/passwd"},
+            {"kind": "photo", "asset_id": photo, "start_sec": 8, "end_sec": 11,
+             "mode": "pip", "pip_corner": "tl", "pip_scale": 0.35},
+        ],
+    }
+    r = await api_client.put(f"/api/v1/reels/{reel_id}/edit", json={"timeline": timeline})
+    assert r.status_code == 200, r.text
+    layers = (await api_client.get(f"/api/v1/reels/{reel_id}/edit")).json()["timeline"]["layers"]
+    assert [ly["kind"] for ly in layers] == ["video", "photo"]
+    assert all(ly["path"] == "" for ly in layers), "paths must never reach the client"
+    assert layers[1]["mode"] == "pip" and layers[1]["pip_corner"] == "tl"
+
+
+@pytest.mark.asyncio
+async def test_put_edit_rejects_bad_broll_layers(api_client) -> None:
+    pid, vid, reel_id, photo = await _seed(api_client)
+    shots = [{"kind": "video", "asset_id": vid, "in_ts": 0, "out_ts": 20}]
+
+    async def put(layer: dict):
+        return await api_client.put(
+            f"/api/v1/reels/{reel_id}/edit", json={"timeline": {"shots": shots, "layers": [layer]}}
+        )
+
+    r = await put({"kind": "video", "asset_id": photo, "start_sec": 1, "end_sec": 3})
+    assert r.status_code == 400 and "photo" in r.json()["error"]["message"]
+    r = await put({"kind": "video", "asset_id": "z" * 64, "start_sec": 1, "end_sec": 3})
+    assert r.status_code == 400 and "not a clip or photo" in r.json()["error"]["message"]
+    r = await put({"kind": "video", "asset_id": vid, "start_sec": 1, "end_sec": 1.1})
+    assert r.status_code == 400 and "0.15s" in r.json()["error"]["message"]
+    r = await put({"kind": "video", "asset_id": vid, "start_sec": 30, "end_sec": 33})
+    assert r.status_code == 400 and "starts at" in r.json()["error"]["message"]
+    r = await put({"kind": "video", "asset_id": vid, "start_sec": 1, "end_sec": 6, "in_ts": 118})
+    assert r.status_code == 400 and "past the end" in r.json()["error"]["message"]
+    r = await put({"kind": "photo", "asset_id": photo, "start_sec": 1, "end_sec": 3, "pip_scale": 0.9})
+    assert r.status_code in (400, 422)
+
+
+@pytest.mark.asyncio
+async def test_compose_resolves_broll_layer_paths(api_client) -> None:
+    pid, vid, reel_id, photo = await _seed(api_client)
+    from apps.api import db as dbmod
+    from sqlalchemy import select
+
+    await api_client.put(
+        f"/api/v1/reels/{reel_id}/edit",
+        json={"timeline": {
+            "shots": [{"kind": "video", "asset_id": vid, "in_ts": 0, "out_ts": 10}],
+            "layers": [{"kind": "photo", "asset_id": photo, "start_sec": 1, "end_sec": 4}],
+        }},
+    )
+    r = await api_client.post(f"/api/v1/reels/{reel_id}/compose", json={"captions": {"mode": "off"}})
+    assert r.status_code == 200, r.text
+    async with dbmod.db_state.sessionmaker() as session:
+        job = (await session.execute(
+            select(dbmod.Job).where(dbmod.Job.kind == "compose").order_by(dbmod.Job.created_at.desc())
+        )).scalars().first()
+    layers = json.loads(job.config_json)["timeline"]["layers"]
+    assert layers[0]["path"].endswith(".jpg")

@@ -146,7 +146,7 @@ export type Reel = z.infer<typeof ReelSchema>;
 
 export const JobSchema = z.object({
   id: z.string(),
-  kind: z.enum(['analyze', 'select', 'compose', 'export', 'publish']),
+  kind: z.enum(['analyze', 'select', 'compose', 'export', 'publish', 'broll']),
   status: z.enum(['queued', 'running', 'done', 'failed']),
   progress: z.number(),
   stage: z.string().nullable(),
@@ -280,10 +280,28 @@ export const TextOverlaySchema = z.object({
   bold: z.boolean(),
   fade_ms: z.number(),
 });
+// B-roll: a clip or photo over the main track for [start_sec, end_sec].
+export const PictureLayerSchema = z.object({
+  id: z.string(),
+  kind: z.enum(['video', 'photo']),
+  asset_id: z.string(),
+  path: z.string().optional(),
+  start_sec: z.number(),
+  end_sec: z.number(),
+  in_ts: z.number(),
+  mode: z.enum(['full', 'pip']),
+  pip_corner: z.enum(['tl', 'tr', 'bl', 'br']),
+  pip_scale: z.number(),
+  ken_burns: z.boolean(),
+  fade_ms: z.number(),
+});
 export const ReelTimelineSchema = z.object({
   shots: z.array(TimelineShotSchema),
   overlays: z.array(TextOverlaySchema),
   voiceovers: z.array(VoiceoverTakeSchema),
+  // Required, not .default([]): the API always sends it, and a missing key
+  // here would be stripped and wipe layers on the next save.
+  layers: z.array(PictureLayerSchema),
 });
 export const SourceAudioSchema = z.object({
   asset_id: z.string(),
@@ -323,6 +341,18 @@ export type TimelineShot = z.infer<typeof TimelineShotSchema>;
 export type VoiceoverTake = z.infer<typeof VoiceoverTakeSchema>;
 export type SourceAudio = z.infer<typeof SourceAudioSchema>;
 export type TextOverlay = z.infer<typeof TextOverlaySchema>;
+export type PictureLayer = z.infer<typeof PictureLayerSchema>;
+// AI B-roll suggestions (the `broll` job's result): a layer plus why.
+export const BrollSuggestionSchema = PictureLayerSchema.extend({
+  filename: z.string(),
+  reason: z.string(),
+  quote: z.string(),
+});
+export const BrollResultSchema = z.object({
+  suggestions: z.array(BrollSuggestionSchema),
+  note: z.string().nullable(),
+});
+export type BrollSuggestion = z.infer<typeof BrollSuggestionSchema>;
 export type ReelTimeline = z.infer<typeof ReelTimelineSchema>;
 export type ReelEdit = z.infer<typeof ReelEditSchema>;
 export type SourceVideo = z.infer<typeof SourceVideoSchema>;

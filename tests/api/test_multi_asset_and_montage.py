@@ -107,6 +107,45 @@ async def test_project_reels_aggregates_across_assets(
 
 
 @pytest.mark.asyncio
+async def test_project_reels_concurrent_first_listing_registers_once(
+    api_client, isolated_data_dir: Path
+) -> None:
+    """Right after a select job the project page and the reels page list the
+    reels at the same time; both used to insert the same new Reel rows and
+    one request died on the primary key."""
+    import asyncio
+
+    from sqlalchemy import func, select
+
+    from apps.api import db as dbmod
+
+    r = await api_client.post("/api/v1/projects", json={"name": "race"})
+    pid = r.json()["id"]
+    aid = "q" * 64
+    async with dbmod.db_state.sessionmaker() as session:
+        session.add(
+            dbmod.Asset(
+                id=aid, project_id=pid, path=f"/tmp/{aid}.mp4", original_filename="q.mp4",
+                duration_sec=120, width=1920, height=1080, fps=30, has_audio=True,
+                size_bytes=1, probe_json="{}",
+            )
+        )
+        await session.commit()
+    _build_selection_on_disk(aid, pid, 5)
+
+    responses = await asyncio.gather(
+        *(api_client.get(f"/api/v1/projects/{pid}/reels") for _ in range(4))
+    )
+    assert [resp.status_code for resp in responses] == [200] * 4, [resp.text for resp in responses]
+    assert all(len(resp.json()["reels"]) == 5 for resp in responses)
+    async with dbmod.db_state.sessionmaker() as session:
+        count = (
+            await session.execute(select(func.count()).select_from(dbmod.Reel).where(dbmod.Reel.project_id == pid))
+        ).scalar_one()
+    assert count == 5
+
+
+@pytest.mark.asyncio
 async def test_project_reels_empty_when_no_selection(api_client) -> None:
     r = await api_client.post("/api/v1/projects", json={"name": "empty"})
     pid = r.json()["id"]

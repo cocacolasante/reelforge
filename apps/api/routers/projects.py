@@ -368,8 +368,17 @@ async def list_project_reels(
             existing = await db.get(dbmod.Reel, r.candidate_id)
             mezz_path = str(mezz) if mezz.exists() else None
             if existing is None:
-                db.add(
-                    dbmod.Reel(
+                # INSERT ... ON CONFLICT DO NOTHING, not session.add: right
+                # after a select job the project page and the reels page hit
+                # this endpoint at the same time, both saw no row, and the
+                # second commit died on the primary key (the reels page
+                # errored until "Try again"). SQLite serializes the writers,
+                # so the loser's insert becomes a no-op and it updates below.
+                from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                await db.execute(
+                    sqlite_insert(dbmod.Reel.__table__)
+                    .values(
                         id=r.candidate_id,
                         project_id=project_id,
                         asset_id=asset.id,
@@ -390,6 +399,7 @@ async def list_project_reels(
                         edit_style=r.edit_style,
                         mezzanine_path=mezz_path,
                     )
+                    .on_conflict_do_nothing(index_elements=["id"])
                 )
             else:
                 existing.rank = r.rank

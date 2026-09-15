@@ -342,6 +342,18 @@ export function useReelEdit(reelId: string | undefined) {
   });
 }
 
+/** Enqueue AI B-roll suggestions for the editor's current (unsaved) timeline. */
+export function useSuggestBroll(reelId: string) {
+  return useMutation({
+    mutationFn: ({ timeline, prompt }: { timeline: ReelTimeline; prompt: string | null }) =>
+      api<Job>(`/reels/${reelId}/broll/suggest`, {
+        method: 'POST',
+        body: { timeline, prompt },
+        schema: JobSchema,
+      }),
+  });
+}
+
 export function useSaveReelEdit(reelId: string) {
   const qc = useQueryClient();
   return useMutation({

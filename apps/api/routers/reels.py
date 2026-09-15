@@ -185,8 +185,11 @@ class ReelEditIn(BaseModel):
     timeline: ReelTimeline
 
 
-MAX_TIMELINE_SHOTS = 60
+# Long-form AI videos (up to 30 min, talking-head jump cuts) run well past 60
+# shots; compose renders any count hierarchically (pipeline._render_hierarchy).
+MAX_TIMELINE_SHOTS = 300
 MAX_OVERLAYS = 40
+MAX_LAYERS = 20
 
 
 def _default_timeline(r: dbmod.Reel) -> ReelTimeline:
@@ -334,6 +337,7 @@ async def get_reel_edit(reel_id: str, db: AsyncSession = Depends(get_db)) -> Ree
         update={
             "shots": [s.model_copy(update={"path": ""}) for s in timeline.shots],
             "voiceovers": [v.model_copy(update={"path": ""}) for v in timeline.voiceovers],
+            "layers": [ly.model_copy(update={"path": ""}) for ly in timeline.layers],
         }
     )
     videos, photos, audios = await _project_sources(db, r.project_id)
@@ -363,6 +367,8 @@ async def put_reel_edit(
         raise ApiError(400, "INVALID_CONFIG", f"at most {MAX_TIMELINE_SHOTS} shots")
     if len(tl.overlays) > MAX_OVERLAYS:
         raise ApiError(400, "INVALID_CONFIG", f"at most {MAX_OVERLAYS} text overlays")
+    if len(tl.layers) > MAX_LAYERS:
+        raise ApiError(400, "INVALID_CONFIG", f"at most {MAX_LAYERS} B-roll layers")
 
     for i, shot in enumerate(tl.shots):
         a = await db.get(dbmod.Asset, shot.asset_id)
@@ -422,12 +428,41 @@ async def put_reel_edit(
                 400, "INVALID_CONFIG",
                 f"overlay {j + 1}: starts at {o.start_sec:.1f}s but the reel is {total:.1f}s",
             )
+    for j, layer in enumerate(tl.layers):
+        a = await db.get(dbmod.Asset, layer.asset_id)
+        if a is None or a.project_id != r.project_id or a.kind == "audio":
+            raise ApiError(
+                400, "INVALID_CONFIG", f"B-roll {j + 1}: not a clip or photo in this project"
+            )
+        if (layer.kind == "photo") != (a.kind == "photo"):
+            raise ApiError(
+                400, "INVALID_CONFIG",
+                f"B-roll {j + 1}: {a.original_filename} is "
+                + ("a photo" if a.kind == "photo" else "footage, not a photo"),
+            )
+        if layer.start_sec < 0 or layer.end_sec - layer.start_sec < 0.15:
+            raise ApiError(400, "INVALID_CONFIG", f"B-roll {j + 1}: must last at least 0.15s")
+        if layer.start_sec > total:
+            raise ApiError(
+                400, "INVALID_CONFIG",
+                f"B-roll {j + 1}: starts at {layer.start_sec:.1f}s but the reel is {total:.1f}s",
+            )
+        if layer.kind == "video":
+            if layer.in_ts < 0:
+                raise ApiError(400, "INVALID_CONFIG", f"B-roll {j + 1}: source in must be >= 0")
+            if a.duration_sec and layer.in_ts + layer.duration > a.duration_sec + 0.05:
+                raise ApiError(
+                    400, "INVALID_CONFIG",
+                    f"B-roll {j + 1}: runs past the end of {a.original_filename} "
+                    f"({a.duration_sec:.1f}s)",
+                )
 
     # Store without paths; compose resolves them fresh from the DB.
     clean = tl.model_copy(
         update={
             "shots": [s.model_copy(update={"path": ""}) for s in tl.shots],
             "voiceovers": [v.model_copy(update={"path": ""}) for v in tl.voiceovers],
+            "layers": [ly.model_copy(update={"path": ""}) for ly in tl.layers],
         }
     )
     r.edit_json = clean.model_dump_json()

@@ -5,6 +5,46 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## Unreleased
 
 ### Added
+- **One long video from several clips.** Choosing "Long single span" with
+  two or more analyzed clips now builds a single long-form video (up to 30
+  minutes): the AI picks the strongest whole sections from every clip, puts
+  them in a sensible order (intro first, wrap-up last), and renders one
+  editable video — instead of one long reel per clip. The AI mix builder on
+  the reels page also goes up to 30 minutes. Very long timelines (up to 300
+  shots) render in multiple chunk levels so memory stays bounded.
+- **Upload several files at once.** Drop or pick any number of videos and
+  photos; they upload one after another with the same resumable, parallel
+  chunking as before. The panel shows "File 2 of 5", what's up next, and lets
+  you add more, skip the current file, or cancel the rest. Files that can't be
+  uploaded (unsupported type, over 5 GB, empty) are skipped with the reason
+  instead of stopping the batch, and a summary lists what went up. The panel
+  stays open for the whole batch.
+- **Eye contact correction.** A per-render toggle (reel page and editor)
+  nudges your eyes toward the camera when you glance at notes or a second
+  screen. It moves only the inside of each eye — lids, lashes and skin stay
+  put — pauses during blinks and head turns, and softens big glances rather
+  than erasing them (larger shifts looked fake in testing). Looking down is
+  only lightly corrected. Off by default; adds roughly 1.5–2 minutes of
+  processing per minute of footage.
+- **AI B-roll suggestions.** "Suggest B-roll" in the editor's B-roll card
+  reads what you say (on the edited timeline, unsaved changes included) and
+  proposes cutaways from the project's other footage and photos — each with
+  the quote it illustrates and why. Accept, preview the spot, or skip each
+  one; nothing is added until you accept. An optional direction steers it
+  ("use the beach photos").
+- **B-roll layers.** The editor has a B-roll track: "Clip at playhead" /
+  "Photo at playhead" drop a project clip or photo over the talking head
+  (3s by default) — full screen or picture-in-picture in any corner and
+  size — while the voice keeps playing. Set start, length and where in the
+  clip it plays from; the scrubbable preview shows layers in place. In the
+  render, layers fade in/out, get the reel's color grade, and sit under
+  captions and text.
+- **Editor: cut dead air out of a shot.** Drag across a shot's waveform to
+  select a section and click "Cut out" — the rest is rejoined with a jump
+  cut. Clicking a waveform jumps the preview there (no more waiting for
+  playback to reach a spot), the playhead is correct on sped-up/slowed
+  shots, and the scissors split at the playhead instead of always in half.
+  Voiceover waveforms are clickable too.
 - **Delete projects from the UI.** A trash button on each project card and
   a "Delete project" button in the project header open a confirmation that
   lists what goes (clips, footage size, reels, renders, exports, mixes).
@@ -114,6 +154,40 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 
 ### Fixed
+- **Stray backslash in wrapped captions.** Every two-line static caption
+  (the style AI mixes and long videos use) showed a literal "\" at the end
+  of its first line: the line break was escaped a second time when the
+  caption was written. Karaoke captions were unaffected.
+- **Analyses stuck at 0% after a worker crash.** A worker process died
+  mid-analysis (native segfault, exit 139) and, with no restart policy, stayed
+  down; its jobs kept "running" until arq's in-progress locks expired an hour
+  later. Workers now restart automatically and log a Python traceback for any
+  native crash (`PYTHONFAULTHANDLER`).
+- **"No clips matched your direction" when the length was the problem.**
+  Asking for a single reel longer than the clip (e.g. 5 minutes from a
+  2-minute video) generated zero candidates, and the project page blamed the
+  direction prompt. Selection now shrinks a length the clip can't provide to
+  what it has (the whole clip becomes the reel), and the direction note only
+  appears when candidates existed and the AI rejected them all.
+- **Reels page errored right after selection until "Try again".** The project
+  page and the reels page list reels at the same moment when a selection
+  finishes; both tried to register the same new reels and one request failed
+  on a duplicate key. Registration is now conflict-safe.
+- **Reel page crashed after loading ("Something went wrong").** A data hook
+  ran after the page's loading check, so React saw a different hook count
+  once the reel arrived (error #310). The compose panel is reachable again.
+- **Auto-reframe ignored the subject since the OpenCV 5 upgrade.** OpenCV
+  5's base wheel dropped the face detector, so subject tracking failed on
+  every clip and quietly fell back to a centered crop. The image now ships
+  opencv-contrib-python (needed by eye contact anyway) plus a bundled face
+  cascade file, restoring motion- and face-following crops.
+- **Talking-head silence removal clipped words and missed pauses.** Jump
+  cuts trusted Whisper's word timestamps, which end up to 0.4s before the
+  sound does; beat sync then trimmed up to 0.45s more off clip ends and the
+  AI director nudged cut points by up to 1.5s. Dead air is now measured
+  from the audio itself (pauses ≥0.45s, including ones straddling a scene
+  split and at the reel's edges), beat-sync trims only eat trailing
+  silence, and the director no longer moves talking-head cuts.
 - **Loudness analysis was silently broken — every bin read -80 (silence)
   for every clip.** ebur128 ran with `framelog=verbose`, whose per-frame
   lines sit below ffmpeg's default log level, so the parser saw nothing.

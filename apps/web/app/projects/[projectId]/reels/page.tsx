@@ -398,9 +398,11 @@ function MixBuilder({
       </CardHeader>
       <CardContent className="space-y-3">
         <p className="text-sm text-muted-foreground">
-          One click: the AI mines the best short moments from every clip in
-          this project, sequences them into a single arc, and renders it. The
-          result is a normal reel — preview, edit, export, publish.
+          One click: the AI mines the best moments from every clip in this
+          project, sequences them into a single arc, and renders it. Over 5
+          minutes it builds a long-form video from whole sections instead of
+          short highlights. The result is a normal reel — preview, edit,
+          export, publish.
         </p>
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="space-y-1.5">
@@ -408,8 +410,8 @@ function MixBuilder({
             <Slider
               value={duration}
               min={15}
-              max={300}
-              step={5}
+              max={1800}
+              step={15}
               onValueChange={setDuration}
             />
           </div>

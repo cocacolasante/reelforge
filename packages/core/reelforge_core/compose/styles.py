@@ -18,9 +18,13 @@ propose adjustments WITHIN these grammars' bounds.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from reelforge_core.compose.beats import BeatGrid
 from reelforge_core.models import AnalysisReport, ComposeConfig, RankedReel
+
+if TYPE_CHECKING:
+    from reelforge_core.compose.silence import SpeechEnvelope
 
 STYLE_NAMES = ("classic", "hype", "talking_head", "cinematic", "chill")
 
@@ -122,12 +126,15 @@ def plan_edit(
     analysis: AnalysisReport,
     config: ComposeConfig,
     beat_grid: BeatGrid | None,
+    envelope: "SpeechEnvelope | None" = None,
 ) -> EditPlan:
-    """Rewrite the base shot plan per the style grammar. Pure, deterministic."""
+    """Rewrite the base shot plan per the style grammar. Pure, deterministic.
+    `envelope` (the asset's measured speech activity) drives jump cuts; without
+    it they fall back to transcript word gaps."""
     if style == "hype":
         plan = _plan_hype(scene_bounds, analysis, beat_grid)
     elif style == "talking_head":
-        plan = _plan_talking_head(scene_bounds, analysis)
+        plan = _plan_talking_head(scene_bounds, analysis, envelope)
     elif style == "cinematic":
         plan = _plan_cinematic(scene_bounds)
     elif style == "chill":
@@ -142,7 +149,7 @@ def plan_edit(
     # Forced jump cuts apply to any style that didn't already do them
     # ("auto" is each grammar's own call; talking_head always does).
     if config.jump_cuts == "on" and style != "talking_head":
-        plan = _with_jump_cuts(plan, analysis)
+        plan = _with_jump_cuts(plan, analysis, envelope)
     return plan
 
 
@@ -238,12 +245,13 @@ def _beat_pieces(
 def _plan_talking_head(
     scene_bounds: list[tuple[int, float, float]],
     analysis: AnalysisReport,
+    envelope: "SpeechEnvelope | None" = None,
 ) -> EditPlan:
     """Jump-cut the dead air; alternate punch-ins instead of transitions;
     karaoke captions front and center."""
     from reelforge_core.compose.jumpcuts import apply_jump_cuts
 
-    shots_raw, cuts_raw = apply_jump_cuts(scene_bounds, analysis.transcript)
+    shots_raw, cuts_raw = apply_jump_cuts(scene_bounds, analysis.transcript, envelope=envelope)
     shots = [
         PlannedShot(
             idx,
@@ -303,13 +311,17 @@ def _plan_chill(scene_bounds: list[tuple[int, float, float]]) -> EditPlan:
     )
 
 
-def _with_jump_cuts(plan: EditPlan, analysis: AnalysisReport) -> EditPlan:
+def _with_jump_cuts(
+    plan: EditPlan, analysis: AnalysisReport, envelope: "SpeechEnvelope | None" = None
+) -> EditPlan:
     from reelforge_core.compose.jumpcuts import JUMP_CUT, split_on_silences
 
     shots: list[PlannedShot] = []
     per_cut: list[tuple[str, float] | None] = []
     for k, shot in enumerate(plan.shots):
-        pieces = split_on_silences((shot.in_ts, shot.out_ts), analysis.transcript)
+        pieces = split_on_silences(
+            (shot.in_ts, shot.out_ts), analysis.transcript, envelope=envelope
+        )
         for j, (ps, pe) in enumerate(pieces):
             if shots:
                 per_cut.append(

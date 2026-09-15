@@ -523,10 +523,40 @@ class VoiceoverTake(BaseModel):
         return max(0.0, min(3.0, self.volume))
 
 
+class PictureLayer(BaseModel):
+    """B-roll: a project clip or photo drawn OVER the main track for
+    [start_sec, end_sec] of the mezzanine — full frame or a picture-in-picture
+    box — while the main track's picture timing and audio carry on underneath.
+
+    Silent by design (the talking head keeps talking). A video layer plays its
+    source from `in_ts` at 1x for the window's length. `path` is resolved by
+    the API at enqueue, like shots and voiceover takes.
+    """
+
+    id: str = ""
+    kind: Literal["video", "photo"]
+    asset_id: str
+    path: str = ""
+    start_sec: float
+    end_sec: float
+    in_ts: float = 0.0
+    mode: Literal["full", "pip"] = "full"
+    pip_corner: Literal["tl", "tr", "bl", "br"] = "br"
+    # Box size as a fraction of the frame's width and height.
+    pip_scale: float = Field(default=0.4, ge=0.2, le=0.7)
+    ken_burns: bool = True  # photo layers drift like photo shots
+    fade_ms: int = Field(default=200, ge=0, le=2000)
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end_sec - self.start_sec)
+
+
 class ReelTimeline(BaseModel):
     shots: list[TimelineShot] = Field(default_factory=list)
     overlays: list[TextOverlay] = Field(default_factory=list)
     voiceovers: list[VoiceoverTake] = Field(default_factory=list)
+    layers: list[PictureLayer] = Field(default_factory=list)
 
     @property
     def total_duration(self) -> float:
@@ -585,6 +615,10 @@ class ComposeConfig(BaseModel):
     # each crossfade midpoint lands on a beat of the chosen music track.
     beat_sync: bool = True
     beat_sync_max_adjust_sec: float = 0.45
+    # Eye-contact correction (compose/eyecontact.py): nudge irises toward
+    # the lens in every extracted video clip. Off by default — it costs
+    # ~50 ms/frame and softens (doesn't erase) big glances.
+    eye_contact: bool = False
     music_volume_db: float = -18.0
     voice_volume_db: float = -14.0
     # Final-mix loudness normalization: one loudnorm pass on the mixed bus so

@@ -61,6 +61,18 @@ MIX_SYSTEM_PROMPT = (
     "Call record_mix exactly once."
 )
 
+LONG_FORM_NOTE = (
+    "\n\nLONG-FORM VIDEO\n"
+    "The target is about {minutes:.0f} minutes, so the candidates are whole "
+    "SECTIONS (roughly 20-90s), not highlights, and the result is one "
+    "watchable long video rather than a reel. Keep the viewer oriented: an "
+    "intro/overview belongs near the start, explanations keep setup before "
+    "detail, and a wrap-up/outro goes last. Cover the substance of every "
+    "source video unless it repeats another; interleave only where it helps "
+    "the flow. Use as many sections as the target needs — for long-form, "
+    "using a minority of the pool is NOT expected."
+)
+
 USER_DIRECTION_TEMPLATE = (
     "\n\nUSER DIRECTION\n"
     'The user asked for: "{prompt}"\n'
@@ -143,7 +155,9 @@ def build_moment_context(
         "features": moment.features.to_dict(),
         "scene_summary": summary,
         "tags": tags[:7],
-        "transcript_words": [[t, w] for t, w in words[:24]],
+        # Long-form sections (20s+) need enough of what's said to be placed
+        # in a sensible order; highlights stay compact.
+        "transcript_words": [[t, w] for t, w in words[: 80 if c.duration_sec >= 20 else 24]],
         "energy_peak_z": moment.features.energy_peak_z,
     }
 
@@ -343,7 +357,11 @@ async def sequence_mix(
 
         client = AsyncAnthropic()
 
+    from reelforge_core.mixes.mining import LONG_FORM_THRESHOLD_SEC
+
     system = MIX_SYSTEM_PROMPT
+    if target_sec > LONG_FORM_THRESHOLD_SEC:
+        system += LONG_FORM_NOTE.format(minutes=target_sec / 60.0)
     if prompt:
         system += USER_DIRECTION_TEMPLATE.format(prompt=prompt)
 

@@ -412,6 +412,17 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   ("database disk image is malformed"). Inspect via
   `docker exec reelforge-api-1 python -c ...` instead. Recovery if it ever
   recurs: stop everything, `sqlite3 db ".recover" | sqlite3 new.db`, swap in.
+- **A dead worker strands its jobs for an hour.** arq has no heartbeat: when
+  a worker process dies mid-job (2026-09-14: `grantmind context/outro`
+  analyses, exit 139 segfault — not reproduced by concurrent OpenCV decode or
+  concurrent Whisper load/transcribe/free), the job row stays `running` and
+  `arq:in-progress:{job_id}` blocks every other worker until its TTL
+  (`job_timeout` 3600s) expires. Workers now run with `restart: unless-stopped`
+  and `PYTHONFAULTHANDLER=1` (tracebacks for native crashes land in
+  `docker compose logs worker`). To unstick immediately: bring workers up,
+  then `redis-cli del arq:in-progress:{job_id}` — the job is still in
+  `arq:queue` and reruns (retry count +1). Only the API lifespan resets stale
+  `running` rows, so a worker-only crash never marks them failed.
 - **Two worker replicas** share `/data/reelforge.db`. WAL mode handles
   concurrent reads; writes are serialized per-connection by SQLite. That's
   fine for this workload (semantics upserts are rare and small).
@@ -593,6 +604,80 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   STYLE_BOUNDS or reverted per-entry — the director must never be able to
   fail a render. Director stamp = fingerprint(plan, style, model, d1) in the
   reel dir; unchanged re-composes are zero-token.
+- **Jump cuts + beat trims read the AUDIO, not just the transcript.**
+  `compose/silence.py` turns `working/{asset}/audio.wav` into a 20 ms RMS
+  envelope (threshold = p10 noise floor + 12 dB, capped at -30 dB).
+  Whisper word ends run up to ~0.4s early, so transcript-only jump cuts
+  clipped phrase endings and missed mis-timed pauses (builders dojo,
+  2026-09-14). With an envelope: `split_on_silences` removes measured
+  silence ≥0.45s keeping 0.1s pads (never a run that swallows a whole
+  transcribed word), `apply_jump_cuts` merges CONTIGUOUS scene bounds into
+  one span (pauses straddling a scene split used to survive) and trims the
+  span's outer dead air; beat sync gets per-clip `max_trims` from
+  `speech_free_tail` so a trim only eats trailing silence; the director may
+  not nudge talking-head cuts (`STYLE_BOUNDS["talking_head"]["max_nudge"]
+  = 0`). No audio.wav → the old transcript behavior. Editor: waveforms are
+  interactive (click = seek, drag = select → "Cut out"), the scissors split
+  at the playhead.
+- **B-roll picture layers.** `ReelTimeline.layers` (`PictureLayer`: a
+  project clip or photo over the main track for `[start_sec, end_sec]` of
+  the mezzanine, `mode` full | pip with corner + scale, fade, silent).
+  Layers never change shot durations — captions, beat sync and xfade math
+  are untouched. `compose/layers.py` pre-renders each to
+  `clips/layer_NNNN.mp4` at its box size (shared clip cache; subject-crop
+  fill), and `build_final_command(layers=...)` composites them right after
+  the crossfade chain (before unsharp/LUT/subtitles, so B-roll is graded and
+  text stays on top) with `setpts=+start/TB` + `overlay=eof_action=pass` —
+  FINAL PASS ONLY, never inside `_render_chunks`. Like shots and takes,
+  layer paths are blanked on GET/PUT and resolved in `enqueue_compose`; a
+  new timeline list needs all three plus the web Zod schema (Zod strips
+  unknown keys, so a missing schema silently deletes them on save).
+  Editor: "B-roll" card (`LayerRow`; the add clip/photo dialogs are shared
+  with shots via `addTarget`, `shotToLayer` places a 3s full-frame layer at
+  the playhead). Preview: one muted `<video>` per LAYER id (not per asset —
+  a cutaway from the main shot's own file needs its own element), synced in
+  `applyFrame` like voiceover takes; boxes mirror `layer_box` on the 9:16
+  preview frame, drawn above photo shots and below text overlays.
+  AI suggestions: `reelforge_core/broll/suggest.py` + `routers/broll.py`
+  (`POST /reels/{id}/broll/suggest`, job kind **"broll"** — added to
+  `JobKindLit` and the web `JobSchema` enum; one job per reel at a time) +
+  worker `suggest_broll_job`. The editor sends its CURRENT timeline; the job
+  maps main-track words to mezzanine time (`shot_segments` mirrors the
+  preview's `buildSegments`), catalogs photos + video scenes not already on
+  screen as main shots (`MAIN_OVERLAP_FRAC`), makes ONE `record_broll` call
+  (director model; scene thumbnails + photo thumbs as image blocks), and
+  `validate_suggestions` clamps/drops everything (1.5–6s, inside the reel
+  and the scene, no overlaps with each other or existing layers, ≤ 8).
+  Results ride the job row (`result.suggestions`); nothing touches the reel
+  until the user accepts in `BrollAssistant` and saves. No candidates or no
+  speech → a note, zero tokens.
+- **Eye-contact correction.** `ComposeConfig.eye_contact` (default off) →
+  `compose/eyecontact.py`, run on each freshly extracted VIDEO clip in both
+  `extract_clips` and `extract_timeline_clips` (never photos or B-roll
+  layers). MediaPipe FaceLandmarker (478 pts incl. iris) → per-eye iris
+  offset in eye widths vs the asset's own at-camera median
+  (`working/{asset}/gaze_ref.json`, keyed on version + source mtime) →
+  both eyes averaged, capped (0.12 sideways / 0.06 vertical), gated off for
+  blinks and |yaw| > 15-20°, smoothed 7 frames → `warp_eye` remaps only the
+  inside of the eye opening. Two streaming passes per clip (landmarks, then
+  warp + re-encode with the clip's audio) so long shots don't sit in RAM.
+  Best-effort: any failure leaves the clip untouched and it is NOT cached
+  (`_SkipCache`); the clip cache key gains `eye_contact: e1` only when on so
+  existing cached clips keep their keys. Limits from the CP3 prototype
+  (2026-09-14): shifts beyond ~0.12 eye widths leave a ghost iris, looking
+  down is barely fixable by warping, and an iris-redraw variant looked
+  painted-on. **Dependencies:** mediapipe requires opencv-contrib-python, but
+  scenedetect 0.7 hard-requires opencv-python and both packages install
+  `cv2` (they clobber each other) — `[tool.uv] override-dependencies` drops
+  opencv-python so contrib is the only provider; mediapipe's native lib needs
+  libegl1/libgles2 even on CPU (Dockerfile system stage); the model is
+  downloaded (pinned float16/1) to `/app/assets/models/face_landmarker.task`
+  (`REELFORGE_FACE_MODEL` overrides). Contrib also restored
+  `cv2.CascadeClassifier`: on the OpenCV 5 base wheel, `reframe.py`'s face
+  detection raised and every auto-reframe silently fell back to a centered
+  crop. The contrib wheel ships NO `cv2/data` XMLs, so the Haar face
+  cascade is downloaded (pinned opencv 4.10.0) next to the MediaPipe model
+  and `reframe._face_cascade_path` prefers it (`REELFORGE_FACE_CASCADE`).
 - **AI Mix (cross-clip reels).** `reelforge_core/mixes/` (mining /
   sequencer / planner / store) + `apps/api/routers/mixes.py` + worker
   `create_mix_job`. Invariants: the `mix-` **id prefix is the mix
@@ -605,9 +690,18 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   title/edit_json back via the sync store (`mixes/store.py`,
   publish/store.py pattern); `validate_sequence` + `fallback_sequence`
   mean a sequencing-model failure can never fail the render; generated
-  timelines must satisfy every PUT /edit rule (≤60 shots, ≥0.15s, real
+  timelines must satisfy every PUT /edit rule (≤300 shots, ≥0.15s, real
   transition kinds) — the editor is the mix's source of truth, which is
-  also why trim/edit-reset 400 for `mix-` ids.
+  also why trim/edit-reset 400 for `mix-` ids. **Long-form (target > 300s,
+  up to 1800s):** selection is per-asset, so a multi-clip "Long single span"
+  in the UI creates a mix instead (project page `SelectionPanel`
+  `acrossClips`). Mining switches to whole sections
+  (`LONG_FORM_BOUNDS` 20-90s, `fit_bounds_to_clip` for shorter clips,
+  `LONG_FORM_DEDUPE_OVERLAP` 0.3), the sequencer gets `LONG_FORM_NOTE`
+  (intro first, outro last, cover every clip) and 80 transcript words per
+  section. Shot caps (`MAX_MIX_SHOTS` = editor `MAX_TIMELINE_SHOTS` = 300)
+  are safe only because compose now chunks recursively
+  (`pipeline._render_hierarchy`: 300 shots -> 60 parts -> 12 -> 3).
 - **Only libx264 + AAC.** No NVENC, no hardware encode. Determinism and
   quality come first; we can revisit in Phase 7 after measuring.
 - **Do not use `-c copy` for clip extraction.** Stream-copy with `-ss` snaps to

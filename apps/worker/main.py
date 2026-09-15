@@ -15,6 +15,7 @@ from apps.worker.jobs import (
     export_reel_job,
     publish_reel_job,
     select_reels_job,
+    suggest_broll_job,
 )
 from apps.worker.logging_config import configure_logging
 from reelforge_core.db import init_db
@@ -75,6 +76,7 @@ class WorkerSettings:
         compile_montage_job,
         publish_reel_job,
         create_mix_job,
+        suggest_broll_job,
     ]
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
     # Lets the API abort in-flight jobs (e.g. when a source clip is deleted

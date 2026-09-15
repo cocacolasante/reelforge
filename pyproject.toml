@@ -19,7 +19,14 @@ dependencies = [
     "typer>=0.15",
     "rich>=13.9",
     # Analysis pipeline
-    "scenedetect[opencv]>=0.6.4",
+    # OpenCV comes from opencv-contrib-python only (see [tool.uv] overrides):
+    # mediapipe needs it, and it restores cv2.CascadeClassifier, which
+    # OpenCV 5's base wheel dropped — compose/reframe.py's face detection.
+    "scenedetect>=0.6.4",
+    "opencv-contrib-python>=5.0",
+    # Eye-contact correction (compose/eyecontact.py): FaceLandmarker iris
+    # landmarks. Needs libEGL/libGLES at load time even on CPU (Dockerfile).
+    "mediapipe>=1.0.1,<2",
     "faster-whisper>=1.0.0",
     "numpy>=1.26,<3",
     # Phase 5: API persistence + async I/O
@@ -38,6 +45,12 @@ dev = [
     "ruff>=0.8",
     "fakeredis>=2.26",
 ]
+
+[tool.uv]
+# scenedetect 0.7 hard-requires opencv-python; mediapipe requires
+# opencv-contrib-python. Both install `cv2` and clobber each other, so the
+# base wheel is overridden away (impossible marker) — contrib is a superset.
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

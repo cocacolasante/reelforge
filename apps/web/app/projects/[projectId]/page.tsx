@@ -40,7 +40,7 @@ import {
 } from '@/lib/api/hooks';
 import { humanMessage } from '@/lib/api/errors';
 import { APIError } from '@/lib/api/errors';
-import { resetUploaderStore } from '@/lib/upload/uploader';
+import { resetUploaderStore, useUploaderActive } from '@/lib/upload/uploader';
 import { api, API_BASE } from '@/lib/api/client';
 import { formatBytes, formatDuration } from '@/lib/format';
 
@@ -65,6 +65,9 @@ function ProjectDetail({ projectId }: { projectId: string }) {
     queryKey: ['project-reels', projectId],
     queryFn: () => api<{ reels: unknown[]; asset_count: number }>(`/projects/${projectId}/reels`),
   });
+  // Keeps the uploader on screen for a whole multi-file batch — otherwise it
+  // unmounted the moment the project's first clip landed.
+  const uploaderActive = useUploaderActive(projectId);
 
   const [showUploader, setShowUploader] = React.useState(false);
   const [jobIds, setJobIds] = React.useState<Record<string, string>>({});
@@ -186,7 +189,7 @@ function ProjectDetail({ projectId }: { projectId: string }) {
           ) : null}
         </CardHeader>
         <CardContent className="space-y-4">
-          {allAssets.length === 0 || showUploader ? (
+          {allAssets.length === 0 || showUploader || uploaderActive ? (
             <Uploader projectId={projectId} onComplete={onUploadComplete} />
           ) : null}
           {assetList.length > 0 ? (
@@ -251,6 +254,7 @@ function ProjectDetail({ projectId }: { projectId: string }) {
         </CardHeader>
         <CardContent className="space-y-4">
           <SelectionPanel
+            projectId={projectId}
             assets={assetList.map((a) => ({
               id: a.id,
               analysisReady: a.analysis_ready,
@@ -409,12 +413,14 @@ function AssetRow({
 // ---- selection panel ----------------------------------------------------
 
 function SelectionPanel({
+  projectId,
   assets,
   activeJobIds,
   existingReelCount,
   onQueued,
   onJobSettled,
 }: {
+  projectId: string;
   assets: Array<{ id: string; analysisReady: boolean }>;
   activeJobIds: string[];
   existingReelCount: number;
@@ -425,6 +431,10 @@ function SelectionPanel({
   ) => void;
 }) {
   const enqueue = useEnqueueSelect();
+  const router = useRouter();
+  // Long form across several clips builds ONE AI video (a long-form mix)
+  // instead of one long reel per clip.
+  const [longJobId, setLongJobId] = React.useState<string | null>(null);
   const [form, setForm] = React.useState<'short' | 'long_single' | 'long_montage'>('short');
   const [minSec, setMinSec] = React.useState<number[]>([30]);
   const [maxSec, setMaxSec] = React.useState<number[]>([60]);
@@ -448,11 +458,34 @@ function SelectionPanel({
   }, [form, minSec, maxSec]);
 
   const readyAssetIds = assets.filter((a) => a.analysisReady).map((a) => a.id);
+  const acrossClips = form === 'long_single' && readyAssetIds.length >= 2;
+
+  const runLongVideo = async () => {
+    setErrorMsg(null);
+    try {
+      const job = await api<{ id: string }>(`/projects/${projectId}/mixes`, {
+        method: 'POST',
+        body: {
+          target_duration_sec: longTarget[0],
+          prompt: prompt.trim() || null,
+          style: 'auto',
+        },
+      });
+      setLongJobId(job.id);
+    } catch (err) {
+      setErrorMsg(humanMessage(err));
+    }
+  };
 
   const startSelect = () => {
     setErrorMsg(null);
     if (readyAssetIds.length === 0) {
       setErrorMsg('Analyze at least one source clip first.');
+      return;
+    }
+    if (acrossClips) {
+      // A new video alongside the existing reels — nothing gets replaced.
+      void runLongVideo();
       return;
     }
     if (existingReelCount > 0) {
@@ -533,7 +566,9 @@ function SelectionPanel({
           {form === 'short'
             ? 'Multiple short reels, each in the chosen duration range.'
             : form === 'long_single'
-            ? 'One long span per source clip, sized near the target duration.'
+            ? readyAssetIds.length >= 2
+              ? `One long video built from the best parts of all ${readyAssetIds.length} clips — the AI picks sections and puts them in order.`
+              : 'One long span from the source clip, sized near the target duration.'
             : 'Top short reels stitched into one longer video (per source).'}
         </p>
       </div>
@@ -676,10 +711,17 @@ function SelectionPanel({
         </p>
       ) : null}
 
-      <Button onClick={startSelect} disabled={enqueue.isPending || readyAssetIds.length === 0}>
+      <Button
+        onClick={startSelect}
+        disabled={enqueue.isPending || readyAssetIds.length === 0 || !!longJobId}
+      >
         <Wand2 className="h-4 w-4" />
         {enqueue.isPending
           ? 'Starting…'
+          : acrossClips
+          ? longJobId
+            ? 'Building your long video…'
+            : `Create one long video from ${readyAssetIds.length} clips`
           : existingReelCount > 0
           ? `Re-select reels from ${readyAssetIds.length} clip${readyAssetIds.length === 1 ? '' : 's'}`
           : `Select reels from ${readyAssetIds.length} clip${readyAssetIds.length === 1 ? '' : 's'}`}
@@ -714,6 +756,22 @@ function SelectionPanel({
         </DialogContent>
       </Dialog>
 
+      {longJobId ? (
+        <JobProgress
+          jobId={longJobId}
+          variant="compose"
+          onDone={(result) => {
+            setLongJobId(null);
+            const reelId =
+              result && typeof result === 'object' && 'reel_id' in result
+                ? String((result as { reel_id?: unknown }).reel_id)
+                : null;
+            router.push(reelId ? `/projects/${projectId}/reels/${reelId}` : `/projects/${projectId}/reels`);
+          }}
+          onFail={() => setLongJobId(null)}
+        />
+      ) : null}
+
       {activeJobIds.length > 0 ? (
         <div className="space-y-2">
           {activeJobIds.map((jid) => (
@@ -722,11 +780,17 @@ function SelectionPanel({
               jobId={jid}
               variant="select"
               onDone={(result) => {
-                const reelCount =
-                  result && typeof result === 'object' && 'reel_count' in result
-                    ? Number((result as { reel_count?: unknown }).reel_count) || 0
-                    : 0;
-                if (reelCount === 0 && prompt.trim()) setZeroMatchNote(true);
+                const r = (result && typeof result === 'object' ? result : {}) as {
+                  reel_count?: unknown;
+                  candidates_generated?: unknown;
+                };
+                const reelCount = Number(r.reel_count) || 0;
+                // Only blame the direction when there were candidates and the
+                // ranker rejected them all — zero candidates means nothing was
+                // ever compared against the prompt.
+                const hadCandidates =
+                  r.candidates_generated === undefined ? true : Number(r.candidates_generated) > 0;
+                if (reelCount === 0 && prompt.trim() && hadCandidates) setZeroMatchNote(true);
                 onJobSettled(jid, { ok: true, reelCount });
               }}
               onFail={() => onJobSettled(jid, { ok: false, reelCount: 0 })}

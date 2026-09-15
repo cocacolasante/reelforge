@@ -74,8 +74,23 @@ async def enqueue_compose(
                     "open the editor to remove it.",
                 )
             resolved_takes.append(take.model_copy(update={"path": a.path}))
+        resolved_layers = []
+        for j, layer in enumerate(tl.layers):
+            a = await db.get(dbmod.Asset, layer.asset_id)
+            if a is None or a.project_id != reel.project_id:
+                raise ApiError(
+                    409,
+                    "ASSET_NOT_FOUND",
+                    f"B-roll layer {j + 1} of the saved edit references a clip or "
+                    "photo that was deleted — open the editor to remove it.",
+                )
+            resolved_layers.append(layer.model_copy(update={"path": a.path}))
         body["timeline"] = tl.model_copy(
-            update={"shots": resolved_shots, "voiceovers": resolved_takes}
+            update={
+                "shots": resolved_shots,
+                "voiceovers": resolved_takes,
+                "layers": resolved_layers,
+            }
         ).model_dump()
         # The timeline already carries its photos; stray inserts would double up.
         body.pop("photo_inserts", None)

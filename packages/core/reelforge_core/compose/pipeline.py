@@ -191,12 +191,14 @@ async def _render_chunks(
     reel_dir: Path,
     log_file: Path,
     progress: ProgressCallback,
+    level: int = 0,
 ) -> tuple[list, list[tuple[str, float]]]:
     """Render clip groups to intermediate parts. Each part carries its
     internal transitions, per-clip effects (Ken Burns / punch-in), and
     per-shot audio gains; captions/music/LUT/unsharp/loudnorm are left for
     the final pass — the mezzanine timeline is identical to a single-pass
-    render. Returns (part ClipInfos, boundary transitions)."""
+    render. Returns (part ClipInfos, boundary transitions). `level` > 0 is a
+    chunk-of-chunks pass (see _render_hierarchy)."""
     from reelforge_core.compose.clips import ClipInfo
     from reelforge_core.compose.graph_builder import build_final_command
 
@@ -214,7 +216,7 @@ async def _render_chunks(
     part_infos: list = []
     boundary: list[tuple[str, float]] = []
     for gi, (a, b) in enumerate(slices):
-        part_path = tmp_dir / f"part_{gi:02d}.mp4"
+        part_path = tmp_dir / (f"part_{gi:02d}.mp4" if level == 0 else f"part_L{level}_{gi:02d}.mp4")
         plan = build_final_command(
             clips=clips[a:b],
             analysis=analysis,
@@ -249,12 +251,35 @@ async def _render_chunks(
         if b - 1 < len(transitions):
             boundary.append(transitions[b - 1])
     log.info(
-        "hierarchical render: %d clips -> %d chunk(s) of <= %d",
+        "hierarchical render (level %d): %d clips -> %d chunk(s) of <= %d",
+        level,
         len(clips),
         len(slices),
         CHUNK_SIZE,
     )
     return part_infos, boundary
+
+
+async def _render_hierarchy(
+    clips: list,
+    transitions: list[tuple[str, float]],
+    analysis: AnalysisReport,
+    config: ComposeConfig,
+    reel_dir: Path,
+    log_file: Path,
+    progress: ProgressCallback,
+) -> tuple[list, list[tuple[str, float]]]:
+    """Chunk until the final pass has at most MAX_CHAIN_INPUTS inputs. One
+    level was enough for <= 30 shots; a long-form timeline (300 shots -> 60
+    parts) would otherwise hand the final pass a 60-input xfade chain — the
+    shape that OOM'd at 12 inputs."""
+    level = 0
+    while len(clips) > MAX_CHAIN_INPUTS:
+        clips, transitions = await _render_chunks(
+            clips, transitions, analysis, config, reel_dir, log_file, progress, level=level
+        )
+        level += 1
+    return clips, transitions
 
 
 async def compose(
@@ -324,6 +349,15 @@ async def compose(
             sources[shot.asset_id] = await asyncio.to_thread(_probe, path)
             if shot.kind == "video":
                 analyses[shot.asset_id] = _load_analysis(data_dir, shot.asset_id)
+        for layer in timeline.layers:
+            if layer.kind != "video" or layer.asset_id in sources:
+                continue
+            path = Path(layer.path) if layer.path else None
+            if path is None or not path.exists():
+                raise ComposeError(
+                    f"B-roll layer references asset {layer.asset_id} with missing file {layer.path!r}"
+                )
+            sources[layer.asset_id] = await asyncio.to_thread(_probe, path)
         per_cut = [
             (
                 (s.transition_after.kind, s.transition_after.duration_sec)
@@ -364,7 +398,14 @@ async def compose(
             from reelforge_core.compose.beats import detect_beats
 
             beat_grid = await asyncio.to_thread(detect_beats, Path(track.path))
-        edit_plan = plan_edit(style, base_bounds, reel, analysis, config, beat_grid)
+        from reelforge_core.compose.silence import load_speech_envelope
+
+        # Measured silence for jump cuts and speech-safe beat trims; None (no
+        # analysis audio) falls back to transcript word gaps.
+        scene_envelope = await asyncio.to_thread(load_speech_envelope, working / "audio.wav")
+        edit_plan = plan_edit(
+            style, base_bounds, reel, analysis, config, beat_grid, scene_envelope
+        )
         if style != "classic":
             log.info(
                 "edit style %r: %d shot(s) -> %d%s",
@@ -422,11 +463,43 @@ async def compose(
         if beat_grid is None:
             beat_grid = await asyncio.to_thread(detect_beats, Path(track.path))
         if beat_grid is not None:
+            from reelforge_core.compose.silence import load_speech_envelope, speech_free_tail
+
+            # A beat trim may only eat trailing silence — trimming speech-edge
+            # shots clipped the last word of phrases (builders dojo, 2026-09-14).
+            # Caps are in output seconds; None = no audio to protect / unknown.
+            max_trims: list[float | None] = []
+            if timeline is not None:
+                envelopes: dict[str, object] = {}
+                for s in timeline.shots:
+                    if s.kind != "video" or s.muted or (s.speed or 1.0) != 1.0:
+                        max_trims.append(None)
+                        continue
+                    if s.asset_id not in envelopes:
+                        envelopes[s.asset_id] = await asyncio.to_thread(
+                            load_speech_envelope, data_dir / "working" / s.asset_id / "audio.wav"
+                        )
+                    a = analyses.get(s.asset_id)
+                    max_trims.append(
+                        speech_free_tail(
+                            s.in_ts,
+                            s.out_ts,
+                            envelopes[s.asset_id],  # type: ignore[arg-type]
+                            a.transcript if a is not None else None,
+                        )
+                    )
+            elif plan_shots is not None:
+                for ps in plan_shots:
+                    tail = speech_free_tail(
+                        ps.in_ts, ps.out_ts, scene_envelope, analysis.transcript
+                    )
+                    max_trims.append(None if tail is None else tail / (ps.speed or 1.0))
             end_trims = compute_beat_end_trims(
                 planned_durations,
                 xfade_durs,
                 beat_grid,
                 config.beat_sync_max_adjust_sec,
+                max_trims=max_trims or None,
             )
             if any(t > 0 for t in end_trims):
                 log.info(
@@ -529,6 +602,22 @@ async def compose(
         )
         xfade_durs = [d for _, d in transitions]
 
+    # B-roll layers: pre-rendered at their box size, composited in the final
+    # pass. They don't touch shot durations, so nothing above changes.
+    layer_inputs: list = []
+    if timeline is not None and timeline.layers:
+        from reelforge_core.compose.layers import extract_layer_clips
+
+        program_sec = max(0.1, sum(c.duration for c in clips) - sum(xfade_durs))
+        try:
+            layer_inputs = await extract_layer_clips(
+                list(timeline.layers), sources, config, reel_dir, log_file, program_sec
+            )
+        except FFmpegError as exc:
+            raise ComposeError(f"B-roll layer render failed: {exc}") from exc
+        except FileNotFoundError as exc:
+            raise ComposeError(str(exc)) from exc
+
     await progress(_emit("clips", 1.0))
 
     # ----- captions -----
@@ -621,12 +710,9 @@ async def compose(
     # threshold, render hierarchically: chunks of clips (internal transitions
     # + per-clip effects) to intermediates, then one small final pass with
     # captions/music/LUT — the mezzanine timeline is identical either way.
-    if len(clips) > MAX_CHAIN_INPUTS:
-        render_clips, render_transitions = await _render_chunks(
-            clips, transitions, analysis, config, reel_dir, log_file, progress
-        )
-    else:
-        render_clips, render_transitions = clips, transitions
+    render_clips, render_transitions = await _render_hierarchy(
+        clips, transitions, analysis, config, reel_dir, log_file, progress
+    )
 
     plan = build_final_command(
         clips=render_clips,
@@ -637,6 +723,7 @@ async def compose(
         output_path=mezzanine_path,
         transitions=render_transitions,
         voiceovers=voiceovers,
+        layers=layer_inputs or None,
     )
 
     try:

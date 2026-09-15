@@ -198,7 +198,11 @@ def _chunk_words_to_lines(
 
 
 def _event_text(words: list[TranscriptWord], max_chars: int) -> str:
-    """Emit the event text with `\\N` linebreaks at max_chars boundaries."""
+    """Emit the event text with `\\N` linebreaks at max_chars boundaries.
+
+    Already escaped — pass it to `_event_raw`. Escaping the joined text
+    doubled the linebreak's backslash (`\\\\N`), so every two-line static
+    caption rendered a literal "\\" at the end of its first line."""
     lines: list[str] = []
     current: list[str] = []
     current_len = 0
@@ -216,7 +220,7 @@ def _event_text(words: list[TranscriptWord], max_chars: int) -> str:
             current_len += addition
     if current:
         lines.append(" ".join(current))
-    return "\\N".join(lines)
+    return "\\N".join(_escape_text(line) for line in lines)
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +290,7 @@ def _render_word_events(words: list[TranscriptWord], mt, config: ComposeConfig) 
             end = mt(ev[-1].end)
             if end <= start:
                 end = start + 0.3
-            out.append(_event(start, end, _event_text(ev, config.captions.max_chars_per_line)))
+            out.append(_event_raw(start, end, _event_text(ev, config.captions.max_chars_per_line)))
     return out
 
 

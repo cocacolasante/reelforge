@@ -201,6 +201,26 @@ def test_build_captions_escapes_braces() -> None:
         assert r"\{weird\}" in text
 
 
+def test_static_two_line_caption_has_a_real_linebreak() -> None:
+    """The linebreak must stay `\\N`: escaping the joined text doubled it to
+    `\\\\N`, and libass drew a literal backslash on every wrapped caption."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        scenes = [_scene(0, 0, 30)]
+        words = [
+            TranscriptWord(start=1.0 + i * 0.3, end=1.25 + i * 0.3, word=w, probability=0.9)
+            for i, w in enumerate([" some", " quick", " context", " {non}", " profits", " live"])
+        ]
+        analysis = _analysis_with_transcript(words, scenes)
+        cfg = ComposeConfig(captions=CaptionStyle(mode="static", max_chars_per_line=16, max_lines=2))
+        text = build_captions(_reel([0], 0, 30), analysis, cfg, Path(td)).read_text()
+        dialogue = next(line for line in text.splitlines() if line.startswith("Dialogue:"))
+        assert "\\N" in dialogue
+        assert "\\\\N" not in dialogue
+        assert r"\{non\}" in dialogue and r"\\{" not in dialogue  # braces escaped exactly once
+
+
 def test_build_captions_karaoke_one_event_per_word() -> None:
     import tempfile
 

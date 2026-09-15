@@ -33,7 +33,8 @@ MIX_STYLES = ("auto", "classic", "hype", "talking_head", "cinematic", "chill")
 
 
 class MixCreate(BaseModel):
-    target_duration_sec: float = Field(default=45.0, ge=15.0, le=300.0)
+    # Up to 30 min: long targets become long-form videos built from sections.
+    target_duration_sec: float = Field(default=45.0, ge=15.0, le=1800.0)
     prompt: str | None = Field(default=None, max_length=500)
     style: str = "auto"
     aspect: str = "9:16"

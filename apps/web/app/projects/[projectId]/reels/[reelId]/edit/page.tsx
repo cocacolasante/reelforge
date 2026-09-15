@@ -6,8 +6,10 @@ import { useQueryClient } from '@tanstack/react-query';
 import {
   ArrowDown,
   ArrowUp,
+  Check,
   Film,
   Image as ImageIcon,
+  Layers,
   Mic,
   Play,
   Plus,
@@ -17,9 +19,11 @@ import {
   RotateCcw,
   Save,
   Scissors,
+  Sparkles,
   Trash2,
   Type,
   Wand2,
+  X,
 } from 'lucide-react';
 import { AppShell } from '@/components/layouts/app-shell';
 import { JobProgress } from '@/components/app/job-progress';
@@ -52,9 +56,13 @@ import {
   useReelEdit,
   useResetReelEdit,
   useSaveReelEdit,
+  useSuggestBroll,
   useUploadVoiceover,
 } from '@/lib/api/hooks';
+import { BrollResultSchema, type BrollSuggestion } from '@/lib/api/schemas';
+import { useJobStream } from '@/lib/sse/job-stream';
 import type {
+  PictureLayer,
   ReelTimeline,
   SourceAudio,
   SourcePhoto,
@@ -118,6 +126,15 @@ function round1(n: number): number {
   return Math.round(n * 10) / 10;
 }
 
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/** Mirrors the PUT /edit minimum shot length. */
+const MIN_EDIT_SHOT_SEC = 0.15;
+/** Jump cut between the pieces of a split / cut-out shot. */
+const HARD_CUT = { kind: 'cut', duration_sec: 0.04 };
+
 function newOverlayId(): string {
   return Math.random().toString(36).slice(2, 10);
 }
@@ -156,6 +173,36 @@ function photoShot(asset_id: string): TimelineShot {
   };
 }
 
+const DEFAULT_LAYER_SEC = 3;
+const PIP_SIZES = [0.25, 0.35, 0.45, 0.6] as const;
+const PIP_CORNERS: { value: PictureLayer['pip_corner']; label: string }[] = [
+  { value: 'tl', label: 'top left' },
+  { value: 'tr', label: 'top right' },
+  { value: 'bl', label: 'bottom left' },
+  { value: 'br', label: 'bottom right' },
+];
+
+/** A picked clip/photo as a full-screen B-roll layer starting at `at`
+ * (mezzanine seconds), up to 3s long and kept inside the reel. */
+function shotToLayer(shot: TimelineShot, at: number, total: number): PictureLayer {
+  const srcLen = shot.kind === 'video' ? Math.max(MIN_EDIT_SHOT_SEC, shot.out_ts - shot.in_ts) : DEFAULT_LAYER_SEC;
+  const dur = Math.min(DEFAULT_LAYER_SEC, srcLen);
+  const start = round1(Math.max(0, Math.min(at, Math.max(0, total - dur))));
+  return {
+    id: newOverlayId(),
+    kind: shot.kind,
+    asset_id: shot.asset_id,
+    start_sec: start,
+    end_sec: round2(start + dur),
+    in_ts: shot.kind === 'video' ? shot.in_ts : 0,
+    mode: 'full',
+    pip_corner: 'br',
+    pip_scale: 0.4,
+    ken_burns: true,
+    fade_ms: 200,
+  };
+}
+
 // ---------- page ----------
 
 export default function ReelEditPage({
@@ -185,9 +232,12 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
   const [resetOpen, setResetOpen] = React.useState(false);
   const [addClipOpen, setAddClipOpen] = React.useState(false);
   const [addPhotoOpen, setAddPhotoOpen] = React.useState(false);
+  // What the add clip/photo dialogs add: a shot, or a B-roll layer at the playhead.
+  const [addTarget, setAddTarget] = React.useState<'shot' | 'layer'>('shot');
   const previewRef = React.useRef<TimelinePreviewHandle>(null);
   const [recording, setRecording] = React.useState(false);
   const [previewT, setPreviewT] = React.useState(0);
+  const [eyeContact, setEyeContact] = React.useState(false);
 
   // Seed local state from the server once (and again after a reset).
   React.useEffect(() => {
@@ -229,7 +279,7 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
       if (dirty) await doSave();
       const job = await compose.mutateAsync({
         reelId,
-        config: { captions: { mode: 'karaoke' } },
+        config: { captions: { mode: 'karaoke' }, ...(eyeContact ? { eye_contact: true } : {}) },
       });
       setComposeJobId(job.id);
     } catch {
@@ -255,20 +305,60 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
     });
   const deleteShot = (i: number) =>
     update((t) => ({ ...t, shots: t.shots.filter((_, k) => k !== i) }));
-  const splitShot = (i: number) =>
+  // Split shot i at `at` (source seconds; default the middle). The halves are
+  // joined by a hard cut so nothing crossfades or plays twice.
+  const splitShot = (i: number, at?: number) =>
     update((t) => {
       const s = t.shots[i];
-      if (s.kind !== 'video' || s.out_ts - s.in_ts < 1.0) return t;
-      const mid = round1((s.in_ts + s.out_ts) / 2);
-      const a = { ...s, out_ts: mid, transition_after: null };
+      if (s.kind !== 'video') return t;
+      const mid = round2(at ?? (s.in_ts + s.out_ts) / 2);
+      if (mid - s.in_ts < MIN_EDIT_SHOT_SEC || s.out_ts - mid < MIN_EDIT_SHOT_SEC) return t;
+      const a = { ...s, out_ts: mid, transition_after: HARD_CUT };
       const b = { ...s, in_ts: mid };
       return { ...t, shots: [...t.shots.slice(0, i), a, b, ...t.shots.slice(i + 1)] };
     });
+  // Remove [from, to] (source seconds) from shot i — e.g. dead air the AI
+  // missed. What's left either side is joined by a hard jump cut; a leftover
+  // sliver shorter than the minimum shot length is dropped.
+  const cutOutRange = (i: number, from: number, to: number) =>
+    update((t) => {
+      const s = t.shots[i];
+      if (s.kind !== 'video') return t;
+      const a = round2(Math.max(s.in_ts, Math.min(from, to)));
+      const b = round2(Math.min(s.out_ts, Math.max(from, to)));
+      if (b - a < 0.05) return t;
+      const pieces: TimelineShot[] = [];
+      if (a - s.in_ts >= MIN_EDIT_SHOT_SEC) pieces.push({ ...s, out_ts: a, transition_after: HARD_CUT });
+      if (s.out_ts - b >= MIN_EDIT_SHOT_SEC) pieces.push({ ...s, in_ts: b });
+      if (pieces.length > 0) {
+        // The last surviving piece keeps the shot's own outgoing transition.
+        pieces[pieces.length - 1] = { ...pieces[pieces.length - 1], transition_after: s.transition_after };
+      }
+      return { ...t, shots: [...t.shots.slice(0, i), ...pieces, ...t.shots.slice(i + 1)] };
+    });
+  // Seconds into shot i's source range -> preview timeline (speed-aware).
+  const seekShot = (i: number, sec: number) => {
+    const seg = segments[i];
+    if (!seg) return;
+    previewRef.current?.seek(seg.start + sec / Math.max(0.25, seg.shot.speed || 1));
+  };
   const patchShot = (i: number, patch: Partial<TimelineShot>) =>
     update((t) => ({
       ...t,
       shots: t.shots.map((s, k) => (k === i ? { ...s, ...patch } : s)),
     }));
+
+  // ---- B-roll layers ----
+  const addFromDialog = (shot: TimelineShot) =>
+    update((t) =>
+      addTarget === 'layer'
+        ? { ...t, layers: [...t.layers, shotToLayer(shot, previewT, totalDuration(t.shots))] }
+        : { ...t, shots: [...t.shots, shot] },
+    );
+  const patchLayer = (i: number, patch: Partial<PictureLayer>) =>
+    update((t) => ({ ...t, layers: t.layers.map((x, k) => (k === i ? { ...x, ...patch } : x)) }));
+  const deleteLayer = (i: number) =>
+    update((t) => ({ ...t, layers: t.layers.filter((_, k) => k !== i) }));
 
   const sourceFor = (id: string) => videos.find((v) => v.asset_id === id);
   const segments = buildSegments(timeline.shots);
@@ -298,7 +388,19 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
             {dirty ? <span className="ml-2 text-amber-500">unsaved changes</span> : null}
           </p>
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <label
+            className="flex items-center gap-1.5 text-xs text-muted-foreground"
+            title="Nudge eyes toward the camera in the render (slower: ~1.5–2 min per minute of footage)"
+          >
+            <input
+              type="checkbox"
+              checked={eyeContact}
+              onChange={(e) => setEyeContact(e.target.checked)}
+              className="h-3.5 w-3.5 accent-primary"
+            />
+            Eye contact
+          </label>
           {/* An AI mix has no scene-derived AI cut to fall back to — the
               timeline IS the mix (and the API 400s the reset). */}
           {!reelId.startsWith('mix-') ? (
@@ -376,20 +478,30 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
         </CardContent>
       </Card>
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
         {/* ===== Shots ===== */}
         <Card>
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle>Shots</CardTitle>
             <div className="flex gap-2">
-              <Button size="sm" variant="outline" onClick={() => setAddClipOpen(true)}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setAddTarget('shot');
+                  setAddClipOpen(true);
+                }}
+              >
                 <Film className="h-4 w-4" />
                 Add clip
               </Button>
               <Button
                 size="sm"
                 variant="outline"
-                onClick={() => setAddPhotoOpen(true)}
+                onClick={() => {
+                  setAddTarget('shot');
+                  setAddPhotoOpen(true);
+                }}
                 disabled={photos.length === 0}
                 title={photos.length === 0 ? 'Upload photos to the project first' : undefined}
               >
@@ -412,12 +524,14 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
                 photo={photos.find((p) => p.asset_id === s.asset_id)}
                 onPatch={(patch) => patchShot(i, patch)}
                 onMove={(dir) => moveShot(i, dir)}
-                onSplit={() => splitShot(i)}
+                onSplit={(at) => splitShot(i, at)}
+                onCutOut={(from, to) => cutOutRange(i, from, to)}
+                onSeek={(sec) => seekShot(i, sec)}
                 onDelete={() => deleteShot(i)}
                 onJump={() => jumpToShot(i)}
                 playhead={
                   segments[i] && previewT >= segments[i].start && previewT <= segments[i].end
-                    ? previewT - segments[i].start
+                    ? (previewT - segments[i].start) * Math.max(0.25, s.speed || 1)
                     : null
                 }
               />
@@ -425,6 +539,8 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
           </CardContent>
         </Card>
 
+        {/* Right column: text, B-roll and voiceover stack beside the shot list. */}
+        <div className="space-y-6">
         {/* ===== Text overlays ===== */}
         <Card>
           <CardHeader className="flex flex-row items-center justify-between">
@@ -483,6 +599,74 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
           </CardContent>
         </Card>
 
+        {/* ===== B-roll ===== */}
+        <Card>
+          <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
+            <CardTitle>B-roll</CardTitle>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                title="Show another clip over your footage, starting at the playhead"
+                onClick={() => {
+                  setAddTarget('layer');
+                  setAddClipOpen(true);
+                }}
+              >
+                <Layers className="h-4 w-4" />
+                Clip at playhead
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                title="Show a photo over your footage, starting at the playhead"
+                disabled={photos.length === 0}
+                onClick={() => {
+                  setAddTarget('layer');
+                  setAddPhotoOpen(true);
+                }}
+              >
+                <ImageIcon className="h-4 w-4" />
+                Photo at playhead
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <BrollAssistant
+              reelId={reelId}
+              timeline={timeline}
+              onAccept={(layers) => update((t) => ({ ...t, layers: [...t.layers, ...layers] }))}
+              onPreview={(sec) => previewRef.current?.seek(sec)}
+            />
+            {timeline.layers.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                Cut away to other clips or photos while you keep talking — full screen or
+                picture-in-picture. Your audio keeps playing underneath.
+              </p>
+            ) : null}
+            {timeline.layers.map((layer, i) => (
+              <LayerRow
+                key={layer.id || i}
+                layer={layer}
+                total={total}
+                previewT={previewT}
+                source={layer.kind === 'video' ? sourceFor(layer.asset_id) : undefined}
+                photo={layer.kind === 'photo' ? photos.find((p) => p.asset_id === layer.asset_id) : undefined}
+                onPatch={(patch) => patchLayer(i, patch)}
+                onDelete={() => deleteLayer(i)}
+                // Land just past the fade-in so the layer is actually visible.
+                onJump={() =>
+                  previewRef.current?.seek(
+                    layer.start_sec +
+                      Math.min(layer.fade_ms / 1000, (layer.end_sec - layer.start_sec) / 3) +
+                      0.01,
+                  )
+                }
+              />
+            ))}
+          </CardContent>
+        </Card>
+
         {/* ===== Voiceover ===== */}
         <VoiceoverPanel
           projectId={projectId}
@@ -496,6 +680,7 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
           onRefreshSources={() => void edit.refetch()}
           previewT={previewT}
         />
+        </div>
       </div>
 
       {/* ===== dialogs ===== */}
@@ -503,13 +688,25 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
         open={addClipOpen}
         onOpenChange={setAddClipOpen}
         videos={videos}
-        onAdd={(shot) => update((t) => ({ ...t, shots: [...t.shots, shot] }))}
+        onAdd={addFromDialog}
+        title={addTarget === 'layer' ? 'Add B-roll clip' : undefined}
+        description={
+          addTarget === 'layer'
+            ? `Plays silently over your footage from the playhead (${formatDuration(previewT)}), up to 3s — adjust after adding.`
+            : undefined
+        }
       />
       <AddPhotoDialog
         open={addPhotoOpen}
         onOpenChange={setAddPhotoOpen}
         photos={photos}
-        onAdd={(shot) => update((t) => ({ ...t, shots: [...t.shots, shot] }))}
+        onAdd={addFromDialog}
+        title={addTarget === 'layer' ? 'Add B-roll photo' : undefined}
+        description={
+          addTarget === 'layer'
+            ? `Shown over your footage from the playhead (${formatDuration(previewT)}) for 3s — adjust after adding.`
+            : undefined
+        }
       />
       <Dialog open={resetOpen} onOpenChange={setResetOpen}>
         <DialogContent className="sm:max-w-md">
@@ -543,6 +740,8 @@ function ShotRow({
   onPatch,
   onMove,
   onSplit,
+  onCutOut,
+  onSeek,
   onDelete,
   onJump,
   playhead = null,
@@ -554,12 +753,28 @@ function ShotRow({
   photo?: SourcePhoto;
   onPatch: (p: Partial<TimelineShot>) => void;
   onMove: (dir: -1 | 1) => void;
-  onSplit: () => void;
+  /** Split at source time `at` (default: the middle). */
+  onSplit: (at?: number) => void;
+  /** Remove [from, to] (source seconds) from this shot. */
+  onCutOut: (from: number, to: number) => void;
+  /** Seconds into this shot's source range -> move the preview there. */
+  onSeek: (sec: number) => void;
   onDelete: () => void;
   onJump: () => void;
+  /** Seconds into this shot's SOURCE range; null when the playhead is elsewhere. */
   playhead?: number | null;
 }) {
   const isPhoto = shot.kind === 'photo';
+  // Waveform selection, seconds into [in_ts, out_ts]. Stale once the shot's
+  // bounds move, so it resets with them.
+  const [selection, setSelection] = React.useState<[number, number] | null>(null);
+  React.useEffect(() => setSelection(null), [shot.in_ts, shot.out_ts]);
+  const shotLen = shot.out_ts - shot.in_ts;
+  const splitAt = playhead !== null ? shot.in_ts + playhead : null;
+  const canSplitAt =
+    splitAt !== null &&
+    splitAt - shot.in_ts >= MIN_EDIT_SHOT_SEC &&
+    shot.out_ts - splitAt >= MIN_EDIT_SHOT_SEC;
   const srcDur = source?.duration_sec ?? Infinity;
   const thumb = isPhoto
     ? photo
@@ -655,14 +870,63 @@ function ShotRow({
           )}
 
           {!isPhoto ? (
-            <WaveformBar
-              assetId={shot.asset_id}
-              start={shot.in_ts}
-              end={shot.out_ts}
-              playhead={playhead}
-              muted={shot.muted}
-              height={32}
-            />
+            <div className="space-y-1">
+              <WaveformBar
+                assetId={shot.asset_id}
+                start={shot.in_ts}
+                end={shot.out_ts}
+                playhead={playhead}
+                muted={shot.muted}
+                height={40}
+                buckets={240}
+                onSeek={onSeek}
+                selection={selection}
+                onSelect={(from, to) => {
+                  setSelection([from, to]);
+                  onSeek(from);
+                }}
+              />
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                {selection ? (
+                  <>
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      className="h-7 px-2"
+                      title="Remove the selected section; the rest joins with a jump cut"
+                      onClick={() => {
+                        onCutOut(shot.in_ts + selection[0], shot.in_ts + selection[1]);
+                        setSelection(null);
+                      }}
+                    >
+                      <Scissors className="h-3.5 w-3.5" />
+                      Cut out {(selection[1] - selection[0]).toFixed(2)}s
+                    </Button>
+                    <span className="text-muted-foreground">
+                      {(shot.in_ts + selection[0]).toFixed(2)}s – {(shot.in_ts + selection[1]).toFixed(2)}s
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2"
+                      onClick={() => {
+                        onSeek(selection[0]);
+                      }}
+                      title="Jump the preview to the start of the selection"
+                    >
+                      Preview
+                    </Button>
+                    <Button size="sm" variant="ghost" className="h-7 px-2" onClick={() => setSelection(null)}>
+                      Clear
+                    </Button>
+                  </>
+                ) : (
+                  <span className="text-muted-foreground">
+                    Click the waveform to jump · drag across it to select a section to cut out
+                  </span>
+                )}
+              </div>
+            </div>
           ) : null}
 
           {!isPhoto ? (
@@ -791,7 +1055,13 @@ function ShotRow({
             <ArrowDown className="h-4 w-4" />
           </Button>
           {!isPhoto ? (
-            <Button size="sm" variant="ghost" title="Split in half" onClick={onSplit} disabled={shot.out_ts - shot.in_ts < 1}>
+            <Button
+              size="sm"
+              variant="ghost"
+              title={canSplitAt ? `Split at the playhead (${splitAt!.toFixed(2)}s)` : 'Split in half (move the playhead into this shot to split there)'}
+              onClick={() => onSplit(canSplitAt ? splitAt! : undefined)}
+              disabled={!canSplitAt && shotLen < 2 * MIN_EDIT_SHOT_SEC}
+            >
               <Scissors className="h-4 w-4" />
             </Button>
           ) : null}
@@ -940,6 +1210,350 @@ function OverlayRow({
   );
 }
 
+// ---------- AI B-roll suggestions ----------
+
+function suggestionToLayer(s: BrollSuggestion): PictureLayer {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { filename, reason, quote, ...layer } = s;
+  return { ...layer, id: newOverlayId() };
+}
+
+function BrollAssistant({
+  reelId,
+  timeline,
+  onAccept,
+  onPreview,
+}: {
+  reelId: string;
+  timeline: ReelTimeline;
+  onAccept: (layers: PictureLayer[]) => void;
+  onPreview: (sec: number) => void;
+}) {
+  const suggest = useSuggestBroll(reelId);
+  const [jobId, setJobId] = React.useState<string | null>(null);
+  const live = useJobStream(jobId);
+  const [items, setItems] = React.useState<BrollSuggestion[] | null>(null);
+  const [note, setNote] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [prompt, setPrompt] = React.useState('');
+
+  React.useEffect(() => {
+    if (!jobId) return;
+    if (live.status === 'done') {
+      const parsed = BrollResultSchema.safeParse(live.result);
+      if (parsed.success) {
+        setItems(parsed.data.suggestions);
+        setNote(parsed.data.note);
+      } else {
+        setError('The suggestion came back in an unexpected shape.');
+      }
+      setJobId(null);
+    } else if (live.status === 'failed') {
+      setError(live.error ?? 'Suggesting B-roll failed.');
+      setJobId(null);
+    }
+  }, [live.status, live.result, live.error, jobId]);
+
+  const running = suggest.isPending || !!jobId;
+  const run = async () => {
+    setError(null);
+    setItems(null);
+    setNote(null);
+    try {
+      const job = await suggest.mutateAsync({ timeline, prompt: prompt.trim() || null });
+      setJobId(job.id);
+    } catch (e) {
+      setError(humanMessage(e));
+    }
+  };
+  const drop = (i: number) => setItems((cur) => (cur ? cur.filter((_, k) => k !== i) : cur));
+
+  return (
+    <div className="space-y-2 rounded-lg border border-dashed p-3 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          value={prompt}
+          maxLength={500}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="Optional direction, e.g. “use the beach photos”"
+          className="h-8 min-w-0 flex-1"
+          disabled={running}
+        />
+        <Button size="sm" onClick={() => void run()} disabled={running}>
+          <Sparkles className="h-4 w-4" />
+          {running ? 'Finding B-roll…' : 'Suggest B-roll'}
+        </Button>
+      </div>
+      {running ? (
+        <p className="text-xs text-muted-foreground">
+          Matching what you say to your clips and photos — usually 10–30 seconds.
+        </p>
+      ) : null}
+      {error ? <p className="text-xs text-destructive">{error}</p> : null}
+      {note && (!items || items.length === 0) ? (
+        <p className="text-xs text-muted-foreground">{note}</p>
+      ) : null}
+      {items && items.length > 0 ? (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between text-xs text-muted-foreground">
+            <span>
+              {items.length} suggestion{items.length === 1 ? '' : 's'} — nothing is added until you accept
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 px-2"
+              onClick={() => {
+                onAccept(items.map(suggestionToLayer));
+                setItems([]);
+              }}
+            >
+              Accept all
+            </Button>
+          </div>
+          {items.map((s, i) => (
+            <div key={s.id} className="space-y-1 rounded-md border bg-card/60 p-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="muted">{s.kind === 'photo' ? 'photo' : 'clip'}</Badge>
+                <span className="min-w-0 truncate font-medium">{s.filename}</span>
+                <span className="text-muted-foreground">
+                  {formatDuration(s.start_sec)} – {formatDuration(s.end_sec)} ·{' '}
+                  {s.mode === 'pip' ? 'picture-in-picture' : 'full screen'}
+                </span>
+              </div>
+              {s.quote ? <p className="italic">“{s.quote}”</p> : null}
+              {s.reason ? <p className="text-muted-foreground">{s.reason}</p> : null}
+              <div className="flex flex-wrap gap-1">
+                <Button
+                  size="sm"
+                  className="h-7 px-2"
+                  onClick={() => {
+                    onAccept([suggestionToLayer(s)]);
+                    drop(i);
+                  }}
+                >
+                  <Check className="h-3.5 w-3.5" />
+                  Accept
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2"
+                  title="Jump the preview to where this would go"
+                  onClick={() => onPreview(s.start_sec)}
+                >
+                  <Play className="h-3.5 w-3.5" />
+                  Spot
+                </Button>
+                <Button size="sm" variant="ghost" className="h-7 px-2" onClick={() => drop(i)}>
+                  <X className="h-3.5 w-3.5" />
+                  Skip
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// ---------- B-roll layer row ----------
+
+function LayerRow({
+  layer,
+  total,
+  previewT,
+  source,
+  photo,
+  onPatch,
+  onDelete,
+  onJump,
+}: {
+  layer: PictureLayer;
+  total: number;
+  previewT: number;
+  source?: SourceVideo;
+  photo?: SourcePhoto;
+  onPatch: (p: Partial<PictureLayer>) => void;
+  onDelete: () => void;
+  onJump: () => void;
+}) {
+  const dur = round2(layer.end_sec - layer.start_sec);
+  const isPhoto = layer.kind === 'photo';
+  const name = isPhoto ? photo?.filename ?? 'photo' : source?.filename ?? layer.asset_id.slice(0, 8);
+  const thumb = isPhoto
+    ? photo
+      ? `${API_BASE}${photo.url}`
+      : null
+    : (() => {
+        const sc =
+          source?.scenes.find((s) => s.start_sec <= layer.in_ts && layer.in_ts < s.end_sec) ??
+          source?.scenes[0];
+        return sc ? `${API_BASE}${sc.thumbnail_url}` : null;
+      })();
+  // Moving the start keeps the duration.
+  const moveTo = (start: number) => {
+    const s = round2(Math.max(0, start));
+    onPatch({ start_sec: s, end_sec: round2(s + Math.max(MIN_EDIT_SHOT_SEC, dur)) });
+  };
+  const srcDur = source?.duration_sec ?? Infinity;
+
+  return (
+    <div className="space-y-2 rounded-lg border bg-card/60 p-3 text-sm">
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onJump}
+          title="Jump preview to this B-roll"
+          className="shrink-0 rounded-sm outline-none ring-primary/40 hover:opacity-90 focus:ring-2"
+        >
+          {thumb ? (
+            <img
+              alt=""
+              src={thumb}
+              className={'rounded-sm bg-muted object-cover ' + (isPhoto ? 'h-10 w-10' : 'h-10 w-16')}
+              loading="lazy"
+            />
+          ) : (
+            <div className="h-10 w-16 rounded-sm bg-muted" />
+          )}
+        </button>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <Badge variant="muted">{isPhoto ? 'photo' : 'clip'}</Badge>
+            <span className="truncate font-medium">{name}</span>
+          </div>
+          <span className="text-xs text-muted-foreground">
+            {formatDuration(layer.start_sec)} – {formatDuration(layer.end_sec)} ·{' '}
+            {layer.mode === 'pip' ? 'picture-in-picture' : 'full screen'}
+          </span>
+        </div>
+        <Button size="sm" variant="ghost" onClick={onJump} title="Preview from this B-roll">
+          <Play className="h-4 w-4" />
+        </Button>
+        <Button size="sm" variant="ghost" onClick={onDelete} className="hover:text-destructive" title="Remove">
+          <Trash2 className="h-4 w-4" />
+        </Button>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <Label className="text-xs text-muted-foreground">At</Label>
+        <Input
+          type="number"
+          step={0.1}
+          min={0}
+          max={total}
+          value={layer.start_sec}
+          onChange={(e) => moveTo(Number(e.target.value) || 0)}
+          className="h-7 w-20"
+        />
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 px-2"
+          title="Move this B-roll to start at the playhead"
+          onClick={() => moveTo(previewT)}
+        >
+          playhead
+        </Button>
+        <Label className="text-xs text-muted-foreground">for</Label>
+        <Input
+          type="number"
+          step={0.1}
+          min={0.2}
+          value={dur}
+          onChange={(e) =>
+            onPatch({ end_sec: round2(layer.start_sec + Math.max(MIN_EDIT_SHOT_SEC, Number(e.target.value) || 0)) })
+          }
+          className="h-7 w-20"
+        />
+        <span className="text-muted-foreground">s</span>
+        {!isPhoto ? (
+          <>
+            <Label className="ml-1 text-xs text-muted-foreground">from source</Label>
+            <Input
+              type="number"
+              step={0.1}
+              min={0}
+              value={layer.in_ts}
+              onChange={(e) => onPatch({ in_ts: round2(Math.max(0, Number(e.target.value) || 0)) })}
+              className="h-7 w-20"
+              title="Where in the clip the B-roll starts playing"
+            />
+            <span className="text-muted-foreground">s</span>
+          </>
+        ) : null}
+      </div>
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <select
+          value={layer.mode}
+          onChange={(e) => onPatch({ mode: e.target.value as PictureLayer['mode'] })}
+          className="h-7 rounded-md border bg-background px-2 text-xs"
+        >
+          <option value="full">full screen</option>
+          <option value="pip">picture-in-picture</option>
+        </select>
+        {layer.mode === 'pip' ? (
+          <>
+            <select
+              value={layer.pip_corner}
+              onChange={(e) => onPatch({ pip_corner: e.target.value as PictureLayer['pip_corner'] })}
+              className="h-7 rounded-md border bg-background px-2 text-xs"
+              aria-label="Corner"
+            >
+              {PIP_CORNERS.map((c) => (
+                <option key={c.value} value={c.value}>{c.label}</option>
+              ))}
+            </select>
+            <select
+              value={String(layer.pip_scale)}
+              onChange={(e) => onPatch({ pip_scale: Number(e.target.value) })}
+              className="h-7 rounded-md border bg-background px-2 text-xs"
+              aria-label="Size"
+            >
+              {(PIP_SIZES as readonly number[]).includes(layer.pip_scale) ? null : (
+                <option value={String(layer.pip_scale)}>{Math.round(layer.pip_scale * 100)}%</option>
+              )}
+              {PIP_SIZES.map((v) => (
+                <option key={v} value={String(v)}>{Math.round(v * 100)}% size</option>
+              ))}
+            </select>
+          </>
+        ) : null}
+        <label className="flex items-center gap-1 text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={layer.fade_ms > 0}
+            onChange={(e) => onPatch({ fade_ms: e.target.checked ? 200 : 0 })}
+            className="h-3.5 w-3.5 accent-primary"
+          />
+          fade
+        </label>
+        {isPhoto ? (
+          <label className="flex items-center gap-1 text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={layer.ken_burns}
+              onChange={(e) => onPatch({ ken_burns: e.target.checked })}
+              className="h-3.5 w-3.5 accent-primary"
+            />
+            drift
+          </label>
+        ) : null}
+      </div>
+      {dur < MIN_EDIT_SHOT_SEC ? (
+        <p className="text-xs text-destructive">B-roll must last at least {MIN_EDIT_SHOT_SEC}s.</p>
+      ) : layer.start_sec > total ? (
+        <p className="text-xs text-destructive">Starts after the reel ends ({formatDuration(total)}).</p>
+      ) : !isPhoto && layer.in_ts + dur > srcDur + 0.05 ? (
+        <p className="text-xs text-destructive">
+          Runs past the end of {name} ({formatDuration(srcDur)}) — start earlier in the source or shorten it.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 // ---------- add clip dialog ----------
 
 function AddClipDialog({
@@ -947,11 +1561,15 @@ function AddClipDialog({
   onOpenChange,
   videos,
   onAdd,
+  title = 'Add a clip',
+  description = 'Pick a scene from any footage in this project, or enter a custom range.',
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   videos: SourceVideo[];
   onAdd: (shot: TimelineShot) => void;
+  title?: string;
+  description?: string;
 }) {
   const [assetId, setAssetId] = React.useState<string>(videos[0]?.asset_id ?? '');
   const [customIn, setCustomIn] = React.useState(0);
@@ -965,10 +1583,8 @@ function AddClipDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Add a clip</DialogTitle>
-          <DialogDescription>
-            Pick a scene from any footage in this project, or enter a custom range.
-          </DialogDescription>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
         {videos.length === 0 ? (
           <p className="text-sm text-muted-foreground">No footage in this project yet.</p>
@@ -1057,18 +1673,22 @@ function AddPhotoDialog({
   onOpenChange,
   photos,
   onAdd,
+  title = 'Add a photo',
+  description = 'Added as a 3-second still with a slow drift. Adjust after adding.',
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   photos: SourcePhoto[];
   onAdd: (shot: TimelineShot) => void;
+  title?: string;
+  description?: string;
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>Add a photo</DialogTitle>
-          <DialogDescription>Added as a 3-second still with a slow drift. Adjust after adding.</DialogDescription>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
         <div className="grid grid-cols-4 gap-2 sm:grid-cols-5">
           {photos.map((p) => (
@@ -1333,6 +1953,7 @@ function VoiceoverPanel({
                 }
                 muted={take.muted}
                 height={28}
+                onSeek={(sec) => previewRef.current?.seek(take.start_sec + sec)}
               />
               <div className="flex flex-wrap items-center gap-2 text-xs">
                 <Label className="text-xs text-muted-foreground">Starts at</Label>
