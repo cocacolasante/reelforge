@@ -136,4 +136,4 @@ def test_voiceover_bus_is_padded_to_program_length():
     assert "apad=whole_dur=19.600" in fc
     assert plan.mezzanine_duration_sec == pytest.approx(19.6)
     # Padding happens AFTER levelling so loudnorm doesn't measure silence.
-    assert fc.index("loudnorm=I=-12.0") < fc.index("apad=whole_dur=")
+    assert fc.index("loudnorm=I=-12.0") < fc.index("apad=whole_dur=19.600")

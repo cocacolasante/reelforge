@@ -177,6 +177,15 @@ async def export(
             mezzanine_duration = manifest.duration_sec
         except Exception as exc:
             log.warning("unable to parse compose.json for %s: %s", reel_id, exc)
+    # The mezzanine FILE is the source of truth. Long timelines render in
+    # chunk levels whose frame rounding adds up (a 5-minute video ran 0.8s
+    # past its planned length), so an older compose.json's planned duration
+    # failed every export's 0.2s drift check.
+    from reelforge_core.export.verify import probe_duration
+
+    probed = await asyncio.to_thread(probe_duration, mezzanine)
+    if probed is not None:
+        mezzanine_duration = probed
 
     # Skip-if-exists: prior sidecar with matching hash + preset_spec_version is fine.
     if not force:

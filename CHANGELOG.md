@@ -4,6 +4,24 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Fixed
+- **AI B-roll spreads across the whole video.** Suggestions were capped at 8
+  and skipped any scene partly used in the main cut, so on a 5-minute video a
+  demo clip that was also its own section only showed up near the end. The
+  assistant now offers every unused stretch of a clip, scales the number of
+  cutaways with length (one per ~25s, up to 20; up to 8s each on long
+  videos), keeps them at least 5s apart, and is told to spread them from
+  beginning to end — weaving in any clip your direction names.
+- **Picture no longer runs ahead of the sound on edits with hard cuts.**
+  Clips joined with quick "cut" transitions could silently lose a whole shot
+  when a clip came out a frame shorter than planned, so everything after it
+  played early (a 5-minute video showed the demo while the speaker was still
+  talking about hosting). Every join now has a few frames of slack, and each
+  shot's audio is pinned to its planned length so long renders stay in sync.
+- **Exports of long videos no longer fail with "duration drift".** Long
+  timelines render in chunks whose frame rounding added ~0.8s; exports now
+  check against the real rendered length.
+
 ### Added
 - **One long video from several clips.** Choosing "Long single span" with
   two or more analyzed clips now builds a single long-form video (up to 30

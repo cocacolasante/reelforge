@@ -80,6 +80,11 @@ def _transition_duration(config: ComposeConfig) -> float:
     return 0.04 if config.transition.kind == "cut" else config.transition.duration_sec
 
 
+# Cloned frames appended to every clip's video (see the end guard in
+# build_final_command). Comfortably more than one frame at any output fps.
+CLIP_END_PAD_SEC = 0.25
+
+
 def _xfade_offsets(
     clip_durations: list[float], xfade_dur: float | list[float]
 ) -> list[float]:
@@ -249,11 +254,23 @@ def build_final_command(
         v_out = f"[v{i}]"
         a_out = f"[a{i}]"
 
-        # Video: format → settb → setpts → optional Ken Burns → final out label
+        # Video: format → settb → setpts → end guard → optional Ken Burns →
+        # final out label. A clip's video is whole frames and can run up to a
+        # frame short of its planned duration; xfade offsets use the planned
+        # durations, and when the running total came up short of a 0.04s
+        # "cut" xfade's end, ffmpeg 5.1's xfade dropped the WHOLE next clip
+        # (a 5-minute talking-head mix lost 8s of picture, sliding it 16s
+        # ahead of the sound). Cloning the last frame gives every transition
+        # slack — xfade discards the first input's frames past its end — and
+        # the final clip is trimmed back so the program length is unchanged.
+        is_last = i == len(clips) - 1
+        end_guard = f",tpad=stop_mode=clone:stop_duration={CLIP_END_PAD_SEC:.3f}"
+        if is_last:
+            end_guard += f",trim=duration={clip.duration:.3f},setpts=PTS-STARTPTS"
         v_prep_out = f"[vp{i}]"
         graph.add(
             FilterNode(
-                filter_name="format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS",
+                filter_name=f"format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS{end_guard}",
                 inputs=[raw_v],
                 outputs=[v_prep_out],
             )
@@ -326,7 +343,12 @@ def build_final_command(
                 FilterNode(
                     filter_name=(
                         "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
-                        f"{gain_part}asetpts=PTS-STARTPTS"
+                        f"{gain_part}asetpts=PTS-STARTPTS,"
+                        # Exactly the planned duration: AAC priming in every
+                        # intermediate chunk encode otherwise adds up (~0.8s
+                        # over a 5-minute hierarchical render), and acrossfade
+                        # overlaps whatever length it is given.
+                        f"apad=whole_dur={clip.duration:.3f},atrim=duration={clip.duration:.3f}"
                     ),
                     inputs=[raw_a],
                     outputs=[a_out],

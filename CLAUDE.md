@@ -378,7 +378,7 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
 
 **Skip-if-exists contract**: when an output file and its sidecar already exist, and both the mezzanine hash and `preset_spec_version` match, `export()` returns the existing manifest without re-transcoding. Pass `--force` to override. Bumping `PRESET_SPEC_VERSION` in code invalidates existing exports for subsequent runs (without touching the files on disk).
 
-**Mezzanine-as-source-of-truth**: `export()` reads `mezzanine.mp4` and never touches `compose.json` beyond reading `duration_sec` for progress math. Changing export format is a transcode pass, never a re-render.
+**Mezzanine-as-source-of-truth**: `export()` reads `mezzanine.mp4` and checks duration drift against the mezzanine's PROBED length (`compose.json`'s `duration_sec` is only a fallback; compose now records the probed length too, because hierarchical renders of long timelines run ~0.8s past the plan and failed every export). Changing export format is a transcode pass, never a re-render.
 
 ## Known gotchas
 - **Two worker replicas by default.** `compose.yml` sets `deploy.replicas: 2`.
@@ -598,7 +598,14 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   output-side seeking on post-setpts timestamps: `-ss/-to` and the reframe
   pan window scale by 1/speed; speed≠1 shots render muted with captions
   suppressed. (4) >6 clips render hierarchically (chunks of ≤5) — a 12-clip
-  single-pass 1080x1920 xfade chain OOM'd at ~6 GB. (5) Style grammars
+  single-pass 1080x1920 xfade chain OOM'd at ~6 GB. (4b) Every clip's
+  video gets `tpad` clone slack (`CLIP_END_PAD_SEC`, last clip trimmed back)
+  and its audio is `apad`+`atrim`med to `ClipInfo.duration`: extracted video
+  is whole frames and can end a frame short of plan, and when the running
+  total fell short of a 0.04s "cut" xfade's end ffmpeg 5.1's xfade dropped
+  the WHOLE next clip (2026-09-16: a 76-shot mix lost 8s of picture, which
+  ran up to 16s ahead of the sound); AAC priming in each chunk encode also
+  added ~0.8s of audio. (5) Style grammars
   (compose/styles.py) engage only in the smart-auto flow or when explicit;
   director proposals (compose/director.py) are validated against
   STYLE_BOUNDS or reverted per-entry — the director must never be able to
@@ -643,11 +650,17 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   `JobKindLit` and the web `JobSchema` enum; one job per reel at a time) +
   worker `suggest_broll_job`. The editor sends its CURRENT timeline; the job
   maps main-track words to mezzanine time (`shot_segments` mirrors the
-  preview's `buildSegments`), catalogs photos + video scenes not already on
-  screen as main shots (`MAIN_OVERLAP_FRAC`), makes ONE `record_broll` call
-  (director model; scene thumbnails + photo thumbs as image blocks), and
-  `validate_suggestions` clamps/drops everything (1.5–6s, inside the reel
-  and the scene, no overlaps with each other or existing layers, ≤ 8).
+  preview's `buildSegments`), catalogs photos + the stretches of each video
+  scene the main track does NOT already show (`free_ranges`, ≤3 longest per
+  scene — whole-scene exclusion hid most of a demo clip that was also a main
+  section; SPEAKING scenes > `MAIN_OVERLAP_FRAC` used are still skipped, or
+  the catalog fills with the talking head's leftovers), makes ONE `record_broll` call (director model; scene thumbnails +
+  photo thumbs as image blocks; the prompt tells it to spread cutaways across
+  the whole reel), and `validate_suggestions` clamps/drops everything
+  (1.5–6s, 8s on reels > 120s; inside the reel and the stretch; no overlaps
+  with existing layers; ≥ `MIN_GAP_SEC` 5s apart; never the clip already
+  on screen as the main shot; budget
+  `suggestion_budget` = one per 25s, 8–20).
   Results ride the job row (`result.suggestions`); nothing touches the reel
   until the user accepts in `BrollAssistant` and saves. No candidates or no
   speech → a note, zero tokens.
