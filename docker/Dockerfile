@@ -24,7 +24,10 @@ COPY pyproject.toml uv.lock ./
 # Skip installing the root project itself — code lands in the next stage.
 # --frozen honors the committed uv.lock so rebuilds can't drift (an unpinned
 # anthropic once jumped a major version on rebuild and broke ranking).
-RUN uv sync --frozen --no-install-project
+# The `worker` extra (arq + redis<6) covers the API, the arq worker and the CLI.
+# The queue_consumer stage below installs the `queue` extra instead — arq and
+# bullmq pin mutually exclusive redis ranges, so they get separate images.
+RUN uv sync --frozen --no-install-project --extra worker
 
 # ---- Stage 3: app code -------------------------------------------------------
 FROM python-deps AS core
@@ -34,6 +37,7 @@ COPY apps/__init__.py apps/__init__.py
 COPY apps/api/ apps/api/
 COPY apps/worker/ apps/worker/
 COPY apps/cli/ apps/cli/
+COPY apps/queue_consumer/ apps/queue_consumer/
 COPY assets/ /app/assets/
 COPY docker/entrypoints/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/reelforge /usr/local/bin/api-entrypoint.sh /usr/local/bin/worker-entrypoint.sh \
@@ -67,6 +71,13 @@ FROM core AS worker
 CMD ["arq", "apps.worker.main.WorkerSettings"]
 
 # ---- Stage 4c: CLI -----------------------------------------------------------
+# The growth-agent queue interface. Same code, different dependency set: swap
+# arq's redis<6 for bullmq's redis>=6.4. The API, the arq worker and the CLI are
+# untouched and still run exactly as before.
+FROM core AS queue_consumer
+RUN uv sync --frozen --no-install-project --extra queue
+CMD ["python", "-m", "apps.queue_consumer.main"]
+
 FROM core AS cli
 ENTRYPOINT ["/usr/bin/tini", "--", "reelforge"]
 CMD ["--help"]
