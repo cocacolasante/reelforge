@@ -98,7 +98,11 @@ services:
     networks: [reelforge_net]
 
   # Public tunnel for Instagram publishing: Meta's servers must FETCH the
-  # video, so the API needs a public HTTPS URL. Quick tunnels need no
+  # video, so the API needs a public HTTPS URL.
+  #
+  # Prefer compose.named-tunnel.yml — a stable hostname that survives restarts,
+  # so REELFORGE_PUBLIC_MEDIA_BASE is written once instead of after every
+  # bounce. This quick tunnel stays for throwaway use. Quick tunnels need no
   # Cloudflare account; the random URL is printed in this service's logs:
   #   docker compose --profile tunnel up -d tunnel
   #   docker compose logs tunnel | grep trycloudflare
