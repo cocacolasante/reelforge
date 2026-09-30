@@ -231,6 +231,82 @@ def apply_refinement(
     )
 
 
+TAIL_WINDOW_SEC = 4.0  # trailing filler lives in the last few seconds
+TAIL_PAD_SEC = 0.25  # breath kept after the last real word
+
+
+def _tail_words(analysis: AnalysisReport, start: float, end: float) -> list[tuple[float, float, str]]:
+    out: list[tuple[float, float, str]] = []
+    if analysis.transcript is None:
+        return out
+    for seg in analysis.transcript.segments:
+        for w in seg.words:
+            if w.word.strip() and start <= (w.start + w.end) / 2.0 <= end:
+                out.append((w.start, w.end, w.word.strip()))
+    return sorted(out)
+
+
+def trim_trailing(
+    reel: RankedReel,
+    analysis: AnalysisReport,
+    config: SelectionConfig,
+    events: list | None = None,
+) -> RankedReel:
+    """Cut trailing filler ("so yeah", "anyway", "um") off the reel's end.
+    Pure and local — no API call. The model's `tail_trim_words` is used only
+    when the words it would drop really are filler (qa/metrics.py patterns);
+    otherwise the pattern decides alone. Never goes below the duration floor,
+    never ends mid-word or on an action event; candidate_id never changes."""
+    from reelforge_core.qa.metrics import FILLER_WORDS, TRAILING_RE
+
+    words = _tail_words(analysis, reel.start_sec, reel.end_sec)
+    if len(words) < 2:
+        return reel
+
+    def filler(tail: list[tuple[float, float, str]]) -> bool:
+        text = " ".join(w for _, _, w in tail)
+        bare = [w.strip(".,!?").lower() for _, _, w in tail]
+        # The dropped words must BE the filler phrase, start to finish.
+        m = TRAILING_RE.search(text)
+        return (m is not None and m.start() == 0) or all(b in FILLER_WORDS for b in bare)
+
+    n = 0
+    proposed = reel.tail_trim_words or 0
+    if 0 < proposed < len(words) and filler(words[-proposed:]):
+        n = proposed
+    else:
+        for k in range(min(6, len(words) - 1), 0, -1):
+            if filler(words[-k:]):
+                n = k
+                break
+    if n == 0 or reel.end_sec - words[-n][0] > TAIL_WINDOW_SEC:
+        return reel
+    keep_last = words[-n - 1]
+    new_end = round(min(keep_last[1] + TAIL_PAD_SEC, words[-n][0]), 3)
+    if new_end - reel.start_sec < config.effective_min_sec or new_end >= reel.end_sec:
+        return reel
+    if config.event_guard:
+        from reelforge_core.reels.events import detect_events, edge_ok
+
+        if not edge_ok(new_end, "end", detect_events(analysis) if events is None else events,
+                       analysis.duration):
+            return reel
+    from reelforge_core.reels.candidates import covering_scenes
+
+    return reel.model_copy(
+        update={
+            "end_sec": new_end,
+            "duration_sec": round(new_end - reel.start_sec, 6),
+            "scene_indices": covering_scenes(analysis.scenes, reel.start_sec, new_end),
+            "end_trim_sec": round(reel.end_sec - new_end, 3),
+            "pre_refine_start_sec": reel.pre_refine_start_sec
+            if reel.pre_refine_start_sec is not None else reel.start_sec,
+            "pre_refine_end_sec": reel.pre_refine_end_sec
+            if reel.pre_refine_end_sec is not None else reel.end_sec,
+        }
+    )
+
+
 def _extract_refinements(resp: Any) -> list[dict]:
     for block in getattr(resp, "content", []) or []:
         if getattr(block, "type", None) == "tool_use":

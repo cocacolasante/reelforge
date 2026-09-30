@@ -48,7 +48,7 @@ def test_resolve_smart_config_preserves_reframe_on_auto_lut():
 
 
 def test_smart_picks_for_mood_matches_tables():
-    assert smart_picks_for_mood("energetic") == {"transition": "slideleft", "lut": "vivid"}
+    assert smart_picks_for_mood("energetic") == {"transition": "cut", "lut": "vivid"}
     assert smart_picks_for_mood("neutral") == {"transition": "fade", "lut": None}
     assert smart_picks_for_mood("not-a-mood") == {"transition": "fade", "lut": None}
 

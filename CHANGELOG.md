@@ -5,6 +5,12 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## Unreleased
 
 ### Fixed
+- **Long renders no longer crash near the end.** Videos of about six
+  minutes or more could fail with "Separator is not found, and chunk exceed
+  the limit" while reporting render progress.
+- **Newer Claude models work for every AI step.** Claude 5 models refused
+  the way ReelForge asked them for structured answers, so steps that used
+  them quietly fell back to simpler non-AI behaviour.
 - **The public tunnel no longer exposes the whole API.** It was forwarding
   every path on `reelforge.blueprintautomation.tech` to an API that has no
   login, so anyone who knew the hostname could list your projects, download
@@ -28,6 +34,114 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   check against the real rendered length.
 
 ### Added
+- **ReelForge can learn from how your reels perform.** Once the growth agent
+  sends back completion and share numbers, `reelforge eval-labels` shows
+  which of ReelForge's own judgements actually predicted success.
+  `reelforge fit-weights --apply` retunes how it scores candidates from your
+  results; this needs 50 labelled reels and moves cautiously. Your best
+  performers are also shown to the AI as examples of what your audience
+  finishes. Nothing changes on its own: fitting is always a command you
+  run.
+- **Long videos built to hold viewers.** Long AI mixes now open with a
+  quick montage of their best 3–4 lines that states what the video
+  delivers, then cut into the story. They come split into titled chapters,
+  with a short title card at each chapter, and show a "Coming up…" teaser
+  near the middle to stop people dropping off. The chapters are saved as
+  YouTube-ready timestamps and added to the description when you publish
+  to YouTube. When a video runs long, the least essential sections are
+  shortened a sentence at a time before anything is cut, and the music
+  changes song at chapter breaks with a smooth crossfade. The strongest AI
+  model plans the long-form structure.
+- **Music that fits the edit.** Songs are now analysed for tempo, bars,
+  sections and drops. Action reels get driving tracks, and the song starts
+  wherever its drop will hit the biggest moment. Other reels end on the end
+  of a musical phrase instead of mid-bar. Long videos loop the song at
+  phrase boundaries with a smooth crossfade instead of jumping back to the
+  start. Beat detection is also more precise, so cuts stay on the beat
+  deeper into a song.
+- **Automatic B-roll.** Talky reels in projects with more than one clip or
+  photo now cut away to matching footage on their own: about one cutaway
+  every 8 seconds on short reels, fewer on long ones, never on action
+  reels. The editor now opens on the exact cut that was rendered, with the
+  cutaways in the B-roll card where you can remove any of them.
+- **Action edits cut like an editor.** Tricks, jumps and wipeouts are never
+  cut in the middle. Each one starts from the calm moment just before it,
+  and the biggest one slows down step by step into the impact, then snaps
+  back to full speed as it lands so you hear it. Cuts land on the beat,
+  every cut visibly changes the framing, and action reels can open on
+  their best moment. A skate reel went from about 9 to 36 visual changes
+  per minute.
+- **Great lines in quiet footage get considered.** On long videos, the
+  first cut of candidates used to favour action and scene changes, so a
+  strong line delivered calmly could be dropped before the AI ever saw it.
+  Every spoken line is now rated as an opener and as a closer, and some
+  candidate slots are saved for the best of them. The AI's own ranking of
+  its picks now counts toward the final order, and reels that say the same
+  thing are less likely to appear side by side.
+- **Stronger openings and cleaner endings.** When picking moments, the AI
+  now sees how long a clip waits before anyone speaks, whether it opens with
+  "hey guys, welcome back", and whether it trails off at the end. Clips that
+  end on a real payoff rank higher. A trailing "so yeah" or "anyway" is cut
+  off the end. Action and punchy talking clips can open cold: their best
+  1–3 seconds play first, then a hard cut with a whoosh takes you to the
+  start of the story.
+- **The vertical crop follows the person.** When a wide video is cropped to
+  vertical, ReelForge now tracks the speaker's face through the whole shot,
+  like a camera operator would. It stays still while they stay near the
+  middle, eases over when they move, and cuts to whoever is talking when
+  there are two people. Shots without a face follow the action instead.
+  Zoomed-in framings keep the speaker's eyes about a third of the way down
+  the frame.
+- **Captions highlight what matters, and misheard words get fixed.** An AI
+  pass now picks the words each caption should highlight and the moment each
+  line lands on (talking-head shots cut in tight there). It also fixes words
+  the transcription got wrong ("skinboard" becomes "skimboard"), saving
+  the fix to the clip's transcript so every reel of that clip uses it. You
+  can see or undo it in the transcript editor. If the AI pass fails, the
+  captions fall back to the previous highlighting.
+- **Subtle sound effects.** Smart-mode videos get a whoosh into B-roll and
+  into any slide transition, plus the occasional pop on a key moment, never
+  more than one every six seconds. Plain cuts stay clean. To use your own
+  sounds, put `whoosh.wav`, `pop.wav` or `hit.wav` in `data/sfx/`.
+- **The picture keeps moving.** Talking-head videos now change framing about
+  every three seconds — wide, medium, wide, tight — always between phrases,
+  never mid-word, and every jump cut lands on a new framing, so a long
+  sentence is no longer one static shot. Fast edits of one continuous clip
+  (a skate line cut to the beat) alternate framing on every cut, so the cuts
+  are actually visible. Framing changes made by an AI mix are kept when you
+  save it in the editor.
+- **New caption look.** Captions now come in short, bold 1-3 word bursts with
+  only the words that carry the point highlighted — a number, a "never", a
+  product name — instead of lighting up every word. They sit where TikTok,
+  Reels and Shorts never cover them (clear of the bottom caption bar and the
+  right-hand buttons), long titles wrap instead of running off the edge, and
+  emoji no longer turn into empty boxes. The karaoke and plain styles are
+  still one click away. Plain captions on older reels no longer spill past the
+  safe edge on a full line.
+- **Clearer voices.** Dialogue is cleaned up on every render — rumble cut,
+  levels evened out, sibilance softened — and background noise is reduced on
+  talking videos (never on action clips, where the sound is the point). A
+  loud click that could clip in the very first moment of a video is gone.
+- **Cleaner cuts.** Energetic and action reels now hard-cut instead of
+  sliding between shots, the AI director may use at most one slide or dip per
+  video, and cinematic reels dissolve with a single dip to black before the
+  last shot. Reels aim for the length you asked for — the AI picking moments
+  was always told "30-60 seconds" before — and it now reads the whole of each
+  moment's transcript, not just the first and last 60 words.
+- **Better picture.** Sharpening only applies to footage that had to be
+  enlarged (it was adding halos to 4K), the colour looks no longer band across
+  skies and never clip highlights or crush blacks, and talking-head shots no
+  longer drift.
+- **Every render is scored.** ReelForge now measures each finished video
+  the way an editor would check it by eye, and saves the result next to it:
+  how often the picture changes and the longest stretch where it doesn't,
+  whether captions stay clear of TikTok/Reels/Shorts buttons, how fast the
+  first word lands, stalls and filler words, whether the ending trails off,
+  and loudness. `reelforge qa-project <project> --save-baseline v0` records a
+  baseline; `--diff v0` shows what a change made better or worse. You can
+  also record picks you'd have made yourself (`reelforge label`), seed them
+  from reels you exported (`reelforge seed-labels`), and log your own verdict
+  on a re-render (`reelforge rate`).
 - **Connect an agent to ReelForge** (`docs/muse-mcp.md`). Muse — or any MCP
   client — can see your footage, cut clips from it and hand them back, using
   a key you create in Agent access and revoke whenever you like.

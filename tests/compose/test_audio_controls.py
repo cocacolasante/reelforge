@@ -96,8 +96,10 @@ def test_voiceover_inputs_delayed_gained_and_ducked():
     # Takes are summed, levelled, then footage ducks beneath them.
     assert "[vo_mix]" in fc and "[vo_norm]" in fc
     assert "sidechaincompress" in fc and "[aclips_ducked]" in fc
-    # The combined bus feeds the voice loudnorm (so music ducks under both).
-    assert "[voice_pre]loudnorm" in fc
+    # The combined bus is cleaned up, then feeds the voice loudnorm (so
+    # music ducks under both).
+    assert "[voice_pre]highpass=f=75" in fc
+    assert "[voice_clean]loudnorm" in fc
 
 
 def test_voiceover_single_take_no_amix_between_takes():

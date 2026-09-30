@@ -119,14 +119,22 @@ def _estimate(source: Path, in_ts: float, out_ts: float) -> tuple[float, float]:
         x0 = first if first is not None else overall
         x1 = second if second is not None else overall
 
-        # Keep the pan subtle.
-        if abs(x1 - x0) > MAX_DRIFT:
-            mid = (x0 + x1) / 2.0
-            x0 = mid + (MAX_DRIFT / 2.0 if x0 > x1 else -MAX_DRIFT / 2.0)
-            x1 = mid - (MAX_DRIFT / 2.0 if x0 > x1 else -MAX_DRIFT / 2.0)
-        return (round(min(max(x0, 0.0), 1.0), 4), round(min(max(x1, 0.0), 1.0), 4))
+        return clamp_drift(x0, x1)
     finally:
         cap.release()
+
+
+def clamp_drift(x0: float, x1: float) -> tuple[float, float]:
+    """Keep the pan subtle: at most MAX_DRIFT, centred on the midpoint, in the
+    same direction. Pure. (The inline original compared x1 against an
+    already-reassigned x0; that looked like it could flip the pan, but the new
+    x0 always stays on the same side, so the two agree on every input —
+    checked exhaustively. This version just states the direction once.)"""
+    if abs(x1 - x0) > MAX_DRIFT:
+        mid = (x0 + x1) / 2.0
+        step = MAX_DRIFT / 2.0 if x1 > x0 else -MAX_DRIFT / 2.0
+        x0, x1 = mid - step, mid + step
+    return (round(min(max(x0, 0.0), 1.0), 4), round(min(max(x1, 0.0), 1.0), 4))
 
 
 def should_crop(

@@ -38,9 +38,19 @@ from reelforge_core.models import (
     UsageTotals,
 )
 
+from reelforge_core.compose.captions import strip_emoji  # noqa: E402
+
 log = logging.getLogger(__name__)
 
-DIRECTOR_PROMPT_VERSION = "d2"
+DIRECTOR_PROMPT_VERSION = "d3"  # d3: one flashy transition per reel, at most
+# Transitions the eye sees even between identical frames. Pros cut; the
+# validator lets through at most this many per reel and turns the rest into
+# cuts, because a prompt alone doesn't hold the line.
+FLASHY_KINDS = frozenset(
+    {"slideleft", "slideright", "slideup", "slidedown", "wipeleft", "wiperight",
+     "smoothleft", "smoothright", "circleopen", "circleclose", "fadewhite", "fadeblack"}
+)
+MAX_FLASHY_PER_REEL = 1
 NUDGE_MAX_SEC = 1.5
 PUNCH_IN_MAX = 1.5
 HOOK_TEXT_MAX = 40
@@ -92,7 +102,10 @@ DIRECTOR_SYSTEM_PROMPT = (
     "the action, end before it fizzles) — but never into an action event or "
     "the seconds just before one (see action_events): the reel must keep the "
     "whole event, and such nudges are discarded;\n"
-    "- change a cut's transition WITHIN the style palette given to you;\n"
+    "- change a cut's transition WITHIN the style palette given to you. "
+    "Professional short-form is almost all hard cuts: use a slide, wipe or "
+    "dip at most ONCE, and only where it marks a real jump in place or "
+    "time — extras are turned back into cuts;\n"
     "- set a shot's speed (only values from the allowed set) or a punch-in "
     "(1.0-1.5) where the content earns it;\n"
     "- write hook_text: at most 40 characters burned over the first two "
@@ -263,6 +276,8 @@ def apply_director(
             i = int(entry["index"])
             if not 0 <= i < len(shots):
                 continue
+            if i < plan.cold_open_shots:
+                continue  # the cold open is validated upstream; hands off
             s = shots[i]
             max_nudge = bounds.get("max_nudge", NUDGE_MAX_SEC)
             new_in = s.in_ts + float(entry.get("nudge_start_sec") or 0.0)
@@ -282,8 +297,39 @@ def apply_director(
                 new_in, new_out = s.in_ts, s.out_ts  # keep the whole event
             speed = entry.get("speed")
             speed = float(speed) if speed is not None else s.speed
-            if speed not in bounds["speeds"]:
+            if speed not in bounds["speeds"] or s.speed < 1.0:
+                # A planned slow step (CP8's ramp into the impact) is a
+                # grammar decision: flattening 0.7 -> 0.5 lost the step.
                 speed = s.speed
+            # Pieces cut from one continuous take must not overlap: nudging an
+            # in-point back before the previous piece's out replayed footage
+            # the viewer had just seen (a skate reel stuttered 0.5s,
+            # 2026-09-30). A nudge across a shared boundary MOVES the
+            # boundary — the neighbour gives up the time — or, if that would
+            # starve the neighbour, stops at it.
+            min_len = bounds["min_shot"]
+            if i > 0:
+                prev = shots[i - 1]
+                if (
+                    prev.scene_index == s.scene_index
+                    and abs(prev.out_ts - s.in_ts) < 1e-3
+                    and new_in < prev.out_ts
+                ):
+                    if new_in - prev.in_ts >= min_len * prev.speed:
+                        shots[i - 1] = replace(prev, out_ts=round(new_in, 3))
+                    else:
+                        new_in = prev.out_ts
+            if i + 1 < len(shots):
+                nxt = shots[i + 1]
+                if (
+                    nxt.scene_index == s.scene_index
+                    and abs(s.out_ts - nxt.in_ts) < 1e-3
+                    and new_out > nxt.in_ts
+                ):
+                    if nxt.out_ts - new_out >= min_len * nxt.speed:
+                        shots[i + 1] = replace(nxt, in_ts=round(new_out, 3))
+                    else:
+                        new_out = nxt.in_ts
             if new_out - new_in < bounds["min_shot"] * speed:
                 new_in, new_out = s.in_ts, s.out_ts  # revert geometry, keep rest
             punch = entry.get("punch_in", s.punch_in)
@@ -291,6 +337,10 @@ def apply_director(
                 punch = float(punch)
                 if not 1.0 <= punch <= PUNCH_IN_MAX:
                     punch = s.punch_in
+            if s.framing_keys:
+                # The grammar's framing keys own this shot's zoom (the graph
+                # applies them ahead of punch_in) — a punch would be a no-op.
+                punch = s.punch_in
             changed = (
                 (new_in, new_out, speed, punch)
                 != (s.in_ts, s.out_ts, s.speed, s.punch_in)
@@ -302,19 +352,34 @@ def apply_director(
                     out_ts=round(new_out, 3),
                     speed=speed,
                     punch_in=punch,
-                    punch_in_animated=bool(entry.get("punch_in_animated", s.punch_in_animated)),
+                    punch_in_animated=(
+                        s.punch_in_animated
+                        if s.framing_keys
+                        else bool(entry.get("punch_in_animated", s.punch_in_animated))
+                    ),
                 )
                 applied.append(f"shot {i}: {entry.get('reason', '')[:80]}")
         except (KeyError, TypeError, ValueError):
             continue
 
     palette = set(bounds["palette"]) | {"cut"}
+    # Flashy transitions the grammar already placed count toward the cap.
+    flashy_used = sum(1 for c in per_cut if c is not None and c[0] in FLASHY_KINDS)
     for entry in raw.get("cuts", []) or []:
         try:
             i = int(entry["index"])
             kind = str(entry["kind"])
             if not 0 <= i < len(per_cut) or kind not in palette:
                 continue
+            if i < plan.cold_open_shots:
+                continue  # the hard cut out of the cold open stays a cut
+            if kind in FLASHY_KINDS:
+                current = per_cut[i]
+                replacing_flashy = current is not None and current[0] in FLASHY_KINDS
+                if not replacing_flashy and flashy_used >= MAX_FLASHY_PER_REEL:
+                    continue
+                if not replacing_flashy:
+                    flashy_used += 1
             dur = min(float(entry.get("duration_sec") or 0.2), bounds["max_cut_dur"])
             dur = 0.04 if kind == "cut" else max(0.04, dur)
             per_cut[i] = (kind, round(dur, 3))
@@ -324,10 +389,13 @@ def apply_director(
 
     overlay: TextOverlay | None = None
     hook = raw.get("hook_text")
-    if isinstance(hook, str) and hook.strip():
+    # libass can't draw colour emoji (a "🛹" hook rendered as a box), so they
+    # go — and a hook that was nothing but emoji is no hook at all.
+    hook_text = strip_emoji(hook)[:HOOK_TEXT_MAX] if isinstance(hook, str) else ""
+    if hook_text:
         overlay = TextOverlay(
             id="director-hook",
-            text=hook.strip()[:HOOK_TEXT_MAX],
+            text=hook_text,
             start_sec=0.4,
             end_sec=2.8,
             position="top",
@@ -341,6 +409,8 @@ def apply_director(
         caption_mode=plan.caption_mode,
         caption_position=plan.caption_position,
         notes=plan.notes + [f"director: {a}" for a in applied],
+        cold_open=plan.cold_open,
+        cold_open_shots=plan.cold_open_shots,
     )
     return new_plan, overlay, applied
 

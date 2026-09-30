@@ -517,6 +517,7 @@ async def suggest_broll(
     model: str,
     prompt: str | None = None,
     client: Any | None = None,
+    budget: int | None = None,
 ) -> SuggestResult:
     """Suggest B-roll for `timeline`. Returns no suggestions (with a note)
     without calling the model when there's nothing to match; model errors
@@ -535,7 +536,7 @@ async def suggest_broll(
         )
     program_sec = program_duration(timeline)
     existing = [(ly.start_sec, ly.end_sec) for ly in timeline.layers]
-    budget = suggestion_budget(program_sec)
+    budget = budget if budget is not None else suggestion_budget(program_sec)
     max_len = max_layer_sec_for(program_sec)
     if client is None:
         from anthropic import AsyncAnthropic

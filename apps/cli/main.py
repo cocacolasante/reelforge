@@ -993,5 +993,263 @@ def eval_select(
     console.print(format_report(evaluate_all(labels, _data_dir())), highlight=False)
 
 
+# ---------------------------------------------------------------------------
+# QA: scoring finished edits, baselines, eval labels, A/B ratings
+# ---------------------------------------------------------------------------
+
+
+@app.command("eval-labels")
+def eval_labels() -> None:
+    """Which ranking scores and QA metrics predict real performance: Spearman
+    correlations of every signal against the growth agent's labels
+    (completion, shares, watch time). Read-only."""
+    from reelforge_core.learning.dataset import TARGETS, collect, labels_db
+    from reelforge_core.learning.fewshot import examples_block
+    from reelforge_core.learning.report import format_report
+    from reelforge_core.learning.weights import MIN_LABELS, load_weights
+
+    rows = collect(_data_dir())
+    if not rows:
+        console.print(
+            f"No performance labels yet ({labels_db(_data_dir())} is missing or empty). "
+            "They arrive from the growth agent through the queue consumer."
+        )
+        raise typer.Exit(0)
+    console.print(format_report(rows, TARGETS))
+    lw = load_weights()
+    console.print(f"\nscore weights: {'learned ' + lw.version + ' ' + str(lw.weights) if lw else 'defaults'}"
+                  f" (fit-weights needs {MIN_LABELS} labels)")
+    block = examples_block(rows)
+    console.print("ranking examples: " + ("active" if block else "not yet (need 10+ joined labels)"))
+
+
+@app.command("fit-weights")
+def fit_weights_cmd(
+    target: str = typer.Option("completion_rate", "--target",
+                               help="completion_rate | shares_per_view | watch_time_pct"),
+    apply: bool = typer.Option(False, "--apply", help="Write the weights so selection uses them."),
+) -> None:
+    """Fit the four ranking-score weights to real performance (ridge
+    regression, shrunk toward the defaults). Offline and explicit: nothing
+    changes until you --apply, and applying invalidates cached rankings."""
+    from reelforge_core.learning.dataset import TARGETS, collect
+    from reelforge_core.learning.weights import DEFAULT_WEIGHTS, fit_weights, save_weights, weights_path
+
+    if target not in TARGETS:
+        raise typer.BadParameter(f"--target must be one of {', '.join(TARGETS)}")
+    try:
+        lw = fit_weights(collect(_data_dir()), target)
+    except ValueError as exc:
+        console.print(f"Not fitting: {exc}.")
+        raise typer.Exit(1)
+    for k, v in lw.weights.items():
+        console.print(f"  {k:22s} {DEFAULT_WEIGHTS[k]:.2f} -> {v:.3f}")
+    console.print(f"version {lw.version} from {lw.n} labels ({target})")
+    if apply:
+        path = weights_path(_data_dir())
+        save_weights(lw, path)
+        console.print(f"applied: {path} — the next selection re-ranks with these weights")
+    else:
+        console.print("dry run — pass --apply to use them")
+
+
+def _labels_dir() -> Path:
+    for cand in (Path("/app/tests/reels/eval/labels"), Path("tests/reels/eval/labels")):
+        if cand.is_dir():
+            return cand
+    raise typer.BadParameter("no labels directory (tests/reels/eval/labels) found")
+
+
+def _reel_dirs_for_project(project: str) -> list[Path]:
+    """Every rendered reel of a project, by project id or exact name. Reads
+    the database inside the container — never from the macOS host."""
+    import sqlite3
+
+    db = _data_dir() / "reelforge.db"
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "select id from projects where id = ? or name = ?", (project, project)
+        ).fetchone()
+        if row is None:
+            raise typer.BadParameter(f"no project {project!r}")
+        assets = [r[0] for r in conn.execute(
+            "select id from assets where project_id = ? and kind = 'video'", (row[0],)
+        )]
+    finally:
+        conn.close()
+    found: list[Path] = []
+    for aid in assets:
+        reels = _data_dir() / "working" / aid / "reels"
+        if reels.is_dir():
+            found.extend(sorted(p for p in reels.iterdir() if (p / "compose.json").exists()))
+    return found
+
+
+def _find_reel_dir(reel_id: str) -> Path:
+    matches = [p for p in (_data_dir() / "working").glob(f"*/reels/{reel_id}") if (p / "compose.json").exists()]
+    if not matches:
+        raise typer.BadParameter(f"no rendered reel {reel_id!r}")
+    return matches[0]
+
+
+@app.command("qa")
+def qa_reel(
+    reel_id: str = typer.Argument(..., help="Reel id (a candidate id, or mix-...)"),
+    as_json: bool = typer.Option(False, "--json", help="Print qa.json instead of the table."),
+) -> None:
+    """Score one rendered reel against the professional-editing targets."""
+    from reelforge_core.qa.scorecard import format_scorecard, write_scorecard
+
+    card = write_scorecard(_find_reel_dir(reel_id))
+    if as_json:
+        console.print_json(json.dumps(card))
+    else:
+        console.print(format_scorecard(card), highlight=False)
+
+
+@app.command("qa-project")
+def qa_project(
+    project: str = typer.Argument(..., help="Project id or exact name."),
+    save_baseline: str = typer.Option(None, "--save-baseline", help="Store these scores as NAME."),
+    diff: str = typer.Option(None, "--diff", help="Compare against a saved baseline NAME."),
+    rescore: bool = typer.Option(True, "--rescore/--cached", help="Re-measure, or reuse qa.json."),
+) -> None:
+    """Score every rendered reel in a project; save or diff a baseline."""
+    from reelforge_core.qa.scorecard import format_scorecard, write_scorecard
+
+    cards: dict[str, dict] = {}
+    for reel_dir in _reel_dirs_for_project(project):
+        cached = reel_dir / "qa.json"
+        card = (
+            json.loads(cached.read_text())
+            if not rescore and cached.exists()
+            else write_scorecard(reel_dir)
+        )
+        cards[reel_dir.name] = card
+        if diff is None:
+            console.print(format_scorecard(card) + "\n", highlight=False)
+    if not cards:
+        console.print(f"[yellow]no rendered reels in {project!r}[/yellow]")
+        raise typer.Exit(code=1)
+
+    baselines = _data_dir() / "qa" / "baselines"
+    if save_baseline:
+        baselines.mkdir(parents=True, exist_ok=True)
+        path = baselines / f"{save_baseline}.json"
+        existing = json.loads(path.read_text()) if path.exists() else {}
+        existing.update(cards)  # one baseline can span several projects
+        path.write_text(json.dumps(existing, indent=1))
+        console.print(f"saved {len(cards)} reel(s) to baseline {save_baseline!r} ({path})")
+
+    if diff:
+        path = baselines / f"{diff}.json"
+        if not path.exists():
+            raise typer.BadParameter(f"no baseline {diff!r} at {path}")
+        before = json.loads(path.read_text())
+        for reel_id, card in cards.items():
+            old = before.get(reel_id)
+            if old is None:
+                console.print(f"{card.get('title') or reel_id}: new (not in {diff!r})\n")
+                continue
+            old_checks = {c["metric"]: c for c in old["checks"]}
+            console.print(f"{card.get('title') or reel_id}  score {old['score']} -> {card['score']}")
+            for c in card["checks"]:
+                was = old_checks.get(c["metric"])
+                if was is None:
+                    continue
+                if was["value"] != c["value"] or was["result"] != c["result"]:
+                    arrow = {"pass": "+", "fail": "!", "n/a": " "}[c["result"]]
+                    console.print(
+                        f"  {arrow} {c['metric']:<24} {was['value']} -> {c['value']}"
+                        f"   ({was['result']} -> {c['result']})",
+                        highlight=False,
+                    )
+            console.print("")
+
+
+@app.command("label")
+def label_pick(
+    asset_id: str = typer.Argument(..., help="The source clip's asset id."),
+    span: str = typer.Argument(..., help="START-END in source seconds, e.g. 12.0-47.5"),
+    note: str = typer.Argument("", help="Why this span deserves a reel."),
+) -> None:
+    """Record a span you would have picked yourself (ground truth for eval-select)."""
+    try:
+        start_s, end_s = (float(x) for x in span.split("-", 1))
+    except ValueError as exc:
+        raise typer.BadParameter("span must look like 12.0-47.5") from exc
+    if end_s <= start_s:
+        raise typer.BadParameter("END must be after START")
+    path = _labels_dir() / f"{asset_id}.json"
+    data = json.loads(path.read_text()) if path.exists() else {"asset_id": asset_id, "picks": []}
+    data["picks"].append({"start_sec": start_s, "end_sec": end_s, "note": note})
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    console.print(f"{len(data['picks'])} pick(s) for {asset_id[:12]} in {path}")
+
+
+@app.command("seed-labels")
+def seed_labels(
+    project: str = typer.Argument(..., help="Project id or exact name."),
+) -> None:
+    """Turn the reels you exported into eval picks — an export is a span you
+    judged worth keeping. AI mixes are skipped: they span several clips, and a
+    pick is one span of one source."""
+    import sqlite3
+
+    db = _data_dir() / "reelforge.db"
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "select id from projects where id = ? or name = ?", (project, project)
+        ).fetchone()
+        if row is None:
+            raise typer.BadParameter(f"no project {project!r}")
+        reels = conn.execute(
+            """select distinct r.asset_id, r.start_sec, r.end_sec, r.title
+               from reels r join exports e on e.reel_id = r.id
+               where r.project_id = ? and e.output_path is not null
+                 and r.id not like 'mix-%'""",
+            (row[0],),
+        ).fetchall()
+    finally:
+        conn.close()
+    added = 0
+    for asset_id, start_s, end_s, title in reels:
+        path = _labels_dir() / f"{asset_id}.json"
+        data = json.loads(path.read_text()) if path.exists() else {"asset_id": asset_id, "picks": []}
+        spans = {(round(p["start_sec"], 2), round(p["end_sec"], 2)) for p in data["picks"]}
+        if (round(start_s, 2), round(end_s, 2)) in spans:
+            continue
+        data["picks"].append(
+            {"start_sec": start_s, "end_sec": end_s, "note": f"exported: {title}"}
+        )
+        path.write_text(json.dumps(data, indent=2) + "\n")
+        added += 1
+    console.print(f"added {added} pick(s) from {len(reels)} exported reel(s)")
+
+
+@app.command("rate")
+def rate_reel(
+    reel_id: str = typer.Argument(...),
+    verdict: str = typer.Option(..., "--verdict", help="better | same | worse than before"),
+    note: str = typer.Option("", "--note"),
+) -> None:
+    """Log your own judgement of a re-render, next to its scorecard."""
+    if verdict not in ("better", "same", "worse"):
+        raise typer.BadParameter("verdict is better, same or worse")
+    reel_dir = _find_reel_dir(reel_id)
+    qa = reel_dir / "qa.json"
+    score = json.loads(qa.read_text()).get("score") if qa.exists() else None
+    out = _data_dir() / "qa" / "ratings.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("a") as fh:
+        fh.write(json.dumps({
+            "reel_id": reel_id, "verdict": verdict, "note": note, "qa_score": score,
+            "at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        }) + "\n")
+    console.print(f"logged: {reel_id} {verdict}")
+
+
 if __name__ == "__main__":
     app()

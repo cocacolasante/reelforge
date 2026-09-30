@@ -73,7 +73,7 @@ def model_path() -> Path:
     return Path(os.environ.get("REELFORGE_FACE_MODEL", DEFAULT_MODEL))
 
 
-def _landmarker(video: bool) -> Any:
+def _landmarker(video: bool, num_faces: int = 1) -> Any:
     try:
         import mediapipe as mp  # noqa: F401
         from mediapipe.tasks.python import BaseOptions, vision
@@ -85,7 +85,7 @@ def _landmarker(video: bool) -> Any:
     opts = vision.FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(path)),
         running_mode=vision.RunningMode.VIDEO if video else vision.RunningMode.IMAGE,
-        num_faces=1,
+        num_faces=num_faces,
         output_facial_transformation_matrixes=True,
     )
     return vision.FaceLandmarker.create_from_options(opts)

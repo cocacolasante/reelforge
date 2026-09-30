@@ -7,14 +7,12 @@ compose path (which deliberately never applies grammars to user edits) needs
 no changes.
 
 Multi-source rules, mirroring compose/styles.py grammars:
-- hype: beat-split long moments (styles._beat_pieces), slow-mo + drifting
-  punch-in on the single biggest energy peak (per-asset z-scores), 1.5x
-  through lulls; hard cuts within a moment; between moments, a source-video
-  change gets a quick slide (reads as a camera change), same-source cuts
-  stay hard.
+- hype: action-led cuts (compose/action.py) — no cut through an action
+  event, a speed ramp into the strongest impact of the mix, beat-snapped
+  filler, alternating framing, 1.5x through lulls; hard cuts throughout.
 - talking_head: jump cuts through each moment's dead air, punch-in
   alternation, all hard cuts.
-- cinematic: dissolve / dip-to-black alternation, Ken Burns everywhere.
+- cinematic: dissolves, one dip to black before the final moment, Ken Burns everywhere.
 - chill: gentle long fades. classic: plain cuts at the reel default.
 
 The output always satisfies the editor PUT rules: <= 60 shots (beat
@@ -27,10 +25,7 @@ from __future__ import annotations
 from reelforge_core.compose.beats import BeatGrid
 from reelforge_core.compose.styles import (
     HYPE_LULL_Z,
-    HYPE_MAX_SHOT_SEC,
-    HYPE_SLOWMO_MAX_SRC_SEC,
-    TH_PUNCH_IN,
-    _beat_pieces,
+    HYPE_ALT_ZOOM,
 )
 from reelforge_core.models import (
     AnalysisReport,
@@ -70,9 +65,13 @@ def plan_mix(
     elif style == "talking_head":
         timeline_shots = _plan_talking_head(shots, analyses, envelopes)
     elif style == "cinematic":
-        timeline_shots = _plan_uniform(
-            shots, palette=[("dissolve", 0.8), ("fadeblack", 0.8)], ken_burns=True
-        )
+        timeline_shots = _plan_uniform(shots, palette=[("dissolve", 0.8)], ken_burns=True)
+        # The one dip to black goes before the final moment (styles.cinematic_cuts).
+        if len(timeline_shots) >= 3:
+            penultimate = timeline_shots[-2]
+            timeline_shots[-2] = penultimate.model_copy(
+                update={"transition_after": TransitionStyle(kind="fadeblack", duration_sec=0.8)}
+            )
     elif style == "chill":
         timeline_shots = _plan_uniform(shots, palette=[("fade", 0.6)], ken_burns=False)
     else:  # classic
@@ -90,6 +89,7 @@ def _shot(
     punch_in_animated: bool = False,
     ken_burns: bool = False,
     transition: tuple[str, float] | None = None,
+    framing_keys: tuple = (),
 ) -> TimelineShot:
     return TimelineShot(
         kind="video",
@@ -100,6 +100,7 @@ def _shot(
         speed=speed,
         punch_in=punch_in,
         punch_in_animated=punch_in_animated,
+        framing_keys=[[round(v, 3) for v in k] for k in framing_keys],
         transition_after=(
             TransitionStyle(kind=transition[0], duration_sec=transition[1])  # type: ignore[arg-type]
             if transition is not None
@@ -152,72 +153,61 @@ def _plan_hype(
     analyses: dict[str, AnalysisReport | None],
     grid: BeatGrid | None,
 ) -> list[TimelineShot]:
+    """Action-led cuts per moment (compose/action.py, as in scene mode): no
+    cut through an event, cut-ins at the motion low before each, a speed
+    ramp into the single strongest impact across the mix, beat-snapped
+    filler, alternating framing, 1.5x through lulls, hard cuts only."""
+    from reelforge_core.compose.action import action_pieces
+    from reelforge_core.reels.events import activity_track, detect_events
+
     z_cache: dict = {}
-
-    # The single biggest moment across the mix gets the slow-mo. z-scores are
-    # per-asset normalized — cross-asset comparison is approximate but the
-    # winner is a genuine peak in its own footage either way.
-    peak: tuple[str, float] | None = None  # (asset_id, time)
-    best_z = float("-inf")
+    per_asset: dict[str, tuple[list, list[float]]] = {}
+    for aid, _s, _e in shots:
+        if aid not in per_asset:
+            a = analyses.get(aid)
+            per_asset[aid] = (
+                (detect_events(a), activity_track(a)) if a is not None else ([], [])
+            )
+    # The strongest event across the mix gets the ramp. Strengths are
+    # per-asset z-scores — approximate across assets, but the winner is a
+    # genuine peak in its own footage either way.
+    money = None
+    best = float("-inf")
     for aid, s, e in shots:
-        for t, z in _energy_z_for(analyses, z_cache, aid):
-            if s <= t <= e and z > best_z:
-                best_z = z
-                peak = (aid, t)
-
+        for ev in per_asset[aid][0]:
+            if s <= ev.peak_sec <= e and ev.strength > best:
+                best, money = ev.strength, ev
     built: list[tuple[TimelineShot, tuple[str, float] | None]] = []
     mezz_cursor = 0.0
-    slide = ["slideleft", "slideright"]
-    source_change_count = 0
-    prev_aid: str | None = None
+    prev_zoom = HYPE_ALT_ZOOM  # so the first alternated piece opens wide
     for aid, s, e in shots:
-        # Boundary transition BEFORE this moment: source change reads as a
-        # camera change -> quick slide; same source -> hard cut.
-        if built:
-            if aid != prev_aid:
-                boundary = (slide[source_change_count % 2], 0.25)
-                source_change_count += 1
-            else:
-                boundary = ("cut", 0.04)
-            prev_shot, _ = built[-1]
-            built[-1] = (prev_shot, boundary)
-        prev_aid = aid
+        events, act = per_asset[aid]
 
-        pieces = (
-            _beat_pieces(s, e, mezz_cursor, grid)
-            if e - s > HYPE_MAX_SHOT_SEC
-            else [(s, e)]
+        def activity(t: float, _act=act) -> float | None:
+            i = int(t)
+            return _act[i] if 0 <= i < len(_act) else None
+
+        pieces, zoom_after = action_pieces(
+            s, e, events, activity, grid=grid, mezz_start=mezz_cursor,
+            money=money if money in events else None, prev_zoom=prev_zoom,
         )
         # Never exceed the editor cap: stop splitting, keep the whole rest.
         if len(built) + len(pieces) > MAX_MIX_SHOTS:
-            pieces = [(s, e)]
+            built.append((_shot(aid, s, e), ("cut", 0.04)))
+            mezz_cursor += e - s
+            continue
+        prev_zoom = zoom_after
         energy = _energy_z_for(analyses, z_cache, aid)
-        for pi, (ps, pe) in enumerate(pieces):
-            if pi > 0:
-                prev_shot, _ = built[-1]
-                built[-1] = (prev_shot, ("cut", 0.04))
-            speed = 1.0
-            punch = None
-            animated = False
-            src_dur = pe - ps
-            if (
-                peak is not None
-                and peak[0] == aid
-                and ps <= peak[1] <= pe
-                and src_dur <= HYPE_SLOWMO_MAX_SRC_SEC
-            ):
-                speed = 0.5
-                punch = 1.2
-                animated = True
-                peak = None
-            else:
-                zs = [z for t, z in energy if ps <= t <= pe]
-                if zs and sum(zs) / len(zs) < HYPE_LULL_Z and src_dur >= 2.0:
+        for p in pieces:
+            speed = p.speed
+            if p.kind == "fill" and speed == 1.0 and p.end - p.start >= 2.0:
+                zs = [z for t, z in energy if p.start <= t <= p.end]
+                if zs and sum(zs) / len(zs) < HYPE_LULL_Z:
                     speed = 1.5
-            shot = _shot(
-                aid, ps, pe, speed=speed, punch_in=punch, punch_in_animated=animated
-            )
-            built.append((shot, None))
+            shot = _shot(aid, p.start, p.end, speed=speed, framing_keys=p.keys)
+            # A hard cut before every piece and every moment: a slide on every
+            # source change made most joins in a mix flashy.
+            built.append((shot, ("cut", 0.04)))
             mezz_cursor += shot.duration
     return _finish_transitions(built)
 
@@ -229,8 +219,10 @@ def _plan_talking_head(
 ) -> list[TimelineShot]:
     from reelforge_core.compose.jumpcuts import split_on_silences
 
+    from reelforge_core.compose.styles import _shot_words, rhythm_keys
+
     built: list[tuple[TimelineShot, tuple[str, float] | None]] = []
-    k = 0
+    zoom_index = 0
     for aid, s, e in shots:
         a = analyses.get(aid)
         transcript = a.transcript if a is not None else None
@@ -244,11 +236,155 @@ def _plan_talking_head(
             if built:
                 prev_shot, _ = built[-1]
                 built[-1] = (prev_shot, ("cut", 0.04))
-            built.append(
-                (
-                    _shot(aid, ps, pe, punch_in=TH_PUNCH_IN if k % 2 == 1 else None),
-                    None,
-                )
-            )
-            k += 1
+            # Same rhythm as a single-clip talking head (styles.rhythm_keys):
+            # a new framing at each cut and about every 3s within a shot.
+            words = _shot_words(a, ps, pe) if a is not None else []
+            keys, zoom_index = rhythm_keys(pe - ps, words, zoom_index)
+            built.append((_shot(aid, ps, pe, framing_keys=keys), None))
     return _finish_transitions(built)
+
+
+# ---------------------------------------------------------------------------
+# Long-form retention structure (CP11)
+# ---------------------------------------------------------------------------
+
+# Long-form visual rhythm: a live 6-minute "chill" mix held one framing for
+# 80s (1.5 changes/min) — long sections, no grammar that moves the picture.
+# Gentler than the talking-head rhythm: a change about every 6s, never more
+# than 8s static (the long-form QA target), between two close framings.
+LONG_RHYTHM = dict(interval=6.0, force=7.0, max_static=8.0, zooms=(1.0, 1.12))
+LONG_STATIC_SEC = 8.0
+
+YT_MIN_CHAPTERS = 3
+YT_MIN_CHAPTER_SEC = 10.0
+CHAPTER_OVERLAY_SEC = 2.0
+REHOOK_OVERLAY_SEC = 3.0
+REHOOK_AT = 0.45  # of the running time
+REHOOK_WINDOW = (0.35, 0.60)
+
+
+def youtube_chapters(starts: list[tuple[str, float]], total: float) -> list[tuple[str, float]]:
+    """Chapters YouTube will accept: the first at 0:00, each >= 10s (a short
+    one folds into the one before), at least 3 — otherwise none. Pure."""
+    chapters = sorted(((t or "").strip()[:60], max(0.0, s)) for t, s in starts)
+    chapters = [(t, s) for t, s in sorted(chapters, key=lambda c: c[1]) if t]
+    if not chapters:
+        return []
+    title0, _ = chapters[0]
+    chapters[0] = (title0, 0.0)
+    kept: list[tuple[str, float]] = [chapters[0]]
+    for title, start in chapters[1:]:
+        if start - kept[-1][1] >= YT_MIN_CHAPTER_SEC:
+            kept.append((title, start))
+    if len(kept) > 1 and total - kept[-1][1] < YT_MIN_CHAPTER_SEC:
+        kept.pop()
+    return kept if len(kept) >= YT_MIN_CHAPTERS else []
+
+
+def format_chapters(chapters: list[tuple[str, float]]) -> str:
+    """YouTube description chapter lines: '0:00 Title'. Pure."""
+    lines = []
+    for title, start in chapters:
+        s = int(start)
+        stamp = f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+        lines.append(f"{stamp} {title}")
+    return "\n".join(lines)
+
+
+def plan_long_form(
+    seq,
+    analyses: dict[str, AnalysisReport | None],
+    style: str,
+    beat_grid: BeatGrid | None,
+    envelopes: dict | None = None,
+) -> ReelTimeline:
+    """A long-form mix: the intro montage (seq.intro) cold-opens, a hard cut
+    into the story, chapters mapped to the first shot of their section, a
+    2s title card at each chapter after the first, and a 'coming up'
+    re-hook near the midpoint. Overlays are ordinary timeline overlays —
+    the editor shows and can delete them. Pure."""
+    from reelforge_core.broll.suggest import shot_segments
+    from reelforge_core.models import Chapter, TextOverlay
+
+    from reelforge_core.compose.styles import _shot_words, rhythm_keys
+
+    intro = list(seq.intro)
+    items = intro + list(seq.shots)
+    tl = plan_mix(items, analyses, style, beat_grid, envelopes)
+    shots = list(tl.shots)
+    if style != "hype":
+        # Keep long shots moving (framing keys never change a duration).
+        zoom_index = 0
+        for i, sh in enumerate(shots):
+            if sh.kind != "video" or sh.framing_keys or sh.duration <= LONG_STATIC_SEC:
+                continue
+            a = analyses.get(sh.asset_id)
+            words = _shot_words(a, sh.in_ts, sh.out_ts, sh.speed or 1.0) if a is not None else []
+            keys, zoom_index = rhythm_keys(sh.duration, words, zoom_index, cx=0.5, cy=0.5, **LONG_RHYTHM)
+            shots[i] = sh.model_copy(update={"framing_keys": [list(k) for k in keys]})
+
+    # First shot of every item: grammars split items (jump cuts, action
+    # cuts) but keep them in order and inside their source range.
+    first: list[int | None] = []
+    cursor = 0
+    for aid, s, e in items:
+        j = next(
+            (j for j in range(cursor, len(shots))
+             if shots[j].asset_id == aid and s - 0.7 <= shots[j].in_ts <= e),
+            None,
+        )
+        first.append(j)
+        if j is not None:
+            cursor = j + 1
+
+    story_start = first[len(intro)] if len(intro) < len(first) else None
+    if intro and story_start:
+        # Out of the montage into the story: a hard cut, whatever the grammar.
+        k = story_start - 1
+        shots[k] = shots[k].model_copy(
+            update={"transition_after": TransitionStyle(kind="cut", duration_sec=0.04)}
+        )
+    tl = tl.model_copy(update={"shots": shots})
+
+    segs = shot_segments(tl)
+    total = segs[-1][2] if segs else 0.0
+
+    def at(shot_index: int) -> float:
+        return segs[shot_index][1] if 0 <= shot_index < len(segs) else 0.0
+
+    raw: list[tuple[str, int]] = []
+    if intro:
+        raw.append(("Intro", 0))
+    for k, title in enumerate(getattr(seq, "chapter_titles", []) or []):
+        j = first[len(intro) + k] if len(intro) + k < len(first) else None
+        if title and j is not None:
+            raw.append((title, j))
+    if raw and raw[0][1] != 0:
+        raw[0] = (raw[0][0], 0)
+    valid = youtube_chapters([(t, at(j)) for t, j in raw], total)
+    by_time = {round(at(j), 3): (t, j) for t, j in raw}
+    chapters = [Chapter(title=t, shot_index=by_time.get(round(s, 3), (t, 0))[1]) for t, s in valid]
+
+    overlays: list[TextOverlay] = []
+    for i, (title, start) in enumerate(valid):
+        if i == 0:
+            continue
+        overlays.append(TextOverlay(
+            id=f"chapter-{i + 1}", text=title, start_sec=round(start + 0.3, 3),
+            end_sec=round(start + 0.3 + CHAPTER_OVERLAY_SEC, 3), position="top",
+            font_size_px=72,
+        ))
+    rehook = getattr(seq, "rehook_text", None)
+    if rehook and total > 60.0:
+        lo, hi = REHOOK_WINDOW[0] * total, REHOOK_WINDOW[1] * total
+        boundaries = [start for _, start in valid if lo <= start <= hi] or [
+            a for _, a, _ in segs if lo <= a <= hi
+        ]
+        t = min(boundaries, key=lambda b: abs(b - REHOOK_AT * total)) if boundaries else REHOOK_AT * total
+        if any(abs(o.start_sec - t) < CHAPTER_OVERLAY_SEC + 0.5 for o in overlays):
+            t += CHAPTER_OVERLAY_SEC + 0.5  # after the chapter card, not on it
+        overlays.append(TextOverlay(
+            id="rehook", text=f"Coming up: {rehook}", start_sec=round(t, 3),
+            end_sec=round(t + REHOOK_OVERLAY_SEC, 3), position="top", font_size_px=64,
+        ))
+    return tl.model_copy(update={"overlays": overlays, "chapters": chapters})

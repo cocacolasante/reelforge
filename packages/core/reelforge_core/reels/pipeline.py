@@ -89,6 +89,17 @@ def _ranking_stamp(config: SelectionConfig, cand_hash: str) -> dict:
     # add/change/remove mismatches and forces a fresh ranking call.
     if config.prompt:
         stamp["prompt"] = config.prompt
+    # CP12: learned weights / performer examples change the ranking — only
+    # when active, so stamps from before any labels keep matching.
+    from reelforge_core.learning.fewshot import block_digest
+    from reelforge_core.reels.rank import active_weights, fewshot_block
+
+    lw = active_weights(config)
+    if lw is not None:
+        stamp["weights_version"] = lw.version
+    digest = block_digest(fewshot_block(config))
+    if digest:
+        stamp["fewshot"] = digest
     return stamp
 
 
@@ -326,7 +337,31 @@ async def select_reels(
     from reelforge_core.reels.prescore import compute_features, prescore, shortlist
 
     features = compute_features(candidates, analysis)
+    # Content scores (CP7): one small text-only call rating every line as an
+    # opener and a closer, so strong lines over calm footage can make the
+    # shortlist. Best-effort — {} keeps the heuristic shortlist.
+    content: dict[str, float] = {}
+    content_usage = UsageTotals()
     short = shortlist(candidates, features, config.shortlist_size)
+    # When the heuristic walk already holds every distinct span (short
+    # footage: the overlap rule leaves fewer than shortlist_size), there is
+    # nothing a reserved slot could add — skip the call.
+    if (
+        config.content_scoring
+        and analysis.transcript is not None
+        and len(short) >= config.shortlist_size
+    ):
+        from reelforge_core.reels.content_score import candidate_scores, score_units
+        from reelforge_core.reels.generators.sentence import build_units
+
+        await progress(_emit("ranking", 0.01, "scoring lines"))
+        units = build_units(analysis.transcript)
+        unit_scores, content_usage = await score_units(
+            units, working_dir=wd, model=config.content_model
+        )
+        content = candidate_scores(candidates, units, unit_scores) if unit_scores else {}
+        if content:
+            short = shortlist(candidates, features, config.shortlist_size, content=content)
     short_ids = {s.candidate_id for s in short}
     write_json_atomic(
         wd / "prescore.json",
@@ -338,6 +373,7 @@ async def select_reels(
                     "end_sec": c.end_sec,
                     "source": c.source,
                     "prescore": prescore(features[c.candidate_id]),
+                    "content_score": content.get(c.candidate_id),
                     "shortlisted": c.candidate_id in short_ids,
                     "features": features[c.candidate_id].to_dict(),
                 }
@@ -363,12 +399,14 @@ async def select_reels(
         raw = json.loads(raw_path.read_text())
         rankings_raw = raw.get("rankings", [])
         candidate_map = {c.candidate_id: c for c in short}
-        from reelforge_core.reels.rank import _coerce_rankings  # local import
+        from reelforge_core.reels.rank import _coerce_rankings, active_weights  # local import
 
         ranked = _coerce_rankings(
             rankings_raw,
             candidate_map=candidate_map,
             prompt_active=bool(config.prompt),
+            analysis=analysis,
+            weights=active_weights(config),
         )
         ranking_result = RankingResult(
             reels=ranked, usage=UsageTotals(), raw_rankings=rankings_raw
@@ -425,7 +463,12 @@ async def select_reels(
         else set()
         for r in kept
     }
-    ordered = mmr_diversify(kept, tag_sets, lam)
+    from reelforge_core.reels.dedup import content_words
+
+    word_sets = {
+        r.candidate_id: content_words(analysis.transcript, r.start_sec, r.end_sec) for r in kept
+    }
+    ordered = mmr_diversify(kept, tag_sets, lam, word_sets)
     topk_by_overall = {r.candidate_id for r in kept[: config.top_k]}
     topk_by_mmr = {r.candidate_id for r in ordered[: config.top_k]}
     dropped_by_diversity = len(topk_by_overall - topk_by_mmr)
@@ -448,6 +491,11 @@ async def select_reels(
         # Refined edges can newly collide; drop the lower-ordered reel and
         # backfill from the post-MMR reserve.
         final = resolve_post_refine_overlaps(final, reserve, config)
+    # Trailing filler off the end (local; the ranker's trim_tail_words is a
+    # hint, the qa/metrics.py patterns decide).
+    from reelforge_core.reels.refine import trim_trailing
+
+    final = [trim_trailing(r, analysis, config) for r in final]
     if config.event_guard:
         from reelforge_core.reels.dedup import enforce_clean_edges
         from reelforge_core.reels.events import detect_events
@@ -460,8 +508,10 @@ async def select_reels(
     await progress(_emit("dedup", 1.0))
 
     total_usage = UsageTotals(
-        input_tokens=ranking_result.usage.input_tokens + refine_usage.input_tokens,
-        output_tokens=ranking_result.usage.output_tokens + refine_usage.output_tokens,
+        input_tokens=ranking_result.usage.input_tokens + refine_usage.input_tokens
+        + content_usage.input_tokens,
+        output_tokens=ranking_result.usage.output_tokens + refine_usage.output_tokens
+        + content_usage.output_tokens,
         cache_hits=ranking_result.usage.cache_hits,
     )
 

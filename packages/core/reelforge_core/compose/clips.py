@@ -86,6 +86,13 @@ class ClipInfo:
     # Static (or drifting) digital zoom applied in the render graph.
     punch_in: float | None = None
     punch_in_animated: bool = False
+    # Framing changes within the shot, (t, zoom, cx, cy) — see
+    # styles.PlannedShot. Graph-side, so not part of any clip cache key.
+    framing_keys: tuple = ()
+    # compose/facetrack.py: share of face-bearing frames whose face stayed in
+    # the crop (None = no face / not tracked) and how it was tracked.
+    face_coverage: float | None = None
+    track_source: str | None = None
 
 
 def _atempo_chain(speed: float) -> str:
@@ -112,6 +119,7 @@ def _video_filter_chain(
     pan: tuple[float, float] | None = None,
     pan_window: tuple[float, float] | None = None,
     speed: float = 1.0,
+    pan_path: list[tuple[float, float]] | None = None,
 ) -> str:
     """Scale chain for one clip.
 
@@ -133,13 +141,20 @@ def _video_filter_chain(
             "zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
             "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
         )
-    if pan is not None:
+    if pan is not None or pan_path:
         in_ts, duration = pan_window or (0.0, 1.0)
-        x0, x1 = pan
         # Crop window: full source height, width matching the target aspect.
         crop_w = f"floor(ih*{width}/{height}/2)*2"
-        progress = f"min(max((t-{in_ts:.3f})/{max(duration, 0.001):.3f}\\,0)\\,1)"
-        center = f"({x0:.4f}+({x1 - x0:.4f})*{progress})*iw"
+        if pan_path:
+            # A tracked path (compose/facetrack.py), keyed in seconds from
+            # the clip's first output frame.
+            from reelforge_core.compose.facetrack import piecewise_expr
+
+            center = f"({piecewise_expr(pan_path, f'(t-{in_ts:.3f})')})*iw"
+        else:
+            x0, x1 = pan
+            progress = f"min(max((t-{in_ts:.3f})/{max(duration, 0.001):.3f}\\,0)\\,1)"
+            center = f"({x0:.4f}+({x1 - x0:.4f})*{progress})*iw"
         x_expr = f"min(max({center}-({crop_w})/2\\,0)\\,iw-({crop_w}))"
         parts.append(
             f"crop=w={crop_w}:h=ih:x='{x_expr}':y=0,"
@@ -166,6 +181,7 @@ def build_clip_command(
     is_hdr: bool,
     pan: tuple[float, float] | None = None,
     speed: float = 1.0,
+    pan_path: list[tuple[float, float]] | None = None,
 ) -> list[str]:
     w, h = config.resolution
     # -ss/-to are OUTPUT options here (accurate-seek re-encode): they act on
@@ -181,6 +197,9 @@ def build_clip_command(
         pan=pan,
         pan_window=(ss, max(0.001, to - ss)),
         speed=speed,
+        # Track keys are source seconds from in_ts; the filter clock runs
+        # 1/speed as fast after setpts.
+        pan_path=[(t / speed, x) for t, x in pan_path] if pan_path else None,
     )
     args: list[str] = [
         "ffmpeg",
@@ -281,6 +300,54 @@ def clip_bounds(
     return in_ts, out_ts
 
 
+async def _reframe(
+    asset: MediaAsset,
+    in_ts: float,
+    out_ts: float,
+    config: ComposeConfig,
+    pan_sem: asyncio.Semaphore,
+    transcript,
+    crop_track: bool,
+    framing_keys: tuple,
+) -> "tuple[tuple[float, float] | None, list | None, object | None]":
+    """(linear pan, tracked path, track) for one clip. The per-frame face
+    track (compose/facetrack.py) runs when the clip is cropped OR carries
+    framing keys to aim; the old two-point estimate is its fallback."""
+    from reelforge_core.compose.facetrack import speech_intervals, track_subject
+    from reelforge_core.compose.reframe import estimate_pan
+    from reelforge_core.paths import WORKING_DIR
+
+    track = None
+    if config.effects.face_track and (crop_track or framing_keys):
+        async with pan_sem:
+            track = await asyncio.to_thread(
+                track_subject,
+                asset.path,
+                in_ts,
+                out_ts,
+                config.resolution,
+                speech=speech_intervals(transcript, in_ts, out_ts),
+                asset_id=asset.id,
+                working_root=WORKING_DIR,
+                aim=bool(framing_keys),
+            )
+    if not crop_track:
+        return None, None, track
+    if track is not None:
+        return None, list(track.path), track
+    async with pan_sem:
+        pan = await asyncio.to_thread(estimate_pan, asset.path, in_ts, out_ts)
+    return pan, None, None
+
+
+def _pan_key(pan, pan_path, track, speed: float) -> str:
+    if pan_path:
+        from reelforge_core.compose.facetrack import FACETRACK_VERSION
+
+        return f"track:{track.digest}|{FACETRACK_VERSION}|s{speed:.4f}"
+    return "none" if pan is None else f"{pan[0]:.4f}-{pan[1]:.4f}"
+
+
 async def extract_clips(
     asset: MediaAsset,
     reel: RankedReel,
@@ -301,7 +368,7 @@ async def extract_clips(
     Burns: clip_bounds is skipped since the pipeline already applied
     clamps/trims/snapping when planning.
     """
-    from reelforge_core.compose.reframe import estimate_pan, should_crop
+    from reelforge_core.compose.reframe import should_crop
 
     clips_dir = reel_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -326,6 +393,7 @@ async def extract_clips(
         punch_in = None
         punch_in_animated = False
         force_kb = False
+        framing_keys: tuple = ()
         if planned is not None:
             # Final bounds + per-shot treatment from the style planner.
             in_ts, out_ts = planned.in_ts, planned.out_ts
@@ -333,6 +401,7 @@ async def extract_clips(
             punch_in = planned.punch_in
             punch_in_animated = planned.punch_in_animated
             force_kb = planned.force_ken_burns
+            framing_keys = tuple(getattr(planned, "framing_keys", ()) or ())
         else:
             # Reel-bound clamp + trim offsets + speech-safe snapping (outer clips).
             in_ts, out_ts = clip_bounds(
@@ -347,10 +416,13 @@ async def extract_clips(
         if end_trims is not None and position < n_scenes - 1 and position < len(end_trims):
             # Beat trims are mezzanine seconds -> scale into source seconds.
             out_ts = max(in_ts + 0.5 * speed, out_ts - end_trims[position] * speed)
-        pan: tuple[float, float] | None = None
-        if crop_track:
-            async with pan_sem:
-                pan = await asyncio.to_thread(estimate_pan, asset.path, in_ts, out_ts)
+        pan, pan_path, track = await _reframe(
+            asset, in_ts, out_ts, config, pan_sem, analysis.transcript, crop_track, framing_keys
+        )
+        if track is not None:
+            from reelforge_core.compose.facetrack import aim_framing_keys
+
+            framing_keys = aim_framing_keys(framing_keys, track, crop_track)
         out_path = clips_dir / f"clip_{position:04d}.mp4"
 
         # Clip cache: same asset + scene + source mtime + aspect/fps/resolution
@@ -371,7 +443,7 @@ async def extract_clips(
                 "hdr": int(is_hdr),
                 "crf": config.clip_crf,
                 "preset": config.clip_preset,
-                "pan": "none" if pan is None else f"{pan[0]:.4f}-{pan[1]:.4f}",
+                "pan": _pan_key(pan, pan_path, track, speed),
                 # Only when on, so existing cached clips keep their keys.
                 **_eye_key(config),
             },
@@ -398,6 +470,7 @@ async def extract_clips(
                 is_hdr=is_hdr,
                 pan=pan,
                 speed=speed,
+                pan_path=pan_path,
             )
             async with sem:
                 await asyncio.to_thread(run_ffmpeg, cmd, log_file=log_file)
@@ -430,6 +503,9 @@ async def extract_clips(
             punch_in=punch_in,
             punch_in_animated=punch_in_animated,
             force_ken_burns=force_kb,
+            framing_keys=framing_keys,
+            face_coverage=getattr(track, "coverage", None),
+            track_source=getattr(track, "source", None),
         )
 
     results: list[ClipInfo | None] = [None] * total
@@ -483,7 +559,7 @@ async def extract_timeline_clips(
     beat-sync `end_trims` shorten interior shots exactly as in scene mode.
     """
     from reelforge_core.compose.photos import render_photo_clip
-    from reelforge_core.compose.reframe import estimate_pan, should_crop
+    from reelforge_core.compose.reframe import should_crop
     from reelforge_core.compose.speech_snap import flatten_words, snap_end, snap_start
 
     clips_dir = reel_dir / "clips"
@@ -519,10 +595,21 @@ async def extract_timeline_clips(
         crop_track = should_crop(
             asset.probe.width or 0, asset.probe.height or 0, w, h, config.effects.reframe
         )
-        pan = None
-        if crop_track:
-            async with pan_sem:
-                pan = await asyncio.to_thread(estimate_pan, asset.path, in_ts, out_ts)
+        framing_keys = tuple(tuple(k) for k in (getattr(shot, "framing_keys", None) or ()))
+        pan, pan_path, track = await _reframe(
+            asset,
+            in_ts,
+            out_ts,
+            config,
+            pan_sem,
+            analysis.transcript if analysis is not None else None,
+            crop_track,
+            framing_keys,
+        )
+        if track is not None:
+            from reelforge_core.compose.facetrack import aim_framing_keys
+
+            framing_keys = aim_framing_keys(framing_keys, track, crop_track)
         out_path = clips_dir / f"clip_{position:04d}.mp4"
         source_mtime = int(asset.path.stat().st_mtime)
         cache_key = file_cache.compute_key(
@@ -541,7 +628,7 @@ async def extract_timeline_clips(
                 "hdr": int(is_hdr),
                 "crf": config.clip_crf,
                 "preset": config.clip_preset,
-                "pan": "none" if pan is None else f"{pan[0]:.4f}-{pan[1]:.4f}",
+                "pan": _pan_key(pan, pan_path, track, speed),
                 **_eye_key(config),
             },
         )
@@ -566,6 +653,7 @@ async def extract_timeline_clips(
                 is_hdr=is_hdr,
                 pan=pan,
                 speed=speed,
+                pan_path=pan_path,
             )
             async with sem:
                 await asyncio.to_thread(run_ffmpeg, cmd, log_file=log_file)
@@ -597,6 +685,9 @@ async def extract_timeline_clips(
             speed=speed,
             punch_in=getattr(shot, "punch_in", None),
             punch_in_animated=bool(getattr(shot, "punch_in_animated", False)),
+            framing_keys=framing_keys,
+            face_coverage=getattr(track, "coverage", None),
+            track_source=getattr(track, "source", None),
         )
 
     async def _photo(position: int, shot) -> ClipInfo:

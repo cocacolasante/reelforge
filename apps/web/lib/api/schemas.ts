@@ -257,6 +257,10 @@ export const TimelineShotSchema = z.object({
   speed: z.number(),
   punch_in: z.number().nullable(),
   punch_in_animated: z.boolean(),
+  // [t, zoom, cx, cy] framing changes within the shot (the talking-head and
+  // hype rhythm). Optional so shots created in the editor don't need it;
+  // declared so Zod doesn't strip it and a save doesn't erase the rhythm.
+  framing_keys: z.array(z.array(z.number())).optional(),
 });
 export const VoiceoverTakeSchema = z.object({
   id: z.string(),
@@ -302,6 +306,9 @@ export const ReelTimelineSchema = z.object({
   // Required, not .default([]): the API always sends it, and a missing key
   // here would be stripped and wipe layers on the next save.
   layers: z.array(PictureLayerSchema),
+  // Long-form chapters (AI mix, CP11). Optional so timelines built in the
+  // editor type-check; declared so a save doesn't strip them.
+  chapters: z.array(z.object({ title: z.string(), shot_index: z.number() })).optional(),
 });
 export const SourceAudioSchema = z.object({
   asset_id: z.string(),

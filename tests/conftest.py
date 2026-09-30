@@ -219,3 +219,24 @@ class FakeAnthropicClient:
 @pytest.fixture
 def fake_anthropic() -> FakeAnthropicClient:
     return FakeAnthropicClient()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_emphasis_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """compose() runs the AI emphasis pass whenever a reel has speech (and
+    selection the CP7 content scoring), and
+    the test service loads .env (a real key). Fail its client construction
+    so compose tests fall back to heuristic captions without touching the
+    network; emphasis tests pass their own fake client."""
+    from reelforge_core.compose import emphasis
+
+    def _offline() -> None:
+        raise RuntimeError("no live API calls in tests")
+
+    monkeypatch.setattr(emphasis, "_default_client", _offline)
+    from reelforge_core.reels import content_score
+
+    monkeypatch.setattr(content_score, "_default_client", _offline)
+    from reelforge_core.compose import autobroll
+
+    monkeypatch.setattr(autobroll, "_default_client", _offline)

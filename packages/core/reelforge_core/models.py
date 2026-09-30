@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal
 
-from pydantic import field_validator, BaseModel, Field
+from pydantic import field_validator, model_validator, BaseModel, Field
 
 REELFORGE_VERSION = "0.5.0"  # Phase 4: export
 
@@ -232,6 +232,15 @@ class RankedReel(BaseModel):
     # The ranker's editing-grammar classification (compose/styles.py);
     # None on pre-v3 reels -> compose falls back to heuristics.
     edit_style: Literal["classic", "hype", "talking_head", "cinematic", "chill"] | None = None
+    # Pro-editing CP6 (ranking v6). ending_lands: does the last line land
+    # (0-100). cold_open: (start, end) source seconds of the payoff line /
+    # action peak to play FIRST, validated word-safe inside the span and
+    # outside its first 5s. tail_trim_words: trailing filler the model would
+    # cut; end_trim_sec: what the local tail trim actually removed (refine.py).
+    ending_lands: int | None = Field(default=None, ge=0, le=100)
+    cold_open: tuple[float, float] | None = None
+    tail_trim_words: int | None = Field(default=None, ge=0, le=8)
+    end_trim_sec: float | None = None
 
 
 OutputForm = Literal["short", "long_single", "long_montage"]
@@ -269,7 +278,19 @@ class SelectionConfig(BaseModel):
     top_k: int = 10
     overlap_threshold: float = 0.5
     ranking_model: str = "claude-sonnet-4-5"
-    ranking_prompt_version: str = "v4"
+    # v5: the prompt states the span length actually asked for (v4 said
+    # "30-60 seconds" for every request) and the ranker sees the whole
+    # transcript, not 60 words at each end.
+    ranking_prompt_version: str = "v6"
+    # CP7: rate every spoken line as an opener/closer (reels/content_score.py)
+    # and reserve shortlist slots for the best-scored candidates.
+    # CP12 learning loop: use applied score weights (reelforge fit-weights
+    # --apply; /data/learning/score_weights.json) and the creator's top
+    # performers as prompt examples — each only once labels exist.
+    learned_weights: bool = True
+    fewshot: bool = True
+    content_scoring: bool = True
+    content_model: str = "claude-haiku-4-5-20251001"
     temperature: float = 0.0
     resume: bool = False
     # Natural-language direction, e.g. "clips of falls", "make it feel intense".
@@ -340,23 +361,33 @@ class MusicTrack(BaseModel):
 
 
 class CaptionStyle(BaseModel):
-    mode: Literal["off", "static", "karaoke"] = "static"
-    font_family: str = "Inter"
-    font_size_px: int = 64
+    # punch (default): 1-3 word chunks in a heavy face, only KEY words
+    # highlighted, an 80ms pop-in — restrained, the 2026 norm. karaoke lights
+    # every word in turn; static is two plain lines.
+    mode: Literal["off", "static", "karaoke", "punch"] = "punch"
+    font_family: str = "Montserrat Black"
+    font_size_px: int = 86
     primary_color: str = "&H00FFFFFF"
     outline_color: str = "&H00000000"
-    outline_width_px: int = 4
+    outline_width_px: int = 6
+    shadow_px: int = 3
     highlight_color: str = "&H0000FFFF"
+    # Upper bounds: every mode also breaks lines to fit the platform-safe
+    # width (compose/safezone.py), which at 86px is ~15 characters.
     max_chars_per_line: int = 28
     max_lines: int = 2
+    punch_max_words: int = 3
     # Karaoke mode groups words into short single lines of at most this many
     # characters; the spoken word is highlighted within the visible line.
     karaoke_max_chars: int = 18
     # Transcribe voiceover takes and caption them too. While a take plays,
     # its words replace any footage captions (the footage is ducked anyway).
     caption_voiceover: bool = True
+    # Every position is clamped into the platform-safe rectangle:
+    # lower_third sits on its bottom edge (y~1250 of 1920), top on its top
+    # edge, centered in its middle.
     position: Literal["lower_third", "centered", "top"] = "lower_third"
-    safe_margin_pct: float = 0.15
+    safe_margin_pct: float = 0.15  # legacy; placement now comes from safezone
 
 
 class TransitionStyle(BaseModel):
@@ -387,8 +418,15 @@ class TransitionStyle(BaseModel):
 class EffectsConfig(BaseModel):
     ken_burns_on_low_energy: bool = True
     ken_burns_zoom: float = 1.10
+    # Dialogue cleanup on the footage bus (graph_builder.voice_chain).
+    voice_enhance: bool = True
+    # afftdn denoise: "auto" = on for talky reels only (compose resolves it),
+    # because on action footage the noise is the content.
+    voice_denoise: Literal["auto", "on", "off"] = "auto"
     unsharp: bool = True
-    unsharp_amount: float = 0.5
+    # Mild: it only runs when footage was scaled UP (see compose() — sharpening
+    # downscaled 4K just added halos). Was 5x5 at 0.5.
+    unsharp_amount: float = 0.3
     # "auto" lets compose.auto.pick_lut_id choose from bundled LUTs by mood.
     # Any other string is treated as a literal LUT id.
     lut: str | None = "auto"
@@ -397,6 +435,15 @@ class EffectsConfig(BaseModel):
     #   crop      — always crop-track when the source is wider than the target
     #   letterbox — legacy scale+pad behavior
     reframe: Literal["auto", "crop", "letterbox"] = "auto"
+    # Per-frame subject tracking for the reframe crop + aiming framing keys
+    # (compose/facetrack.py). Off = the old two-point linear pan.
+    face_track: bool = True
+    # Sound effects (compose/sfx.py): a pop on the odd key word, a whoosh
+    # into B-roll or a flashy transition. "auto" = on in the smart flow
+    # (smart_mode), off in manual configs; always at most one per
+    # sfx.SHORT_GAP_SEC. Gain is relative to the file's own level.
+    sfx: Literal["auto", "on", "off"] = "auto"
+    sfx_gain_db: float = Field(default=-14.0, ge=-40.0, le=0.0)
 
 
 Aspect = Literal["9:16", "16:9", "1:1"]
@@ -463,6 +510,18 @@ class TimelineShot(BaseModel):
     # punch_in_animated drifts the crop window like Ken Burns instead.
     punch_in: float | None = Field(default=None, ge=1.0, le=1.6)
     punch_in_animated: bool = False
+    # Framing changes within the shot: [t, zoom, cx, cy] per key, t in
+    # output seconds from the shot's start (see styles.PlannedShot). The mix
+    # planner sets these; the editor round-trips them (web Zod schema too).
+    framing_keys: list[list[float]] = Field(default_factory=list, max_length=64)
+
+    @field_validator("framing_keys")
+    @classmethod
+    def _check_framing_keys(cls, keys: list[list[float]]) -> list[list[float]]:
+        for k in keys:
+            if len(k) != 4 or not (0 <= k[0] and 1.0 <= k[1] <= 1.6 and 0 <= k[2] <= 1 and 0 <= k[3] <= 1):
+                raise ValueError("a framing key is [t >= 0, zoom 1.0-1.6, cx 0-1, cy 0-1]")
+        return keys
 
     @property
     def effective_gain(self) -> float:
@@ -523,6 +582,16 @@ class VoiceoverTake(BaseModel):
         return max(0.0, min(3.0, self.volume))
 
 
+class BrollSource(BaseModel):
+    """A project clip or photo automatic B-roll may cut to (CP9). The API
+    fills these at compose enqueue — the pipeline never touches the DB."""
+
+    asset_id: str
+    kind: Literal["video", "photo"]
+    filename: str = ""
+    path: str
+
+
 class PictureLayer(BaseModel):
     """B-roll: a project clip or photo drawn OVER the main track for
     [start_sec, end_sec] of the mezzanine — full frame or a picture-in-picture
@@ -552,11 +621,35 @@ class PictureLayer(BaseModel):
         return max(0.0, self.end_sec - self.start_sec)
 
 
+class Chapter(BaseModel):
+    """A long-form chapter (CP11): starts at the first frame of shot
+    `shot_index`, so it survives any re-timing — compose turns it into
+    seconds with its own crossfade math."""
+
+    title: str = Field(max_length=60)
+    shot_index: int = Field(ge=0)
+
+
 class ReelTimeline(BaseModel):
     shots: list[TimelineShot] = Field(default_factory=list)
     overlays: list[TextOverlay] = Field(default_factory=list)
     voiceovers: list[VoiceoverTake] = Field(default_factory=list)
     layers: list[PictureLayer] = Field(default_factory=list)
+    # Long-form chapters (CP11); an editor deleting shots can leave indices
+    # past the end — those chapters are dropped, not an error.
+    chapters: list[Chapter] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def _chapters_in_range(self) -> "ReelTimeline":
+        if self.chapters:
+            n = len(self.shots)
+            kept, seen = [], set()
+            for c in sorted(self.chapters, key=lambda c: c.shot_index):
+                if c.shot_index < n and c.shot_index not in seen:
+                    kept.append(c)
+                    seen.add(c.shot_index)
+            self.chapters = kept
+        return self
 
     @property
     def total_duration(self) -> float:
@@ -606,6 +699,23 @@ class ComposeConfig(BaseModel):
     # style; failures keep the deterministic plan.
     director: bool = True
     director_model: str = "claude-sonnet-4-5"
+    # AI emphasis (compose/emphasis.py): one small stamped call per reel that
+    # picks the caption key words, the one key moment per line (tight
+    # framing, maybe a pop) and fixes misheard words. Failures fall back to
+    # the keywords.py heuristic. `emphasis_corrections` saves fixes as the
+    # asset's transcript override (visible + revertible in the editor).
+    # Automatic B-roll (CP9, compose pipeline): cutaways from the project's
+    # other clips/photos over talky scene-mode reels. auto = smart flow, not
+    # hype, speech ratio >= 0.4, and only when `broll_sources` (filled by the
+    # API at enqueue) has something to cut to.
+    auto_broll: Literal["auto", "on", "off"] = "auto"
+    broll_sources: list[BrollSource] = Field(default_factory=list, max_length=200)
+    # Cold open (compose/styles.cold_open_for): play the reel's validated
+    # payoff/peak first. auto = hype always, talking_head on a strong payoff.
+    cold_open: Literal["auto", "on", "off"] = "auto"
+    emphasis: bool = True
+    emphasis_model: str = "claude-haiku-4-5-20251001"
+    emphasis_corrections: bool = True
     # Editing-style grammar (compose/styles.py). "auto" classifies from the
     # reel (ranker's pick, else heuristics) — but ONLY in the smart-auto flow
     # (smart_mode on + transition.kind "auto"); manual flows stay "classic"
@@ -687,6 +797,27 @@ class ComposeManifest(BaseModel):
     reelforge_version: str
     created_at: str
     elapsed_sec: float
+    # The edit grammar that actually planned the shots (config.style may be
+    # "auto"). None on manifests written before it was recorded.
+    style: str | None = None
+    # B-roll windows [start_sec, end_sec] on the mezzanine timeline.
+    layers: list[list[float]] = Field(default_factory=list)
+    # Sound effects actually mixed: [kind, mezzanine start] (compose/sfx.py).
+    sfx: list[list] = Field(default_factory=list)
+    # What the AI emphasis pass did: source (ai | cache), counts, and the
+    # transcript fixes [old, new] it saved. None = heuristic captions.
+    emphasis: dict | None = None
+    # The cold open played first ([start, end] source seconds), if any.
+    cold_open: list[float] | None = None
+    # Automatic B-roll layers (CP9), paths blanked — the editor's default
+    # timeline shows them so they can be removed.
+    auto_broll: list[dict] = Field(default_factory=list)
+    # Where in the chosen track the reel sits (CP10): offset, reason,
+    # source segments (crossfaded loops), measured BPM.
+    music_section: dict | None = None
+    # Long-form chapters as rendered: [{"title", "start_sec"}] (CP11); also
+    # written as YouTube-ready chapters.txt next to the mezzanine.
+    chapters: list[dict] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

@@ -177,7 +177,7 @@ async def test_compose_plan_serves_smart_picks(api_client) -> None:
     assert r.status_code == 200
     body = r.json()
     assert body["mood"] == "energetic"
-    assert body["transition"] == "slideleft"
+    assert body["transition"] == "cut"  # energetic content cuts (CP1)
     assert body["lut"] == "vivid"
     assert body["music"] == "auto-match"
     # Edit Quality v1: the grammar preview.

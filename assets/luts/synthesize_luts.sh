@@ -5,6 +5,9 @@
 set -euo pipefail
 OUT_DIR="${1:-/app/assets/luts}"
 mkdir -p "$OUT_DIR"
+# The Python half reads OUT; without this it ignored the argument and always
+# wrote to /app/assets/luts.
+export OUT="$OUT_DIR"
 
 python3 - <<'PY'
 import os
@@ -36,24 +39,45 @@ def write_lut(name: str, title: str, transform):
     print(f"wrote {p} ({p.stat().st_size // 1024} KB)")
 
 
-# Warm: lift reds + small green/blue retreat in shadows; gentle midtone warmth.
+# Tints are weighted to the MIDTONES (w peaks at 0.5, is 0 at black and
+# white): multiplying the whole range pushed highlights past 1.0, where the
+# clamp flattened skies and skin into clipped patches.
+def _mid(x):
+    return 4.0 * x * (1.0 - x)
+
+
+def _tint(r, g, b, gr, gg, gb):
+    return (
+        r * (1 + (gr - 1) * _mid(r)),
+        g * (1 + (gg - 1) * _mid(g)),
+        b * (1 + (gb - 1) * _mid(b)),
+    )
+
+
+def _smoothstep(e0, e1, x):
+    t = max(0.0, min(1.0, (x - e0) / (e1 - e0)))
+    return t * t * (3 - 2 * t)
+
+
+# Warm: lift reds, ease blues back, mostly in the midtones.
 def warm(r, g, b):
-    return (r * 1.08, g * 1.02, b * 0.95)
+    return _tint(r, g, b, 1.08, 1.02, 0.95)
 
 
-# Cool: blue lift + slight desaturation in highlights.
+# Cool: blue lift, reds eased back.
 def cool(r, g, b):
-    return (r * 0.92, g * 1.00, b * 1.10)
+    return _tint(r, g, b, 0.92, 1.00, 1.10)
 
 
-# Cinematic: teal-shadow + orange-highlight (subtle).
+# Cinematic: teal shadows blending into orange highlights. The blend runs
+# across luma 0.25-0.6 — the old version switched hard at 0.4, which drew a
+# visible band across any gradient (skies, walls) that crossed it.
 def cinematic(r, g, b):
     luma = 0.299 * r + 0.587 * g + 0.114 * b
-    if luma < 0.4:
-        # Push shadows toward teal
-        return (r * 0.95, g * 1.03, b * 1.06)
-    # Lift highlights toward orange
-    return (r * 1.08, g * 1.02, b * 0.95)
+    k = _smoothstep(0.25, 0.6, luma)
+    teal = _tint(r, g, b, 0.95, 1.03, 1.06)
+    orange = _tint(r, g, b, 1.08, 1.02, 0.95)
+    return tuple(t + (o - t) * k for t, o in zip(teal, orange))
 
 
 # Vivid: saturation bump via simple distance-from-grey scale.

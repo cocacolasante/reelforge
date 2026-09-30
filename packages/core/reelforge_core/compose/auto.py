@@ -20,18 +20,18 @@ from reelforge_core.models import (
     TransitionStyle,
 )
 
-# Transition picks are intentionally conservative — fade and dissolve work for
-# almost everything; the punchier kinds (slideleft, wipeleft) only fire for
-# energetic / triumphant content where snappier cuts feel right.
+# Short-form editors cut. Energetic and triumphant content used to slide
+# (slideleft); measured on real reels, 67% of one skate reel's joins were
+# slides, which reads as a template. Calmer moods keep soft fades.
 TRANSITION_BY_MOOD: dict[str, str] = {
     "calm": "fade",
     "tense": "fade",
     "joyful": "dissolve",
     "somber": "fadeblack",
-    "energetic": "slideleft",
+    "energetic": "cut",
     "mysterious": "fadeblack",
     "romantic": "dissolve",
-    "triumphant": "slideleft",
+    "triumphant": "cut",
     "melancholic": "fadeblack",
     "neutral": "fade",
 }

@@ -19,6 +19,8 @@ from reelforge_core.compose.captions import build_captions, has_dialogue
 from reelforge_core.compose.clips import ClipInfo, extract_clips
 from reelforge_core.compose.graph import ffmpeg_version, run_ffmpeg
 from reelforge_core.compose.graph_builder import build_final_command, resolve_transitions
+from reelforge_core.compose.music_analysis import BED_MIN_SEC
+from reelforge_core.compose.sfx import cold_open_exit, plan_sfx, sfx_enabled, sfx_path
 from reelforge_core.compose.music import (
     load_music_library,
     prepare_music,
@@ -26,7 +28,7 @@ from reelforge_core.compose.music import (
 )
 from reelforge_core.errors import ComposeError, FFmpegError
 from reelforge_core.ingest import MediaAsset
-from reelforge_core.io_utils import write_json_atomic
+from reelforge_core.io_utils import write_json_atomic, write_text_atomic
 from reelforge_core.models import (
     REELFORGE_VERSION,
     AnalysisReport,
@@ -110,14 +112,33 @@ async def _run_ffmpeg_with_progress(
     )
     stderr_buf: list[str] = []
 
-    async def _reader() -> None:
+    async def _lines():
+        """stderr split on \\r AND \\n. `-stats` redraws its progress with
+        carriage returns only, so readline() saw one ever-growing "line"
+        and a long render (6+ min) blew asyncio's 64 KB stream limit —
+        "Separator is not found, and chunk exceed the limit" (2026-09-30)."""
         assert proc.stderr is not None
-        last_emit = 0.0
+        pending = b""
         while True:
-            line = await proc.stderr.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", "replace")
+            chunk = await proc.stderr.read(65536)
+            if not chunk:
+                if pending:
+                    yield pending
+                return
+            pending += chunk
+            parts = re.split(rb"[\r\n]", pending)
+            pending = parts.pop()
+            for part in parts:
+                if part:
+                    yield part
+            if len(pending) > 1 << 20:  # a pathological unbroken stream
+                yield pending
+                pending = b""
+
+    async def _reader() -> None:
+        last_emit = 0.0
+        async for line in _lines():
+            text = line.decode("utf-8", "replace") + "\n"
             stderr_buf.append(text)
             m = FFMPEG_TIME_RE.search(text)
             if m:
@@ -225,6 +246,9 @@ async def _render_chunks(
             config=bare,
             output_path=part_path,
             transitions=transitions[a : b - 1],
+            # Voice cleanup and edge fades belong to the finished mix only:
+            # per chunk they would stack twice and dip every join.
+            final_pass=False,
         )
         await progress(
             _emit(
@@ -282,6 +306,89 @@ async def _render_hierarchy(
     return clips, transitions
 
 
+DENOISE_SPEECH_RATIO = 0.4
+
+
+def _chapter_times(timeline, clips: list, xfades: list[float]) -> list[tuple[str, float]]:
+    """Chapter (title, mezzanine start) from shot indices, with the render's
+    own crossfade math, validated for YouTube (mixes/planner.py)."""
+    if timeline is None or not getattr(timeline, "chapters", None) or not clips:
+        return []
+    from reelforge_core.mixes.planner import youtube_chapters
+
+    starts: list[float] = []
+    t = 0.0
+    for i, c in enumerate(clips):
+        starts.append(t)
+        t += c.duration - (xfades[i] if i < len(xfades) else 0.0)
+    total = t
+    return youtube_chapters(
+        [(ch.title, starts[ch.shot_index]) for ch in timeline.chapters if ch.shot_index < len(starts)],
+        total,
+    )
+
+
+async def _bed_tracks(library: list, primary, primary_ta) -> list:
+    """The chosen track first, then other analysable tracks of its mood
+    (user library preferred), up to BED_MAX_TRACKS. Deterministic."""
+    from reelforge_core.compose.music_analysis import BED_MAX_TRACKS, analyze_track
+
+    same = sorted(
+        (t for t in library if t.mood == primary.mood and t.id != primary.id),
+        key=lambda t: (t.source != "user", t.id),
+    )
+    if primary.source == "user":
+        # The bundled set is synthesized placeholder filler: never splice it
+        # into a bed of real songs (a live long-form bed did, 2026-09-30).
+        same = [t for t in same if t.source == "user"]
+    out = [(primary, primary_ta)]
+    for t in same:
+        if len(out) >= BED_MAX_TRACKS:
+            break
+        ta = await asyncio.to_thread(analyze_track, Path(t.path))
+        if ta is not None:
+            out.append((t, ta))
+    return out
+
+
+def _speech_ratio(clips: list, analyses: dict) -> float:
+    """Spoken seconds / total seconds across the rendered video shots."""
+    total = spoken = 0.0
+    for c in clips:
+        if getattr(c, "is_photo", False):
+            continue
+        total += max(0.0, c.out_ts - c.in_ts)
+        rep = analyses.get(c.asset_id) if c.asset_id else None
+        if rep is None and len(analyses) == 1:
+            rep = next(iter(analyses.values()))
+        if rep is None or rep.transcript is None:
+            continue
+        for seg in rep.transcript.segments:
+            if seg.end < c.in_ts or seg.start > c.out_ts:
+                continue
+            for w in seg.words:
+                lo, hi = max(w.start, c.in_ts), min(w.end, c.out_ts)
+                spoken += max(0.0, hi - lo)
+    return spoken / total if total > 0 else 0.0
+
+
+def _all_sources_downscaled(clips: list, sources: dict, asset, config: ComposeConfig) -> bool:
+    """True when every video shot's source is at least as tall as the output
+    (portrait crops from landscape keep the source's full height)."""
+    out_h = config.resolution[1]
+    heights: list[int] = []
+    for c in clips:
+        if getattr(c, "is_photo", False):
+            continue
+        src = sources.get(c.asset_id) if c.asset_id else None
+        media = src if src is not None else asset
+        h = getattr(getattr(media, "probe", None), "height", None)
+        if not h:
+            return False  # unknown -> keep the mild pass
+        heights.append(int(h))
+    return bool(heights) and min(heights) >= out_h
+
+
 async def compose(
     asset: MediaAsset,
     reel: RankedReel,
@@ -306,6 +413,12 @@ async def compose(
 
     style = resolve_style(config, reel, analysis)
     config = resolve_smart_config(config, reel, analysis)
+    if style == "talking_head" and config.effects.ken_burns_on_low_energy:
+        # A slow drift on a person talking to camera reads as a wobble; the
+        # talking-head grammar gets its motion from cuts and punch-ins.
+        config = config.model_copy(
+            update={"effects": config.effects.model_copy(update={"ken_burns_on_low_energy": False})}
+        )
 
     # ----- prepare -----
     await progress(_emit("prepare", 0.0))
@@ -320,7 +433,18 @@ async def compose(
     reel_for_music = (
         reel.model_copy(update={"suggested_mood": bias}) if bias else reel
     )
-    track = select_track(library, config, reel_for_music)
+    in_timeline = bool(config.timeline and config.timeline.shots)
+    track = select_track(library, config, reel_for_music, style=None if in_timeline else style)
+    # Whole-track analysis (CP10): tempo, bars, 8-bar phrases, the drop —
+    # cached per track file. Drives where in the song the reel sits.
+    music_ta = None
+    music_offset = 0.0
+    music_why = "top of the track"
+    music_drop_at: float | None = None
+    if track is not None:
+        from reelforge_core.compose.music_analysis import analyze_track
+
+        music_ta = await asyncio.to_thread(analyze_track, Path(track.path))
 
     # ----- shot plan -----
     # Timeline mode (post-generation editing): the config carries the complete
@@ -335,6 +459,7 @@ async def compose(
     plan_shots = None  # styles.PlannedShot list (scene mode only)
     beat_grid = None
     director_overlay = None  # hook TextOverlay from the edit director
+    cold_open_plan = None  # the EditPlan carrying a cold open, if any
     if timeline is not None:
         from reelforge_core.ingest import probe as _probe
 
@@ -390,22 +515,63 @@ async def compose(
         # Style grammar: rewrite the plan (beat cuts, ramps, punch-ins, jump
         # cuts, transitions). The beat grid must exist BEFORE planning so
         # hype can place cuts on beats; the beat-sync block below reuses it.
-        if (
-            style == "hype"
-            and track is not None
-            and beat_grid is None
-        ):
-            from reelforge_core.compose.beats import detect_beats
-
-            beat_grid = await asyncio.to_thread(detect_beats, Path(track.path))
         from reelforge_core.compose.silence import load_speech_envelope
 
         # Measured silence for jump cuts and speech-safe beat trims; None (no
         # analysis audio) falls back to transcript word gaps.
         scene_envelope = await asyncio.to_thread(load_speech_envelope, working / "audio.wav")
+        # Cold open (CP6): the ranker's validated payoff/peak plays first,
+        # then the reel from the top, joined by a hard cut (+ a whoosh).
+        from reelforge_core.compose.styles import cold_open_for, lock_cold_open, with_cold_open
+
+        # Photo inserts index into the shot list; a prepended shot would
+        # move them, so a reel with inserts keeps its own opening.
+        cold = None if config.photo_inserts else cold_open_for(config, style, reel)
+        if (
+            cold is None
+            and style == "hype"
+            and config.cold_open != "off"
+            and not config.photo_inserts
+        ):
+            # Action needs no words to know its moment: lead with the
+            # strongest event peak when the ranker didn't propose a cold open.
+            from reelforge_core.compose.action import event_cold_open
+            from reelforge_core.reels.events import detect_events
+
+            cold = event_cold_open(reel.start_sec, reel.end_sec, detect_events(analysis))
+        if cold is not None:
+            base_bounds = with_cold_open(base_bounds, cold, analysis)
+        # Where in the song the reel sits (CP10) — decided BEFORE planning,
+        # because hype places its cuts on this grid. Action puts the drop on
+        # the payoff (estimated here, corrected by whole beats after
+        # extraction); everything else ends the reel on a phrase.
+        if music_ta is not None:
+            from reelforge_core.compose.music_analysis import choose_section, grid_for_offset
+
+            cold_len = (cold[1] - cold[0]) if cold is not None else 0.0
+            reel_sec = cold_len + sum(e - s for _, s, e in base_bounds[(1 if cold else 0):])
+            if style == "hype":
+                from reelforge_core.compose.action import money_event
+                from reelforge_core.reels.events import detect_events
+
+                money = money_event(detect_events(analysis), [(reel.start_sec, reel.end_sec)])
+                if money is not None:
+                    # + the ramp's slowdown (0.6s at 0.7x and 0.6s at 0.5x).
+                    music_drop_at = cold_len + (money.peak_sec - reel.start_sec) + 0.86
+            music_offset, music_why = choose_section(music_ta, reel_sec, music_drop_at)
+            if not music_why.startswith("drop"):
+                music_drop_at = None
+            beat_grid = grid_for_offset(music_ta, music_offset)
+        elif style == "hype" and track is not None and beat_grid is None:
+            from reelforge_core.compose.beats import detect_beats
+
+            beat_grid = await asyncio.to_thread(detect_beats, Path(track.path))
         edit_plan = plan_edit(
-            style, base_bounds, reel, analysis, config, beat_grid, scene_envelope
+            style, base_bounds, reel, analysis, config, beat_grid, scene_envelope, cold
         )
+        if cold is not None:
+            edit_plan = lock_cold_open(edit_plan, cold)
+            cold_open_plan = edit_plan
         if style != "classic":
             log.info(
                 "edit style %r: %d shot(s) -> %d%s",
@@ -421,6 +587,8 @@ async def compose(
             edit_plan, director_overlay, _director_usage = await run_director(
                 edit_plan, reel, analysis, config, beat_grid, reel_dir
             )
+        if edit_plan.cold_open_shots:
+            cold_open_plan = edit_plan
         plan_shots = edit_plan.shots
         per_cut = edit_plan.per_cut if any(c is not None for c in edit_plan.per_cut) else None
         # Caption suggestions never un-mute captions the user turned off.
@@ -453,6 +621,13 @@ async def compose(
     # per-clip end trims that put each crossfade midpoint on a beat. Must
     # happen before clip extraction — the trims change clip bounds.
     end_trims: list[float] | None = None
+    if timeline is not None and music_ta is not None:
+        # Timelines (edits, AI mixes) end on a phrase; no payoff to aim at.
+        from reelforge_core.compose.music_analysis import choose_section, grid_for_offset
+
+        total = max(0.1, sum(planned_durations) - sum(xfade_durs))
+        music_offset, music_why = choose_section(music_ta, total, None)
+        beat_grid = grid_for_offset(music_ta, music_offset)
     if (
         track is not None
         and config.beat_sync
@@ -622,6 +797,48 @@ async def compose(
 
     # ----- captions -----
     await progress(_emit("captions", 0.0))
+    # AI emphasis: caption key words, the key moment per line (tight framing
+    # on talking-head shots, the odd pop) and misheard-word fixes, saved as
+    # the transcript override BEFORE captions read it. Best-effort: None
+    # means the keywords.py heuristic. Framing is graph-side, so tightening
+    # after extraction touches no clip cache.
+    emphasis = None
+    sfx_on = sfx_enabled(config.effects.sfx, config.smart_mode)
+    if config.emphasis and (
+        config.captions.mode != "off" or sfx_on or any(c.framing_keys for c in clips)
+    ):
+        from reelforge_core.compose.captions import effective_analyses
+        from reelforge_core.compose.emphasis import (
+            reel_words,
+            run_emphasis,
+            save_corrections,
+            tighten_framing,
+        )
+
+        spoken = reel_words(clips, analysis, analyses, xfade_durs)
+        if spoken:
+            await progress(_emit("captions", 0.05, "finding the key words"))
+            emphasis, _emphasis_usage = await run_emphasis(
+                spoken,
+                reel=reel,
+                model=config.emphasis_model,
+                reel_dir=reel_dir,
+                working_root=data_dir / "working",
+                duration=max(0.1, sum(c.duration for c in clips) - sum(xfade_durs)),
+            )
+            if emphasis.source == "none":
+                emphasis = None
+            else:
+                if config.emphasis_corrections and emphasis.corrections:
+                    try:
+                        await asyncio.to_thread(
+                            save_corrections,
+                            emphasis.corrections,
+                            effective_analyses(analysis, analyses),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("transcript fixes not saved: %s", exc)
+                clips = tighten_framing(clips, emphasis)
     # Voiceover takes get their own captions: transcribe each unmuted take
     # (cached per take under working/{take_asset_id}) before building the
     # subtitle track.
@@ -670,6 +887,7 @@ async def compose(
             ),
             xfades=xfade_durs,
             voiceover_captions=voiceover_captions,
+            emphasis=emphasis,
         )
     except Exception as exc:
         raise ComposeError(f"caption build failed: {exc}") from exc
@@ -680,13 +898,86 @@ async def compose(
     )
     await progress(_emit("captions", 1.0))
 
+    # ----- automatic B-roll (CP9) -----
+    # Scene mode only (a saved timeline carries its own layers). Timed to
+    # the FINAL clips; rendered by the same final-pass compositor as editor
+    # layers. Best-effort: [] on any failure.
+    auto_layers: list = []
+    if timeline is None:
+        from reelforge_core.compose.autobroll import plan_auto_broll, wants_auto_broll
+
+        if wants_auto_broll(config, style, _speech_ratio(clips, analyses)):
+            await progress(_emit("captions", 1.0, "choosing B-roll"))
+            auto_layers = await plan_auto_broll(
+                clips, transitions, analysis, config,
+                reel_dir=reel_dir, working_root=data_dir / "working",
+            )
+        if auto_layers:
+            from reelforge_core.compose.layers import extract_layer_clips
+            from reelforge_core.ingest import probe as _probe
+
+            for layer in auto_layers:
+                if layer.kind == "video" and layer.asset_id not in sources:
+                    sources[layer.asset_id] = await asyncio.to_thread(_probe, Path(layer.path))
+            program_sec = max(0.1, sum(c.duration for c in clips) - sum(xfade_durs))
+            try:
+                layer_inputs = await extract_layer_clips(
+                    auto_layers, sources, config, reel_dir, log_file, program_sec
+                )
+            except Exception as exc:  # noqa: BLE001 — B-roll never fails a render
+                log.warning("auto B-roll render skipped: %s", exc)
+                auto_layers, layer_inputs = [], []
+
     # ----- music -----
     await progress(_emit("music", 0.0))
     music_path: Path | None = None
     target_duration = max(0.1, sum(c.duration for c in clips) - sum(xfade_durs))
+    music_segments = None
+    bed_track_ids: list[str] = []
+    if track is not None and music_ta is not None:
+        from reelforge_core.compose.music_analysis import (
+            END_FADE_SEC,
+            loop_plan,
+            realign_end,
+            refine_offset,
+        )
+
+        if music_drop_at is not None:
+            # Where the impact ACTUALLY landed: the first full-speed shot
+            # right after a 0.5x ramp step. Whole beats only (the cuts were
+            # snapped to this grid).
+            t = 0.0
+            for i, c in enumerate(clips):
+                if i > 0 and clips[i - 1].speed == 0.5 and c.speed == 1.0:
+                    music_offset = refine_offset(music_ta, music_offset, music_drop_at, t)
+                    break
+                t += c.duration - (xfade_durs[i] if i < len(xfade_durs) else 0.0)
+        elif music_why.startswith("ends on the phrase"):
+            music_offset = realign_end(music_ta, music_offset, target_duration)
+        music_segments = loop_plan(music_ta, music_offset, target_duration)
+        bed_chapters = _chapter_times(timeline, clips, xfade_durs) if timeline is not None else []
+        if len(bed_chapters) >= 3 and target_duration >= BED_MIN_SEC and style != "hype":
+            # Long-form (CP11): change track at chapter boundaries instead of
+            # looping one song for twenty minutes.
+            from reelforge_core.compose.music_analysis import chapter_bed
+
+            bed_tracks = await _bed_tracks(library, track, music_ta)
+            if len(bed_tracks) > 1:
+                music_segments = chapter_bed(
+                    [(t.path, ta) for t, ta in bed_tracks], [s for _, s in bed_chapters],
+                    target_duration,
+                )
+                used = {seg[2] for seg in music_segments if len(seg) > 2}
+                bed_track_ids = [t.id for t, _ in bed_tracks if t.path in used]
+                music_why = f"chapter bed over {len(bed_tracks)} tracks"
+        log.info("music: %s from %.2fs (%d segment(s))", music_why, music_offset, len(music_segments))
     if track is not None:
         try:
-            music_path = prepare_music(track, target_duration, config, reel_dir, log_file)
+            music_path = prepare_music(
+                track, target_duration, config, reel_dir, log_file,
+                segments=music_segments,
+                fade_out_sec=END_FADE_SEC if music_segments else 1.0,
+            )
         except FFmpegError as exc:
             raise ComposeError(f"music prep failed: {exc}") from exc
     await progress(_emit("music", 1.0))
@@ -710,6 +1001,40 @@ async def compose(
     # threshold, render hierarchically: chunks of clips (internal transitions
     # + per-clip effects) to intermediates, then one small final pass with
     # captions/music/LUT — the mezzanine timeline is identical either way.
+    # Denoise dialogue only when the reel is mostly talk: on action footage
+    # the "noise" is the content (waves, wheels, wind in a GoPro mic).
+    if config.effects.voice_denoise == "auto":
+        talky = _speech_ratio(clips, analyses) >= DENOISE_SPEECH_RATIO
+        config = config.model_copy(
+            update={"effects": config.effects.model_copy(update={"voice_denoise": "on" if talky else "off"})}
+        )
+
+    # Sharpen only footage that was scaled UP to fit the output. Downscaled
+    # 4K is already sharp, and unsharp on it just draws halos. One upscaled
+    # clip is enough to keep the (mild) pass on.
+    if config.effects.unsharp and _all_sources_downscaled(clips, sources, asset, config):
+        config = config.model_copy(
+            update={"effects": config.effects.model_copy(update={"unsharp": False})}
+        )
+
+    # Sound effects: whooshes into B-roll / the one flashy transition, pops
+    # on key moments — at most one per sfx.SHORT_GAP_SEC. Final pass only.
+    sfx_cues: list[tuple[str, float]] = []
+    sfx_inputs: list[tuple[Path, float]] = []
+    if sfx_on:
+        for start, kind in plan_sfx(
+            total=target_duration,
+            pops=emphasis.pops if emphasis is not None else [],
+            durations=[c.duration for c in clips],
+            transitions=transitions,
+            layer_starts=[li.start for li in (layer_inputs or [])],
+            whooshes=cold_open_exit(clips, transitions, cold_open_plan),
+        ):
+            path = sfx_path(kind, data_dir)
+            if path is not None:
+                sfx_cues.append((kind, start))
+                sfx_inputs.append((path, start))
+
     render_clips, render_transitions = await _render_hierarchy(
         clips, transitions, analysis, config, reel_dir, log_file, progress
     )
@@ -724,6 +1049,7 @@ async def compose(
         transitions=render_transitions,
         voiceovers=voiceovers,
         layers=layer_inputs or None,
+        sfx=sfx_inputs or None,
     )
 
     try:
@@ -740,7 +1066,7 @@ async def compose(
     # ----- finalize -----
     await progress(_emit("finalize", 0.0))
     scene_clip_map: list[dict] = []
-    for c in clips:
+    for i, c in enumerate(clips):
         scene_clip_map.append(
             {
                 "scene_index": c.scene_index,
@@ -748,6 +1074,22 @@ async def compose(
                 "in_ts": c.in_ts,
                 "out_ts": c.out_ts,
                 "effects_applied": c.effects_applied,
+                # What the QA scorecard needs to tell a visible cut from an
+                # invisible join: which footage, how long, how framed, and
+                # the crossfade into the next shot.
+                "asset_id": c.asset_id or asset.id,
+                "duration": round(c.duration, 3),
+                "speed": c.speed,
+                "punch_in": c.punch_in,
+                "punch_in_animated": c.punch_in_animated,
+                "framing_keys": [list(k) for k in c.framing_keys],
+                "face_coverage": c.face_coverage,
+                "track": c.track_source,
+                "transition_after": (
+                    [transitions[i][0], round(transitions[i][1], 3)]
+                    if i < len(transitions)
+                    else None
+                ),
                 **(
                     {"kind": "photo", "photo_asset_id": c.photo_asset_id}
                     if c.is_photo
@@ -771,6 +1113,14 @@ async def compose(
             plan.mezzanine_duration_sec,
         )
 
+    # Long-form chapters (CP11) at their RENDERED times, YouTube-validated,
+    # also as a paste-ready chapters.txt next to the mezzanine.
+    chapter_list = _chapter_times(timeline, clips, xfade_durs) if timeline is not None else []
+    if chapter_list:
+        from reelforge_core.mixes.planner import format_chapters
+
+        write_text_atomic(reel_dir / "chapters.txt", format_chapters(chapter_list) + "\n")
+
     manifest = ComposeManifest(
         asset_id=asset.id,
         reel_id=reel.candidate_id,
@@ -788,8 +1138,43 @@ async def compose(
         reelforge_version=REELFORGE_VERSION,
         created_at=datetime.now(timezone.utc).isoformat(),
         elapsed_sec=round(time.monotonic() - t_start, 3),
+        style=style,
+        layers=[[round(li.start, 3), round(li.end, 3)] for li in (layer_inputs or [])],
+        sfx=[[kind, round(start, 3)] for kind, start in sfx_cues],
+        cold_open=list(cold_open_plan.cold_open) if cold_open_plan is not None else None,
+        auto_broll=[layer.model_dump(exclude={"path"}) for layer in auto_layers],
+        music_section=(
+            {"offset": music_offset, "why": music_why, "segments": music_segments,
+             "bpm": music_ta.bpm if music_ta else None,
+             **({"tracks": [
+                 t.model_dump() for t in library if t.id in bed_track_ids
+             ]} if bed_track_ids else {})}
+            if music_segments else None
+        ),
+        chapters=[{"title": t, "start_sec": round(s_, 3)} for t, s_ in chapter_list],
+        emphasis=(
+            {
+                "source": emphasis.source,
+                "key_words": len(emphasis.emphasised),
+                "key_moments": len(emphasis.key_moments),
+                "corrections": [[c.old, c.new] for c in emphasis.corrections],
+            }
+            if emphasis is not None
+            else None
+        ),
     )
     write_json_atomic(reel_dir / "compose.json", json.loads(manifest.model_dump_json()))
+
+    # QA scorecard (qa.json). Measures the finished edit against the targets
+    # in qa/thresholds.py; costs a loudness pass (~3-5s per output minute)
+    # and can never fail a render.
+    try:
+        from reelforge_core.qa.scorecard import write_scorecard
+
+        card = await asyncio.to_thread(write_scorecard, reel_dir)
+        log.info("qa %s: %s (%s)", reel.candidate_id, card["score"], card["kind"])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("qa scorecard skipped: %s", exc)
 
     # Cleanup tmp on success (keep clips + logs for debugging / Phase 4 export).
     shutil.rmtree(reel_dir / "tmp", ignore_errors=True)

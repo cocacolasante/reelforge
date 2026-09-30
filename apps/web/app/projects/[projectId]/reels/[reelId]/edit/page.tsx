@@ -279,7 +279,7 @@ function Editor({ projectId, reelId }: { projectId: string; reelId: string }) {
       if (dirty) await doSave();
       const job = await compose.mutateAsync({
         reelId,
-        config: { captions: { mode: 'karaoke' }, ...(eyeContact ? { eye_contact: true } : {}) },
+        config: { captions: { mode: 'punch' }, ...(eyeContact ? { eye_contact: true } : {}) },
       });
       setComposeJobId(job.id);
     } catch {
@@ -1885,7 +1885,7 @@ function VoiceoverPanel({
       <CardContent className="space-y-3">
         {takes.length > 0 && !recording ? (
           <p className="text-xs text-muted-foreground">
-            Takes are transcribed and captioned automatically on render (karaoke or static
+            Takes are transcribed and captioned automatically on render (punch, karaoke or static
             mode); footage captions yield while a take is speaking.
           </p>
         ) : null}

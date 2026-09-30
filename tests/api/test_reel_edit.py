@@ -254,3 +254,48 @@ async def test_compose_resolves_broll_layer_paths(api_client) -> None:
         )).scalars().first()
     layers = json.loads(job.config_json)["timeline"]["layers"]
     assert layers[0]["path"].endswith(".jpg")
+
+
+@pytest.mark.asyncio
+async def test_compose_resolves_auto_broll_sources(api_client) -> None:
+    pid, vid, reel_id, photo = await _seed(api_client)
+    from apps.api import db as dbmod
+    from sqlalchemy import select
+
+    r = await api_client.post(f"/api/v1/reels/{reel_id}/compose", json={"captions": {"mode": "off"}})
+    assert r.status_code == 200, r.text
+    async with dbmod.db_state.sessionmaker() as session:
+        job = (await session.execute(
+            select(dbmod.Job).where(dbmod.Job.kind == "compose").order_by(dbmod.Job.created_at.desc())
+        )).scalars().first()
+    cfg = json.loads(job.config_json)
+    srcs = {s["asset_id"]: s for s in cfg["broll_sources"]}
+    assert srcs[vid]["kind"] == "video" and srcs[photo]["kind"] == "photo"
+    assert srcs[photo]["path"].endswith(".jpg") and srcs[photo]["filename"] == "beach.jpg"
+
+
+@pytest.mark.asyncio
+async def test_default_timeline_is_what_rendered_with_auto_broll(api_client) -> None:
+    import apps.api.settings as settings_mod
+
+    pid, vid, reel_id, photo = await _seed(api_client)
+    rd = settings_mod.settings.data_dir / "working" / vid / "reels" / reel_id
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "compose.json").write_text(json.dumps({
+        "scene_clip_map": [
+            {"in_ts": 30.0, "out_ts": 32.5, "asset_id": vid, "speed": 1.0,
+             "framing_keys": [[0.0, 1.0, 0.5, 0.42]], "transition_after": ["cut", 0.04]},
+            {"in_ts": 1.0, "out_ts": 9.0, "asset_id": vid, "speed": 1.0,
+             "framing_keys": [[0.0, 1.15, 0.5, 0.42], [3.0, 1.3, 0.5, 0.42]],
+             "transition_after": None},
+        ],
+        "auto_broll": [{"id": "auto-1", "kind": "photo", "asset_id": photo,
+                        "start_sec": 4.0, "end_sec": 6.0}],
+    }))
+    body = (await api_client.get(f"/api/v1/reels/{reel_id}/edit")).json()
+    shots = body["timeline"]["shots"]
+    assert [(s["in_ts"], s["out_ts"]) for s in shots] == [(30.0, 32.5), (1.0, 9.0)]
+    assert shots[0]["transition_after"]["kind"] == "cut"
+    assert shots[1]["framing_keys"][1] == [3.0, 1.3, 0.5, 0.42]
+    layer = body["timeline"]["layers"][0]
+    assert layer["asset_id"] == photo and layer["path"] == "" and layer["start_sec"] == 4.0

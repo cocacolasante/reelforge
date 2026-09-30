@@ -472,6 +472,16 @@ async def publish_reel_job(ctx: dict, publication_id: str) -> dict:
         if credit:
             pub["description"] = append_credit(pub.get("description") or "", credit)
             log.info("music credit appended to publication", extra=extra)
+        if platform == "youtube":
+            # Long-form chapters (CP11) — YouTube builds its chapter bar from
+            # timestamp lines in the description. Idempotent like the credit.
+            chapters_txt = data_dir / "working" / asset_id / "reels" / pub["reel_id"] / "chapters.txt"
+            try:
+                chapters = chapters_txt.read_text().strip()
+            except OSError:
+                chapters = ""
+            if chapters:
+                pub["description"] = append_credit(pub.get("description") or "", chapters)
         video_path = (
             data_dir / "outputs" / asset_id / pub["reel_id"] / f"{pub['preset_id']}.mp4"
         )
@@ -800,20 +810,25 @@ async def create_mix_job(
 
         # ----- sequence -----
         await _phase(0.14, f"sequencing {len(pool)} moments")
+        from reelforge_core.mixes.sequencer import LONG_FORM_MODEL
+
+        # Long-form structure (chapters, intro, priorities) is the strongest
+        # model's job; shorts keep the ranking model.
+        mix_model = cfg.get("mix_model") or (LONG_FORM_MODEL if long_form else "claude-sonnet-4-5")
         seq, usage = await sequence_mix(
             pool,
             analyses,
             names,
             target_sec=target_sec,
             prompt=cfg.get("prompt") or None,
-            model=cfg.get("mix_model", "claude-sonnet-4-5"),
+            model=mix_model,
             sheets=sheets,
         )
         if usage.input_tokens:
             try:
                 await record_anthropic_usage(
                     job_id=job_id,
-                    model=cfg.get("mix_model", "claude-sonnet-4-5"),
+                    model=mix_model,
                     input_tokens=usage.input_tokens,
                     output_tokens=usage.output_tokens,
                     project_id=project_id,
@@ -844,7 +859,17 @@ async def create_mix_job(
             if track is not None:
                 import asyncio as _asyncio
 
-                beat_grid = await _asyncio.to_thread(detect_beats, Path(track.path))
+                from reelforge_core.compose.music_analysis import analyze_track, mezzanine_grid
+
+                # Compose starts the music at a whole-beat offset (CP10), so
+                # the grid to cut on is the track's tempo at phase 0 — the
+                # 0:00 grid put hype mix cuts off the beat.
+                ta = await _asyncio.to_thread(analyze_track, Path(track.path))
+                beat_grid = (
+                    mezzanine_grid(ta)
+                    if ta is not None
+                    else await _asyncio.to_thread(detect_beats, Path(track.path))
+                )
 
         # ----- plan + persist -----
         await _phase(0.18, "planning the edit")
@@ -859,7 +884,13 @@ async def create_mix_job(
                 aid: await _asyncio.to_thread(load_speech_envelope, working_dir_for(aid) / "audio.wav")
                 for aid in analyses
             }
-        timeline = plan_mix(seq.shots, analyses, style, beat_grid, envelopes)
+        if long_form:
+            from reelforge_core.mixes.planner import plan_long_form
+
+            # Intro montage, chapters, title cards and the midpoint re-hook.
+            timeline = plan_long_form(seq, analyses, style, beat_grid, envelopes)
+        else:
+            timeline = plan_mix(seq.shots, analyses, style, beat_grid, envelopes)
         update_mix_reel(
             mix_id,
             edit_json=timeline.model_dump_json(),  # paths are empty (API-style)

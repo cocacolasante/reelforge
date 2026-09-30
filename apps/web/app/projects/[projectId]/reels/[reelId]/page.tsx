@@ -45,6 +45,13 @@ const PRESETS = [
   { id: 'mov_prores_hq', label: 'MOV · ProRes HQ', description: 'Editorial (HQ)', ratio: 12.0 },
 ] as const;
 
+const CAPTION_MODE_HINTS: Record<'off' | 'static' | 'karaoke' | 'punch', string> = {
+  punch: 'Bold 1-3 word captions; only key words highlighted',
+  karaoke: 'Every word lights up as it is spoken',
+  static: 'Plain two-line captions',
+  off: 'No captions',
+};
+
 export default function ReelDetailPage({
   params,
 }: {
@@ -74,7 +81,10 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
   const [style, setStyle] = React.useState('auto');
   const [director, setDirector] = React.useState(true);
   const [aspect, setAspect] = React.useState<'9:16' | '16:9' | '1:1'>('9:16');
-  const [captionMode, setCaptionMode] = React.useState<'off' | 'static' | 'karaoke'>('karaoke');
+  // punch: bold 1-3 word captions, key words highlighted — the default look.
+  const [captionMode, setCaptionMode] = React.useState<'off' | 'static' | 'karaoke' | 'punch'>(
+    'punch',
+  );
   const [transition, setTransition] = React.useState('fade');
   const [transitionDur, setTransitionDur] = React.useState<number[]>([0.4]);
   const [musicTrack, setMusicTrack] = React.useState<string>('__auto__');
@@ -428,9 +438,10 @@ function Body({ projectId, reelId }: { projectId: string; reelId: string }) {
             <section className="space-y-2">
               <Label>Captions</Label>
               <div className="flex gap-2">
-                {(['off', 'static', 'karaoke'] as const).map((m) => (
+                {(['punch', 'karaoke', 'static', 'off'] as const).map((m) => (
                   <button
                     key={m}
+                    title={CAPTION_MODE_HINTS[m]}
                     onClick={() => setCaptionMode(m)}
                     className={
                       'rounded-md border px-3 py-1 text-sm transition ' +

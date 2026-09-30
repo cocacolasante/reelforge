@@ -216,10 +216,10 @@ def test_final_bus_loudnorm_disabled() -> None:
         output_path=Path("/tmp/mezz.mp4"),
     )
     fc = plan.filter_complex
-    # Only the voice-stem loudnorm remains; the bus passes through anull.
+    # Only the voice-stem loudnorm remains; the bus gets just the edge fades.
     assert fc.count("loudnorm=") == 1
     assert "[anorm]" not in fc
-    assert "anull" in fc
+    assert "[voice]afade=t=in:d=0.03" in fc
     assert "[afinal]" in fc
 
 
@@ -235,4 +235,7 @@ def test_final_bus_has_brickwall_limiter() -> None:
     )
     fc = plan.filter_complex
     # -1.5 dBTP -> 10^(-1.5/20) = 0.8414 linear
-    assert "alimiter=limit=0.8414:level=false:latency=true" in fc
+    # -1.5 dBTP target minus 1 dB of true-peak headroom -> -2.5 dBFS samples.
+    assert "alimiter=limit=0.7499:level=false:latency=true" in fc
+    # Limited at loudnorm's 192 kHz (oversampled), resampled to 48 kHz after.
+    assert fc.index("alimiter=") < fc.rindex("aresample=48000,aformat=sample_rates=48000")

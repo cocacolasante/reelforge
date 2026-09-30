@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass
 
 from reelforge_core.models import AnalysisReport, ReelCandidate
 
-PRESCORE_VERSION = "p2"
+PRESCORE_VERSION = "p3"  # p3: content-scored reserved shortlist slots (CP7)
 # A candidate edge within this many seconds of an utterance-unit edge counts
 # as "on" it (scene cuts rarely coincide exactly with word timestamps).
 BOUNDARY_EPS = 0.25
@@ -175,23 +175,47 @@ def _time_overlap(a: ReelCandidate, b: ReelCandidate) -> float:
     return max(0.0, inter) / shorter
 
 
+RESERVED_SLOTS = 12  # of the shortlist, for content-scored candidates
+MIN_CONTENT_SCORE = 8.0  # of 20: a reserved slot needs a line worth hearing
+
+
 def shortlist(
     candidates: list[ReelCandidate],
     features: dict[str, PrescoreFeatures],
     n: int,
+    content: dict[str, float] | None = None,
+    reserved: int = RESERVED_SLOTS,
 ) -> list[ReelCandidate]:
     """Top-n by prescore with a light overlap penalty: walk in prescore order,
     skipping a candidate that overlaps an already-kept one by more than
-    SHORTLIST_OVERLAP_MAX. Returned in prescore order."""
+    SHORTLIST_OVERLAP_MAX. Returned in prescore order.
+
+    With `content` scores (reels/content_score.py), the last `reserved`
+    slots go to the best content-scored candidates the heuristic walk
+    missed (same overlap rule, at least MIN_CONTENT_SCORE); unused reserved
+    slots fall back to the heuristic order."""
     order = sorted(
         candidates,
         key=lambda c: (-prescore(features[c.candidate_id]), c.duration_sec, c.start_sec),
     )
+    rank = {c.candidate_id: i for i, c in enumerate(order)}
+    reserve = min(reserved, n) if content else 0
     kept: list[ReelCandidate] = []
-    for c in order:
-        if len(kept) >= n:
-            break
-        if any(_time_overlap(c, k) > SHORTLIST_OVERLAP_MAX for k in kept):
-            continue
-        kept.append(c)
-    return kept
+
+    def walk(pool: list[ReelCandidate], limit: int) -> None:
+        for c in pool:
+            if len(kept) >= limit:
+                break
+            if c in kept or any(_time_overlap(c, k) > SHORTLIST_OVERLAP_MAX for k in kept):
+                continue
+            kept.append(c)
+
+    walk(order, n - reserve)
+    if reserve:
+        by_content = sorted(
+            (c for c in order if content.get(c.candidate_id, -1.0) >= MIN_CONTENT_SCORE),
+            key=lambda c: (-content[c.candidate_id], rank[c.candidate_id]),
+        )
+        walk(by_content, n)
+        walk(order, n)  # top up whatever the content pool couldn't fill
+    return sorted(kept, key=lambda c: rank[c.candidate_id])

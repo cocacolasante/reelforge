@@ -14,5 +14,9 @@ services:
       - ./apps:/app/apps
       - ./tests:/app/tests
       - ./pyproject.toml:/app/pyproject.toml
+      # Just the LUT + SFX generators, so their tests run the working copy. Not
+      # all of assets/: the image builds LUTs and downloads face models into it.
+      - ./assets/luts/synthesize_luts.sh:/app/assets/luts/synthesize_luts.sh:ro
+      - ./assets/sfx/synthesize_sfx.sh:/app/assets/sfx/synthesize_sfx.sh:ro
     command: ["pytest", "-ra", "-v"]
     networks: [reelforge_net]
