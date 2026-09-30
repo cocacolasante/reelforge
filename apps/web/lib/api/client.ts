@@ -36,7 +36,9 @@ export async function api<T = unknown>(path: string, opts: ApiOpts<T> = {}): Pro
   } = opts;
 
   const url = new URL(
-    path.startsWith('http') ? path : API_BASE + (path.startsWith('/api') ? path : `/api/v1${path}`),
+    // '/api/' with the slash: a path like '/api-keys' is a resource name, not
+    // an already-prefixed URL, and silently lost its /api/v1 without it.
+    path.startsWith('http') ? path : API_BASE + (path.startsWith('/api/') ? path : `/api/v1${path}`),
   );
   if (query) {
     for (const [k, v] of Object.entries(query)) {
