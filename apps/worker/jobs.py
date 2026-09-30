@@ -209,7 +209,11 @@ async def compose_reel_job(
     wd = working_dir_for(asset_id)
     analysis_path = wd / "analysis.json"
     reels_path = wd / "reels.json"
-    if not analysis_path.exists() or not reels_path.exists():
+    # A mix carries its own RankedReel stub, so it only needs the analysis:
+    # a project that went straight to an AI mix never ran selection, and
+    # requiring reels.json made re-rendering one fail (2026-09-20).
+    needs_selection = reel_stub is None
+    if not analysis_path.exists() or (needs_selection and not reels_path.exists()):
         msg = (
             f"missing analysis/reels for asset {asset_id}. Run analyze and "
             f"select before compose."
@@ -220,14 +224,22 @@ async def compose_reel_job(
 
     try:
         analysis = AnalysisReport.model_validate_json(analysis_path.read_text())
-        selection = ReelSelection.model_validate_json(reels_path.read_text())
+        selection = (
+            ReelSelection.model_validate_json(reels_path.read_text())
+            if reels_path.exists()
+            else None
+        )
     except Exception as exc:
         tb = traceback.format_exc()
         await db.record_job_failure(job_id, str(exc), tb)
         await write_terminal(redis, job_id, "error", str(exc))
         raise
 
-    reel = next((r for r in selection.reels if r.candidate_id == reel_id), None)
+    reel = (
+        next((r for r in selection.reels if r.candidate_id == reel_id), None)
+        if selection is not None
+        else None
+    )
     if reel is None and reel_stub is not None:
         # Synthetic reels (AI mixes) live only as DB rows; the API passes a
         # stub built from the row so compose works without a reels.json entry.

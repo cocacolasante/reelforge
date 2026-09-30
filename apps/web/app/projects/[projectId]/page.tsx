@@ -65,6 +65,17 @@ function ProjectDetail({ projectId }: { projectId: string }) {
     queryKey: ['project-reels', projectId],
     queryFn: () => api<{ reels: unknown[]; asset_count: number }>(`/projects/${projectId}/reels`),
   });
+  // A project can reach the reels page with NO per-clip selection: going
+  // straight to an AI mix (or a montage) leaves /projects/{id}/reels empty,
+  // which hid the "View reels" button on a project whose mix had rendered.
+  const projectMixes = useQuery({
+    queryKey: ['project-mixes', projectId],
+    queryFn: () => api<{ mixes: unknown[] }>(`/projects/${projectId}/mixes`),
+  });
+  const projectMontages = useQuery({
+    queryKey: ['project-montages', projectId],
+    queryFn: () => api<{ montages: unknown[] }>(`/projects/${projectId}/montages`),
+  });
   // Keeps the uploader on screen for a whole multi-file batch — otherwise it
   // unmounted the moment the project's first clip landed.
   const uploaderActive = useUploaderActive(projectId);
@@ -142,7 +153,14 @@ function ProjectDetail({ projectId }: { projectId: string }) {
   // woven into a reel at compose time, so they're listed separately.
   const assetList = allAssets.filter((a) => a.kind === 'video');
   const photoList = allAssets.filter((a) => a.kind === 'photo');
+  // Selection-only: re-running Select overwrites reels.json and nothing else,
+  // so the replace warning must NOT count mixes or montages.
   const reelCount = (projectReels.data?.reels as unknown[] | undefined)?.length ?? 0;
+  // Everything the reels page actually lists.
+  const viewableCount =
+    reelCount +
+    ((projectMixes.data?.mixes as unknown[] | undefined)?.length ?? 0) +
+    ((projectMontages.data?.montages as unknown[] | undefined)?.length ?? 0);
 
   return (
     <div className="container space-y-6 py-8">
@@ -156,9 +174,9 @@ function ProjectDetail({ projectId }: { projectId: string }) {
           </h1>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {reelCount > 0 ? (
+          {viewableCount > 0 ? (
             <Button onClick={() => router.push(`/projects/${projectId}/reels`)}>
-              View {reelCount} reel{reelCount === 1 ? '' : 's'}
+              View {viewableCount} reel{viewableCount === 1 ? '' : 's'}
               <ArrowRight className="h-4 w-4" />
             </Button>
           ) : null}
