@@ -38,6 +38,26 @@ class Settings(BaseSettings):
         default="http://localhost:8001", alias="REELFORGE_PUBLIC_API_BASE"
     )
     web_base: str = Field(default="http://localhost:3000", alias="REELFORGE_WEB_BASE")
+    # A folder ReelForge watches for footage — point it at an iCloud or
+    # Dropbox folder that syncs from a phone and dropping clips there is
+    # enough. Empty disables the scanner.
+    watch_dir: str = Field(default="", alias="REELFORGE_WATCH_DIR")
+    watch_scan_seconds: float = 30.0
+    # A file is only taken once it has stopped growing, so a half-synced
+    # clip is never probed.
+    watch_settle_seconds: float = 20.0
+    # Where finished clips are copied when delivery includes "folder" —
+    # point it at a synced folder and they appear on the phone.
+    delivery_dir: str = Field(default="", alias="REELFORGE_DELIVERY_DIR")
+    # Default delivery when an agent doesn't say: comma-separated
+    # links | folder | email.
+    delivery_default: str = Field(default="links", alias="REELFORGE_DELIVERY_DEFAULT")
+    smtp_host: str = Field(default="", alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, alias="SMTP_PORT")
+    smtp_user: str = Field(default="", alias="SMTP_USER")
+    smtp_password: str = Field(default="", alias="SMTP_PASSWORD")
+    smtp_from: str = Field(default="", alias="SMTP_FROM")
+    smtp_to: str = Field(default="", alias="SMTP_TO")
     caption_preview_timeout_s: float = 10.0
     caption_preview_rpm_per_ip: int = 30
 

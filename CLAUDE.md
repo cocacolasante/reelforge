@@ -664,6 +664,92 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   Results ride the job row (`result.suggestions`); nothing touches the reel
   until the user accepts in `BrollAssistant` and saves. No candidates or no
   speech → a note, zero tokens.
+- **Agent access (MCP, CP1).** An outside agent — Muse (Meta's assistant) is
+  the first — reaches ReelForge as a **custom MCP connector**: a hosted
+  `POST /mcp` plus a bearer key. Same design as growth-agent's and
+  emailblaster's Muse integrations, so read `~/Projects/emailblaster/
+  docs/muse-mcp.md` before changing anything here. Shape:
+  `apps/api/routers/mcp.py` (stateless JSON-RPC over Streamable HTTP —
+  `initialize`/`ping`/`tools/list`/`tools/call`, batch arrays, 202 for
+  notifications, plain JSON and NEVER SSE, `GET`/`DELETE` -> 405);
+  `apps/api/mcp/tools.py` (`TOOLS` list of declarative `Tool` objects;
+  `mutates` drives the MCP `readOnlyHint`/`idempotentHint` annotations);
+  `apps/api/services/api_keys.py` + `db.ApiKey` (SHA-256 hashed, `rf_`
+  prefix indexed for lookup, `secrets.compare_digest`, revocable,
+  `last_used_at` stamped); `apps/api/routers/api_keys.py` (dashboard-only
+  minting — deliberately NOT reachable from a tool, so a key can't mint
+  another). Invariants: the MCP router mounts at the ROOT, not `/api/v1`
+  (connector URLs are `host/mcp`); tools dispatch through the app's own
+  routes in-process via `httpx.ASGITransport(app=request.app)` re-presenting
+  the caller's key (`request.app`, not an import — `create_app()` means an
+  import would hit a different instance and break tests); refusals are tool
+  output (`isError: true`, "ReelForge refused this: …"), never protocol
+  errors; and `tests/api/test_mcp.py` PINS the tool list plus the absence of
+  any publish/delete/key tool — widening the surface is an edit there.
+- **Footage in, for agents (CP2).** MCP tools carry JSON, so an agent can
+  never hand over the video itself — both paths here exist because of that.
+  (1) `start_upload` mints a project plus an HMAC-signed, 6h link
+  (`services/signing.py`, secret auto-generated at `/data/.link_secret` so it
+  survives restarts); `routers/upload_link.py` serves a self-contained phone
+  page at ROOT `/upload/{token}` (XHR per file, for upload progress) and
+  `POST /upload/{token}/file`. (2) `services/watch_folder.py` scans
+  `REELFORGE_WATCH_DIR` every `watch_scan_seconds`, taking only files whose
+  mtime has settled (`watch_settle_seconds`) so a half-synced clip is never
+  probed; a subfolder becomes its own project, loose files join a per-day
+  one; the user's file is never moved or deleted and `db.WatchIngest`
+  (path + size + mtime) is what stops a re-ingest. Both share
+  `services/ingest_file.py::ingest_media_file`, which returns
+  `(asset, created)`: an asset id IS the content hash and an asset belongs to
+  ONE project, so re-sending footage that is already here returns the
+  existing row pointing at ITS project — callers must report that ("already
+  in ReelForge, in 'first batch'") instead of crediting a batch with a clip
+  it never received.
+- **Cutting, for agents (CP3).** An agent asks once and polls ONE job, rather
+  than driving analyze -> select -> compose -> export itself.
+  `POST /api/v1/agent/cuts` (`routers/agent.py`) does the database-side setup
+  — validating the project, dropping asset rows whose file has vanished,
+  picking the longest clip as the mix primary, creating the `mix-` Reel row —
+  then enqueues `agent_cut_job` (`apps/worker/jobs.py`), which runs
+  `apps/worker/agent_cut.py`: analysis is REUSED when `analysis.json` exists
+  (it is the expensive stage and is keyed by content hash), selection runs
+  per clip, and the top-K ACROSS the batch are composed + exported. Long mode
+  CALLS `create_mix_job` with the same ctx rather than copying the mix
+  pipeline, so progress and the result land on the same job row. One agent
+  cut per project at a time (`conflict_filter` on kind + project) — cutting
+  costs tokens and tens of minutes. A clip that won't probe is skipped with a
+  warning; only an entirely unreadable batch fails the job. Job kind
+  `agent_cut` is in `JobKindLit` AND the web `JobSchema` enum. NOTE: a
+  `RankedReel`'s score field is `overall` — `overall_score` is the DB Reel
+  column, and a test fake using the wrong name let that bug reach live
+  footage once (2026-09-29); agent tests build REAL `RankedReel`s.
+- **Delivery (CP4).** `apps/worker/delivery.py` runs the channels an agent
+  asked for once clips exist: `links` (always, and both other channels
+  reference them), `folder` (copy into `REELFORGE_DELIVERY_DIR`, a synced
+  folder), `email` (SMTP_* env; never raises — a failed send reports itself
+  and the cut still succeeds). `reelforge_core/links.py` is shared by API and
+  worker (the worker must not import `apps.api`): HMAC tokens over a path
+  RELATIVE to `/data/outputs`, re-checked for containment on resolve, served
+  by `GET /media/{token}` at ROOT and OUTSIDE auth — the link is the
+  capability, and it has to work from a phone with no key. Long mode exports
+  the mix mezzanine first (`export_and_deliver_long`), since a mix renders a
+  mezzanine but never an export and there would otherwise be no file to hand
+  over. Collision naming appends " (2)" rather than editing the name: a clip
+  titled "take 2" must not be filed as "take 3".
+- **The tunnel forwards PATHS, not the host (CP5).** `scripts/
+  named-tunnel-setup.sh` writes path-scoped ingress: only `/mcp`, `/health`,
+  `/media/*`, `/upload/*` and `/public/media/*` reach `api:8001`; everything
+  else 404s at Cloudflare's edge. Load-bearing — this API has no session
+  auth (it assumes localhost), so the blanket forward that shipped for
+  Instagram published the dashboard API, `DELETE /api/v1/projects/{id}`
+  included, to anyone who knew the hostname (found and closed 2026-09-29).
+  cloudflared reads its rules at STARTUP: editing `secrets/cloudflared/
+  config.yml` does nothing until the container restarts. The dashboard stays
+  on localhost:3000 and OAuth uses `REELFORGE_PUBLIC_API_BASE` (localhost),
+  so nothing needs a wider forward. `REELFORGE_WATCH_DIR` /
+  `REELFORGE_DELIVERY_DIR` are HOST paths, bind-mounted at the SAME path
+  inside `api` (and the delivery one into `worker`), so one .env value is
+  right on both sides; unset they fall back to `/dev/null`. See
+  `docs/muse-mcp.md`.
 - **Eye-contact correction.** `ComposeConfig.eye_contact` (default off) →
   `compose/eyecontact.py`, run on each freshly extracted VIDEO clip in both
   `extract_clips` and `extract_timeline_clips` (never photos or B-roll

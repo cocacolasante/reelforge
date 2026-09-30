@@ -27,6 +27,13 @@ services:
     volumes:
       - ./data:/data
       - whisper_models:/models/whisper
+      # Folders on the Mac that agents use: footage dropped in
+      # REELFORGE_WATCH_DIR is ingested, finished clips are copied to
+      # REELFORGE_DELIVERY_DIR. Mounted at the SAME path inside the
+      # container so one .env value is correct on both sides. Unset, they
+      # fall back to /dev/null, which mounts harmlessly and disables both.
+      - ${REELFORGE_WATCH_DIR:-/dev/null}:${REELFORGE_WATCH_DIR:-/dev/null}
+      - ${REELFORGE_DELIVERY_DIR:-/dev/null}:${REELFORGE_DELIVERY_DIR:-/dev/null}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8001/ready"]
       interval: 10s
@@ -56,6 +63,7 @@ services:
     volumes:
       - ./data:/data
       - whisper_models:/models/whisper
+      - ${REELFORGE_DELIVERY_DIR:-/dev/null}:${REELFORGE_DELIVERY_DIR:-/dev/null}
     networks: [reelforge_net]
     deploy:
       replicas: 2

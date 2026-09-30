@@ -28,6 +28,9 @@ import {
   type ReelEdit,
   type ReelTimeline,
   AssetSchema as _AssetSchema,
+  ApiKeyListSchema,
+  ApiKeyCreatedSchema,
+  AgentAccessInfoSchema,
 } from './schemas';
 
 // ---------- projects ----------
@@ -401,5 +404,42 @@ export function useUploadVoiceover(projectId: string) {
       }
       return _AssetSchema.parse(json) as Asset;
     },
+  });
+}
+
+// --- agent access (MCP keys) ------------------------------------------------
+
+export function useApiKeys() {
+  return useQuery({
+    queryKey: ['api-keys'],
+    queryFn: () => api('/api-keys', { schema: ApiKeyListSchema }),
+  });
+}
+
+export function useAgentConnection() {
+  return useQuery({
+    queryKey: ['agent-connection'],
+    queryFn: () => api('/api-keys/connection', { schema: AgentAccessInfoSchema }),
+  });
+}
+
+export function useCreateApiKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      api('/api-keys', {
+        method: 'POST',
+        body: { name },
+        schema: ApiKeyCreatedSchema,
+      }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['api-keys'] }),
+  });
+}
+
+export function useRevokeApiKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (keyId: string) => api(`/api-keys/${keyId}/revoke`, { method: 'POST' }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['api-keys'] }),
   });
 }

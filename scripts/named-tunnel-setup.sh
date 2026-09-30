@@ -76,10 +76,23 @@ cp "$creds" "$OUT/credentials.json"
 chmod 600 "$OUT/credentials.json"
 
 # Ingress is resolved top to bottom and the last rule must be a catch-all, or
-# cloudflared refuses to start. Pointing at web:5175 rather than the API is
-# deliberate: the Vite dev server proxies /api, /mcp and /media through, so one
-# hostname carries the dashboard, the OAuth callbacks, the MCP endpoint Muse
-# connects to, and the signed media URLs TikTok fetches.
+# cloudflared refuses to start.
+#
+# ONLY the paths that must answer the outside world are forwarded; everything
+# else 404s at Cloudflare's edge. This matters more here than elsewhere: the
+# ReelForge API has no session auth — it assumes localhost — so a blanket
+# forward publishes the whole dashboard API, and `DELETE /api/v1/projects/{id}`
+# with it, to anyone who guesses the hostname.
+#
+#   /mcp           the agent endpoint; a bearer key is required there
+#   /media/...     signed, expiring links to finished clips
+#   /upload/...    signed upload links, opened on a phone
+#   /public/media  one export at a time while Instagram fetches it
+#   /health        cheap liveness, no data
+#
+# The dashboard and its API stay on localhost, where the browser reaches them
+# directly (NEXT_PUBLIC_API_URL), and OAuth callbacks use
+# REELFORGE_PUBLIC_API_BASE, which is localhost too.
 cat > "$OUT/config.yml" <<CFG
 tunnel: ${uuid}
 credentials-file: /etc/cloudflared/credentials.json
@@ -87,6 +100,10 @@ metrics: 0.0.0.0:2000
 
 ingress:
   - hostname: ${TUNNEL_HOSTNAME}
+    path: ^/(mcp|health)$
+    service: ${TUNNEL_SERVICE}
+  - hostname: ${TUNNEL_HOSTNAME}
+    path: ^/(media|upload|public/media)(/.*)?$
     service: ${TUNNEL_SERVICE}
   - service: http_status:404
 CFG

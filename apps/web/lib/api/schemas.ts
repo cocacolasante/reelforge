@@ -146,7 +146,7 @@ export type Reel = z.infer<typeof ReelSchema>;
 
 export const JobSchema = z.object({
   id: z.string(),
-  kind: z.enum(['analyze', 'select', 'compose', 'export', 'publish', 'broll']),
+  kind: z.enum(['analyze', 'select', 'compose', 'export', 'publish', 'broll', 'agent_cut']),
   status: z.enum(['queued', 'running', 'done', 'failed']),
   progress: z.number(),
   stage: z.string().nullable(),
@@ -357,3 +357,22 @@ export type ReelTimeline = z.infer<typeof ReelTimelineSchema>;
 export type ReelEdit = z.infer<typeof ReelEditSchema>;
 export type SourceVideo = z.infer<typeof SourceVideoSchema>;
 export type SourcePhoto = z.infer<typeof SourcePhotoSchema>;
+
+// --- agent access (MCP keys) ------------------------------------------------
+
+export const ApiKeySchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  prefix: z.string(),
+  created_at: z.string(),
+  last_used_at: z.string().nullable(),
+  revoked_at: z.string().nullable(),
+});
+export const ApiKeyListSchema = z.object({ keys: z.array(ApiKeySchema) });
+// The token rides along only on the create response — never on a listing.
+export const ApiKeyCreatedSchema = ApiKeySchema.extend({ token: z.string() });
+export const AgentAccessInfoSchema = z.object({
+  mcp_url: z.string(),
+  reachable_publicly: z.boolean(),
+});
+export type ApiKey = z.infer<typeof ApiKeySchema>;
