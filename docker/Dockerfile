@@ -46,6 +46,8 @@ RUN chmod +x /usr/local/bin/reelforge /usr/local/bin/api-entrypoint.sh /usr/loca
     && bash /app/assets/music/synthesize_placeholders.sh /app/assets/music \
     # Synthesize the bundled LUTs (warm/cool/cinematic/vivid). ~460 KB total.
     && bash /app/assets/luts/synthesize_luts.sh /app/assets/luts \
+    # Synthesize the sound effects (pop/hit/whoosh, compose/sfx.py). ~150 KB.
+    && bash /app/assets/sfx/synthesize_sfx.sh /app/assets/sfx \
     # MediaPipe face landmarker for eye-contact correction (~3.7 MB, pinned).
     && mkdir -p /app/assets/models \
     && curl -fsSL -o /app/assets/models/face_landmarker.task \
@@ -54,6 +56,18 @@ RUN chmod +x /usr/local/bin/reelforge /usr/local/bin/api-entrypoint.sh /usr/loca
     # ships CascadeClassifier but no cv2/data XMLs (BSD, pinned tag).
     && curl -fsSL -o /app/assets/models/haarcascade_frontalface_default.xml \
         https://raw.githubusercontent.com/opencv/opencv/4.10.0/data/haarcascades/haarcascade_frontalface_default.xml \
+    # Caption fonts: Montserrat Black/ExtraBold (SIL OFL 1.1, pinned release,
+    # checksum-verified). libass reads them via the subtitles filter's
+    # fontsdir=/app/assets/fonts; qa/captions_geom.py measures with them.
+    && mkdir -p /app/assets/fonts \
+    && curl -fsSL -o /app/assets/fonts/Montserrat-Black.ttf \
+        https://github.com/JulietaUla/Montserrat/raw/v7.222/fonts/ttf/Montserrat-Black.ttf \
+    && curl -fsSL -o /app/assets/fonts/Montserrat-ExtraBold.ttf \
+        https://github.com/JulietaUla/Montserrat/raw/v7.222/fonts/ttf/Montserrat-ExtraBold.ttf \
+    && curl -fsSL -o /app/assets/fonts/OFL.txt \
+        https://github.com/JulietaUla/Montserrat/raw/v7.222/OFL.txt \
+    && echo "b404ed39088fcb3f8d2ced8164f7a625dfae2ad43bf4a055b55a84d95038d50d  /app/assets/fonts/Montserrat-Black.ttf" | sha256sum -c - \
+    && echo "1b364c3400bf7b1cc2c47a25dd0d3edd8331da451412aa5539080f78f8f70b63  /app/assets/fonts/Montserrat-ExtraBold.ttf" | sha256sum -c - \
     && chown -R reelforge:reelforge /data /models /app
 USER reelforge
 ENV PATH="/app/.venv/bin:/usr/local/bin:$PATH" \

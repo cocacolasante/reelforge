@@ -121,6 +121,31 @@ async def enqueue_compose(
             item["path"] = photo.path
             resolved.append(item)
         body["photo_inserts"] = resolved
+    # Automatic B-roll (CP9) cuts to the project's clips and photos; resolve
+    # them here like every other path. Scene-mode reels only — a timeline
+    # (saved edit or AI mix) carries its own layers.
+    if (
+        "timeline" not in body
+        and not reel_id.startswith("mix-")
+        and not reel.child_reel_ids_json
+        and body.get("auto_broll", "auto") != "off"
+        and "broll_sources" not in body
+    ):
+        from sqlalchemy import select
+
+        rows = (
+            await db.execute(
+                select(dbmod.Asset)
+                .where(dbmod.Asset.project_id == reel.project_id)
+                .where(dbmod.Asset.kind.in_(("video", "photo")))
+                .order_by(dbmod.Asset.created_at)
+            )
+        ).scalars().all()
+        body["broll_sources"] = [
+            {"asset_id": a.id, "kind": a.kind, "filename": a.original_filename, "path": a.path}
+            for a in rows[:200]
+            if a.path and Path(a.path).exists()
+        ]
     config = ComposeConfig(**body)
 
     # Synthetic reels (AI mixes) exist only as DB rows — hand the worker a

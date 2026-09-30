@@ -59,7 +59,8 @@ def test_pick_lut_id_returns_known_or_none():
 
 
 def test_pick_transition_kind_specific_moods():
-    assert pick_transition_kind(_reel("energetic")) == "slideleft"
+    # Energetic content cuts; slides read as a template (CP1, 2026-09-30).
+    assert pick_transition_kind(_reel("energetic")) == "cut"
     assert pick_transition_kind(_reel("calm")) == "fade"
     assert pick_transition_kind(_reel("joyful")) == "dissolve"
 
@@ -71,12 +72,12 @@ def test_pick_lut_specific_moods():
 
 
 def test_pick_transition_kind_for_montage_majority_wins():
-    # 3 energetic vs 1 calm → energetic wins → slideleft.
+    # 3 energetic vs 1 calm → energetic wins → a hard cut.
     assert (
         pick_transition_kind_for_montage(
             ["energetic", "energetic", "energetic", "calm"]
         )
-        == "slideleft"
+        == "cut"
     )
 
 
@@ -109,7 +110,7 @@ def test_resolve_smart_config_off_passthrough():
 def test_resolve_smart_config_on_resolves_auto():
     cfg = ComposeConfig()  # smart_mode default True, transition=auto, lut=auto
     out = resolve_smart_config(cfg, _reel("energetic"))
-    assert out.transition.kind == "slideleft"
+    assert out.transition.kind == "cut"
     assert out.effects.lut == "vivid"
     # input must be untouched (pure resolver)
     assert cfg.transition.kind == "auto"

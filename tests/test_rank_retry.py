@@ -153,15 +153,16 @@ def test_build_candidate_context_populates_fields() -> None:
 
 
 def test_build_candidate_context_word_window_truncates() -> None:
-    """v2: transcript_words keeps the first/last WORD_WINDOW words with a
-    '…' marker between."""
+    """v5: past TIMESTAMPED_ALL_UP_TO words, transcript_words keeps the
+    first/last EDGE_WORDS timestamped with a '…' marker between, and the
+    middle rides along as plain text."""
     from reelforge_core.models import (
         SelectionConfig,
         Transcript,
         TranscriptSegment,
         TranscriptWord,
     )
-    from reelforge_core.reels.rank import WORD_WINDOW
+    from reelforge_core.reels.rank import EDGE_WORDS
 
     analysis = make_analysis("ctx-long", [10.0] * 5)
     n_words = 200
@@ -189,9 +190,10 @@ def test_build_candidate_context_word_window_truncates() -> None:
     candidates = generate_candidates(analysis, cfg)
     ctx = build_candidate_context(candidates[0], analysis)
     tw = ctx["transcript_words"]
-    assert len(tw) == 2 * WORD_WINDOW + 1
-    assert tw[WORD_WINDOW] == "…"
+    assert len(tw) == 2 * EDGE_WORDS + 1
+    assert tw[EDGE_WORDS] == "…"
     assert tw[0][1] == "w0"
+    assert ctx["transcript_middle"].split()[0] == f"w{EDGE_WORDS}"
 
 
 def test_slice_transcript_is_word_granular_on_straddling_segments() -> None:
@@ -363,3 +365,51 @@ def test_coerce_ignores_prompt_relevance_when_inactive() -> None:
         narrative_coherence=60, hook_strength=80, emotional_payoff=40, standalone_clarity=70
     ).weighted
     assert out[0].overall == round(weighted, 2)
+
+
+@pytest.mark.asyncio
+async def test_claude5_models_get_auto_tool_choice_and_an_instruction():
+    from types import SimpleNamespace
+
+    from reelforge_core.reels.rank import _call_model
+
+    calls = []
+
+    class Client:
+        def __init__(self):
+            self.messages = self
+
+        async def create(self, **kw):
+            calls.append(kw)
+            return SimpleNamespace(stop_reason="tool_use", content=[], usage=None)
+
+    await _call_model(Client(), model="claude-opus-5-5", temperature=0.0, system_prompt="S",
+                      messages=[], tools=[{"name": "t"}], tool_name="t")
+    assert calls[0]["tool_choice"] == {"type": "auto"}
+    assert "Respond ONLY by calling the t tool" in calls[0]["system"]
+    await _call_model(Client(), model="claude-sonnet-4-5", temperature=0.0, system_prompt="S",
+                      messages=[], tools=[{"name": "t"}], tool_name="t")
+    assert calls[1]["tool_choice"] == {"type": "tool", "name": "t"} and calls[1]["system"] == "S"
+
+
+@pytest.mark.asyncio
+async def test_a_tool_choice_rejection_switches_to_auto():
+    from types import SimpleNamespace
+
+    from reelforge_core.reels import rank
+
+    calls = []
+
+    class Client:
+        def __init__(self):
+            self.messages = self
+
+        async def create(self, **kw):
+            calls.append(kw)
+            if kw["tool_choice"]["type"] == "tool":
+                raise RuntimeError('400 tool_choice: type "tool" is not supported for this model')
+            return SimpleNamespace(stop_reason="tool_use", content=[], usage=None)
+
+    await rank._call_model(Client(), model="claude-sonnet-4-5", temperature=0.0, system_prompt="S",
+                           messages=[], tools=[{"name": "t"}], tool_name="t")
+    assert [c["tool_choice"]["type"] for c in calls] == ["tool", "auto"]

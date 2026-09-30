@@ -124,7 +124,31 @@ def detect_beats(path: Path, analyze_sec: float = 60.0) -> BeatGrid | None:
     # Phase: comb offset that best aligns with onsets.
     scores = [float(flux[off::lag].sum()) for off in range(lag)]
     phase = int(np.argmax(np.asarray(scores))) * frame_dt
-    return BeatGrid(bpm=round(bpm, 2), phase_sec=round(phase, 4))
+    bpm, phase = refine_tempo(flux, frame_dt, bpm, phase)
+    return BeatGrid(bpm=round(bpm, 3), phase_sec=round(phase, 4))
+
+
+def refine_tempo(flux, frame_dt: float, bpm: float, phase: float) -> tuple[float, float]:
+    """Sub-frame tempo + phase. The autocorrelation lag is a whole number of
+    23ms frames, so its tempo is quantised ~2.5% at 120 BPM — harmless from
+    0:00 over a short reel, but a grid read 30s into a track (compose/
+    music_analysis.py sections) drifted ~0.8s off the real beats. Searches
+    +/-3% (0.02 BPM steps) and a phase comb for the grid whose predicted
+    beats collect the most onset flux over the whole analysed span. Pure."""
+    import numpy as np
+
+    n = flux.size
+    best = (-1.0, bpm, phase)
+    for cand in np.arange(bpm * 0.97, bpm * 1.03, 0.02):
+        interval = 60.0 / cand
+        beats = np.arange(0.0, n * frame_dt - interval, interval)
+        for ph in np.linspace(0.0, interval, 24, endpoint=False):
+            idx = np.rint((beats + ph) / frame_dt).astype(int)
+            idx = idx[idx < n]
+            score = float(flux[idx].sum())
+            if score > best[0]:
+                best = (score, float(cand), float(ph))
+    return best[1], best[2]
 
 
 def compute_beat_end_trims(

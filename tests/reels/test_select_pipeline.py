@@ -259,10 +259,10 @@ async def test_prompt_injects_direction_and_relevance_field(
 
     selection = await select_reels(analysis, config)
 
-    from reelforge_core.reels.rank import SYSTEM_PROMPT_V2
+    from reelforge_core.reels.rank import build_system_prompt
 
     system = client.calls[0]["system"]
-    assert system.startswith(SYSTEM_PROMPT_V2)
+    assert system.startswith(build_system_prompt(SelectionConfig()))
     assert "USER DIRECTION" in system and "clips of falls" in system
     tool = client.calls[0]["tools"][0]
     item = tool["input_schema"]["properties"]["rankings"]["items"]
@@ -271,7 +271,8 @@ async def test_prompt_injects_direction_and_relevance_field(
     assert selection.reels, "80-relevance candidates must survive the gate"
     for r in selection.reels:
         assert r.prompt_relevance == 80
-        assert r.overall == round(0.45 * 80 + 0.55 * r.scores.weighted, 2)
+        # +/- the CP7 rank-position blend (rank.BORDA_WEIGHT / 2).
+        assert abs(r.overall - round(0.45 * 80 + 0.55 * r.scores.weighted, 2)) <= 4.01
 
 
 async def test_no_prompt_uses_v2_golden(
@@ -290,29 +291,32 @@ async def test_no_prompt_uses_v2_golden(
 
     selection = await select_reels(analysis, config)
 
-    from reelforge_core.reels.rank import RECORD_RANKINGS_V2, SYSTEM_PROMPT_V2
+    from reelforge_core.reels.rank import RECORD_RANKINGS_V2, build_system_prompt
 
-    assert client.calls[0]["system"] == SYSTEM_PROMPT_V2
+    # v3 prompt text (v6 stamp): the v2 instructions with the real duration,
+    # plus the CP6 hook/ending/cold-open fields.
+    assert client.calls[0]["system"] == build_system_prompt(config)
     assert client.calls[0]["tools"][0] == RECORD_RANKINGS_V2
     item = client.calls[0]["tools"][0]["input_schema"]["properties"]["rankings"]["items"]
     assert "prompt_relevance" not in item["properties"]
-    assert {"rank_position", "opening_description", "content_style"} <= set(item["properties"])
-    for req in ("rank_position", "opening_description", "content_style"):
+    assert {"rank_position", "opening_description", "content_style", "ending_lands",
+            "cold_open", "trim_tail_words"} <= set(item["properties"])
+    for req in ("rank_position", "opening_description", "content_style", "ending_lands"):
         assert req in item["required"]
     assert client.calls[0]["max_tokens"] == 16000
     for r in selection.reels:
         assert r.prompt_relevance is None
-        assert r.overall == round(r.scores.weighted, 2)
+        assert abs(r.overall - round(r.scores.weighted, 2)) <= 4.01  # + rank blend
         assert r.rank_position is not None
         assert r.opening_description
         assert r.edit_style in ("classic", "hype", "talking_head", "cinematic", "chill")
 
-    # Stamp golden: v2 prompt version + prescore version + shortlist hash.
+    # Stamp golden: prompt version + prescore version + shortlist hash.
     stamp = json.loads(
         (isolated_data_dir / "working" / "aidp2" / "ranking_raw.json.stamp").read_text()
     )
-    assert stamp["ranking_prompt_version"] == "v4"
-    assert stamp["prescore_version"] == "p2"
+    assert stamp["ranking_prompt_version"] == "v6"
+    assert stamp["prescore_version"] == "p3"
     assert set(stamp) == {
         "ranking_model",
         "ranking_prompt_version",

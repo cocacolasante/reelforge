@@ -801,6 +801,363 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   section. Shot caps (`MAX_MIX_SHOTS` = editor `MAX_TIMELINE_SHOTS` = 300)
   are safe only because compose now chunks recursively
   (`pipeline._render_hierarchy`: 300 shots -> 60 parts -> 12 -> 3).
+- **QA scorecard (pro-editing plan, CP0).** Every render writes `qa.json`
+  (`reelforge_core/qa/`, never fails a render): the edit measured against
+  `qa/thresholds.py` per kind (talking / action / long_form). Visible
+  changes come from the EDIT PLAN, not pixels — ffmpeg's scene score can't
+  tell a cut from motion (calibrated 2026-09-30: a visible cut 0.042, a
+  near-identical join 0.089, a pan 0.116) — so `compose.json`'s
+  `scene_clip_map` now carries per-shot `asset_id`, `duration`, `speed`,
+  `punch_in`, `transition_after`, plus top-level `style` and `layers`; any
+  new way of changing the picture (framing keys, B-roll, cold opens) must
+  be recorded there or the scorecard can't see it. `build_captions` writes
+  `words.json` (spoken words in mezzanine time) regardless of caption mode.
+  `compose/safezone.py` is the ONE platform-safe rectangle (union of
+  TikTok/Reels/Shorts UI on 1080x1920: x 65-880, y 290-1250), shared by the
+  scorecard and, from CP2, caption layout. CLI: `qa`, `qa-project
+  --save-baseline/--diff`, `label`, `seed-labels`, `rate`; baselines in
+  `/data/qa/baselines/`. The plan and targets: `docs/editing-quality.md`.
+- **Pro-editing CP1 (2026-09-30).** Selection: the ranking prompt is now
+  `SYSTEM_PROMPT_V3_TEMPLATE`, filled by `build_system_prompt` with the span
+  length the config actually asks for (v4 told the model "30-60 seconds"
+  for every request, 300s long_single spans included) and framed as a
+  YouTube section above `SHORT_FORM_MAX_SEC` (180s); `ranking_prompt_version`
+  v5. The ranker sees the WHOLE span: every word timestamped up to 120
+  words, otherwise `EDGE_WORDS` (40) timestamped at each end plus
+  `transcript_middle` as plain text (timestamps cost ~4x a word's tokens).
+  The mix sequencer gets `transcript_text` (≤240 words) for long sections
+  (`MIX_PROMPT_VERSION` m3). `rank.accepts_temperature` gates the
+  `extra_body` temperature for EVERY `_call_model` caller (ranker, refiner,
+  director, B-roll, sequencer): unknown models get no sampling params.
+  Editing: pros cut — energetic/triumphant moods, the hype grammar and the
+  hype mix planner all hard-cut; the director may place at most
+  `MAX_FLASHY_PER_REEL` (1) slide/wipe/dip, enforced in `apply_director`
+  (prompt alone didn't hold); cinematic dissolves with ONE dip to black
+  before the last shot (`styles.cinematic_cuts`, shared with the mix
+  planner). Unsharp runs only when some source was scaled UP to the output
+  (`pipeline._all_sources_downscaled`), at 3x3/0.3; Ken Burns is off for
+  talking-head. LUTs are midtone-weighted and blended (`smoothstep`), so
+  black and white stay put and the old hard grade switch at luma 0.4 (a
+  step 2.77x the grid spacing — visible banding) is gone;
+  `synthesize_luts.sh` now honours its output-dir argument. The test
+  service mounts that one script, not all of `assets/` (the image builds
+  LUTs and downloads face models into it).
+- **Pro-editing CP2: captions, safe zones, voice (2026-09-30).** Captions
+  default to mode `punch`: 1-3 word chunks (breaking at punctuation, a
+  0.35s pause, or the safe width) in Montserrat Black 86px with a 6px
+  outline and 3px shadow, an 80ms pop from 108%, and ONLY key words
+  highlighted (`compose/keywords.py` heuristic: numbers/currency, a strong
+  lexicon, -est words, mid-sentence names; at most one per chunk, 10-25% of
+  words; CP4's AI emphasis will replace it). Fonts are downloaded, pinned and
+  sha256-checked in the Dockerfile into `/app/assets/fonts`
+  (`graph_builder.CAPTION_FONTS_DIR`, also used by the API caption
+  preview); a family that names its weight gets Bold=0 (`_bold_flag`) or
+  libass synthesises a smear. EVERY mode and position is laid out inside
+  `compose/safezone.py`: lower_third sits on the safe bottom edge (y~1250 of
+  1920), top on the safe top, side margins 65/200 (the right icon rail), and
+  lines are broken by MEASURED width (`compose/textfit.py`, shared with the
+  QA scorecard) — the old 28-character lines were ~985px in an 815px safe
+  width. Overlays (director hook included) are wrapped the same way and
+  `strip_emoji`'d (libass draws colour emoji as boxes); an emoji-only hook
+  is dropped. The talking-head grammar asks for punch/lower_third instead of
+  karaoke centred on the face. Audio: `graph_builder.voice_chain` (highpass
+  75 -> afftdn only when `voice_denoise` resolves "on" -> 3:1 compressor ->
+  +2 dB at 3 kHz -> deesser) runs on the footage bus before the voice
+  loudnorm; compose resolves `voice_denoise="auto"` from the reel's speech
+  ratio (>= 0.4) because on action footage the noise IS the content.
+  `edge_fades` (30ms) close the final bus: a skate mix measured +4.6 dBTP
+  in its first 10-20ms only — the limiter's lookahead is empty there. Voice
+  chain and fades run in the FINAL pass only (`build_final_command(
+  final_pass=False)` for chunks), or they would stack per chunk and dip
+  every join. Caption packing always measures the BOLD face
+  (`captions._measure_bold`): Inter gets ASS bold, and measuring it at
+  regular weight let saved 64px-Inter static lines overflow by ~12px a side.
+- **Pro-editing CP3: visual rhythm via framing keys (2026-09-30).** A
+  planned cut between two pieces of one continuous shot looked like no cut
+  (the skate reel: 17 planned, 2 visible), and a talking head held one
+  framing per sentence. `PlannedShot.framing_keys` /
+  `TimelineShot.framing_keys` / `ClipInfo.framing_keys` =
+  `[(t, zoom, cx, cy)]`, t in the shot's OUTPUT seconds: framing changes
+  WITHIN a shot, so shot durations — and all the triplicated xfade /
+  caption / beat math — never move. Applied graph-side (like punch_in, so
+  NOT in the clip cache keys): `graph_builder` scales the frame UP by the
+  key's zoom (`scale@fk{i}`) and cuts a FIXED output-sized window
+  (`crop@fc{i}`), retargeting both with one `sendcmd` per key (a single
+  interval each — `_ffescape` leaves ';', which the graph parser splits
+  on). NEVER resize a crop's w/h by command: on ffmpeg 5.1 GROWING a crop
+  mid-stream wedges the graph forever (the first live talking-head render
+  hung at its first tight -> wide key, 1.8 GB of buffered frames, 0% CPU);
+  shrinking works, which is why the original zoom-in-only spike passed.
+  `test_real_render_through_tight_to_wide_keys_does_not_hang` runs real
+  ffmpeg with a timeout to guard it. Keys take
+  precedence over punch_in, and the director may not punch a keyed shot.
+  Talking head (`styles.rhythm_keys`, also used by the mix planner): each
+  shot opens on the next framing in the 1.0/1.15/1.0/1.3 cycle (the cycle
+  runs across shots, so every jump cut changes framing too), then changes
+  ~every 3s at a phrase boundary (sentence end or >= 0.12s gap) or a
+  word-free moment, at ANY word boundary after 3.6s, never within 1.5s of
+  the previous key or the shot's end, and early when the tail would
+  otherwise exceed 4s. Centred at (0.5, 0.42) of the already-reframed clip
+  until CP5's face track. Hype: beat pieces of one shot alternate 1.0 /
+  `HYPE_ALT_ZOOM` 1.2. The QA scorecard counts a key as a "reframe" change
+  when the zoom moves >= 0.1. Keys ride `compose.json`'s scene_clip_map and
+  the web Zod `TimelineShot` (optional) — Zod strips unknown keys, so a
+  save from the editor would otherwise erase a mix's rhythm.
+- **Pro-editing CP4: AI emphasis, transcript fixes, SFX (2026-09-30).**
+  `compose/emphasis.py`: after clip extraction, `reel_words` maps every
+  spoken word of the RENDERED shots to mezzanine time (the same
+  `clip_shots` / `map_segments` / `segment_words` helpers captions now use)
+  and ONE stamped `record_emphasis` call (`ComposeConfig.emphasis_model`,
+  Haiku 4.5) returns per line: caption key words, one `key_moment`, a
+  `pop` flag and misheard-word `corrections`. `apply_emphasis` validates
+  everything (indices, ≤34% of a line, key moments ≥6s apart — 15s past
+  180s — and fixes must be ONE word for one word, ≥0.5 similar unless a
+  known glossary term, ≤10% of words). Fixes are written into the asset's
+  transcript override (`save_corrections`, only where the word still reads
+  the old text) BEFORE `build_captions` loads overrides, so the editor
+  shows them and DELETE /transcript reverts them; glossary terms persist
+  per asset (`working/{asset}/glossary.json`). Stamp:
+  `emphasis_raw.json` holds BOTH fingerprints (words as sent, words after
+  its own fixes) — otherwise every fix bought a second call. Punch
+  captions take the AI picks via `pick_keywords(preferred=...)` (heuristic
+  only tops up to the 10% floor); key moments turn their phrase's framing
+  key tight (1.3) in `tighten_framing` — key TIMES never move. Any failure
+  → heuristic captions. Tests: `_default_client` is replaced by an autouse
+  fixture in `tests/conftest.py` because the test service loads .env (a
+  real key) — pass a fake client to exercise the call.
+  `compose/sfx.py`: `plan_sfx` puts a whoosh into each B-roll entry and
+  across flashy transitions (hard cuts stay dry), a pop on AI pop moments,
+  whooshes first, ≥`SHORT_GAP_SEC` 6s apart (20s long-form), shifted by
+  `PEAK_SEC` so the swell lands on the event. Mixed in `build_final_command
+  (sfx=...)` after voice+music, before the final loudnorm/limiter — FINAL
+  PASS ONLY. Files are synthesized at build time
+  (`assets/sfx/synthesize_sfx.sh`, pop/hit/whoosh, ~-4.5 dBFS peaks);
+  `/data/sfx/{kind}.wav` overrides. `EffectsConfig.sfx` "auto" = smart
+  flow only; `sfx_gain_db` -14. `compose.json` records `sfx` and an
+  `emphasis` summary; QA q2 adds `sfx_per_min` (≤10).
+- **Pro-editing CP5: per-frame face tracking (2026-09-30).**
+  `compose/facetrack.py` replaces the 12-sample two-point pan (measured
+  0.47-0.56 on real footage — a centre crop) whenever a clip is cropped OR
+  carries framing keys. `decode_frames` streams the clip range through
+  `ffmpeg -ss ... -vf fps=6,scale=480:-2 -f image2pipe -vcodec ppm` — PPM
+  because its header carries the real (post-rotation) size — ONE frame in
+  memory at a time; keep stdout BUFFERED (a raw pipe's read(n) returns
+  short reads that look like a truncated frame). MediaPipe FaceLandmarker
+  (VIDEO mode, `eyecontact._landmarker(video, num_faces=2)`) gives eye line
+  and mouth opening; `pick_subject` keeps two faces in left/right slots
+  and switches to the one whose mouth moves ≥1.6x more over the last second
+  while the transcript says someone is talking (≥1.5s apart). Under 25% of
+  frames with a face → motion-centroid fallback (softer spring).
+  `camera_path`: holds inside a 20% dead zone, critically damped spring
+  (ω 3.0 face / 1.2 motion), a speaker switch is a CUT; `thin_path` ≤1 key
+  per 0.5s (≤120 keys) minus keys a straight line explains; the crop's x is
+  a nested-`if(lt(...))` piecewise expression (`piecewise_expr`) in seconds
+  from the clip's first output frame (track keys / speed). Cached at
+  `working/{asset}/tracks/` on (version f1, range, mtime, aspect); the clip
+  cache `pan` field becomes `track:<digest>|f1|s<speed>` in BOTH cache
+  keys. `aim_framing_keys` points zoomed keys at the face (eyes a third
+  down the zoomed frame) — graph-side, so no re-extraction. Any failure →
+  the old `estimate_pan`. `EffectsConfig.face_track` (default on). Clips
+  record `face_coverage` + `track`; QA q3 `face_in_crop` ≥0.95.
+- **Pro-editing CP6: hook, ending, cold open (2026-09-30).** Ranking v6:
+  each candidate's context gains `hook_features` (`rank.hook_features`:
+  first_word_sec, opening_greeting, trailing_filler, ends_on_sentence —
+  the SAME patterns the QA scorecard uses, exported from qa/metrics.py as
+  GREETING_RE / TRAILING_RE / FILLER_WORDS) and the tool gains required
+  `ending_lands` (0-100; overall += (x-50)*0.1) plus optional
+  `trim_tail_words` and `cold_open {start_sec,end_sec}|null`.
+  `validate_cold_open` (in `_coerce_rankings`, which now takes `analysis`):
+  1-3.5s, inside the span, NOT in its first 5s, edges snapped off words
+  (≤0.4s) or dropped — live, the model proposed a 6.2s one and it was
+  rightly dropped. `refine.trim_trailing` runs after refinement for the
+  top-K: the model's tail count is used only when the words it drops ARE
+  filler (TRAILING_RE matching from their first word, or all FILLER_WORDS),
+  otherwise the pattern alone decides; never below the duration floor, off
+  a word, or onto an action event; records `end_trim_sec` (+ pre_refine_*),
+  candidate_id unchanged. Compose (scene mode only — timelines skip
+  grammars): `styles.cold_open_for` (D4: hype always, talking_head when
+  emotional_payoff ≥70, never cinematic/chill; `ComposeConfig.cold_open`
+  auto|on|off; skipped when `photo_inserts` exist — they index the shot
+  list) → `with_cold_open` prepends it to `base_bounds` BEFORE `plan_edit`,
+  `lock_cold_open` marks the leading shots (`EditPlan.cold_open_shots`)
+  and forces a hard cut out; `apply_director` skips those shots' nudges and
+  that cut; `sfx.cold_open_exit` puts a whoosh on it; compose.json records
+  `cold_open`. The CLI's compose defaults to a MANUAL config (classic
+  style): pass `--transition auto --lut auto` for the smart flow. Live
+  sandbox check (`data/qa/sandbox`, copies of two analyses — selection was
+  NOT re-run on the real projects): a beach reel opened on the wave smash,
+  hard-cut into its real start with a whoosh.
+- **Pro-editing CP7: content-aware shortlist + final order (2026-09-30).**
+  `reels/content_score.py`: ONE stamped text-only call
+  (`record_line_scores`, `SelectionConfig.content_model` Haiku 4.5,
+  `content_scores.json` keyed on version c1 + model + unit texts) rates
+  every utterance unit (≤500) 0-10 as an opener (`hook`) and a closer
+  (`payoff`); a candidate scores hook(first unit) + payoff(last unit).
+  `prescore.shortlist(content=...)` fills `shortlist_size - RESERVED_SLOTS`
+  (12) by the heuristic walk, then the reserved slots with the best
+  content-scored candidates (≥ MIN_CONTENT_SCORE 8/20, same overlap rule),
+  topping up heuristically; PRESCORE_VERSION p3; `prescore.json` shows
+  `content_score`. The call is SKIPPED when the heuristic shortlist isn't
+  full — on short footage the overlap rule leaves every distinct span
+  shortlisted already (live: 154 candidates on the 4-min beach clip -> 15
+  distinct spans), so it only pays off on long footage.
+  `rank.blend_rank_positions` (inside `_coerce_rankings`): overall +=
+  BORDA_WEIGHT (8) x (borda - 0.5) from the model's own rank_position —
+  set without labels (there are none yet; `reelforge seed-labels` +
+  `eval-select` to tune). MMR similarity adds `TEXT_WEIGHT` (0.5) x
+  Jaccard over each reel's content words (`dedup.content_words`), so two
+  reels making the same point displace each other. `tests/conftest.py`
+  blocks `content_score._default_client` like emphasis.
+- **Pro-editing CP8: action cutting (2026-09-30).** `compose/action.py`
+  (pure; `styles._plan_hype` AND the mix planner's hype use
+  `action_pieces` — the v1 `_beat_pieces` splitter is gone): action events
+  (reels/events.py) are never cut through — each gets one shot cutting in
+  at the motion low ≤2s before it (ties to the LATER bin) and holding 0.8s
+  after; events whose blocks overlap merge into one shot (the randomized
+  test found a follow-through ending inside the next event); an event
+  longer than 2.5s reframes (keys) instead of cutting; filler between
+  events is ~2s pieces; `snap_cuts` puts cuts on beats within 0.25s,
+  never inside an event or starving a piece. The strongest event
+  (`money_event`) gets a stepped ramp 1.0 -> 0.7 -> 0.5 INTO the impact
+  (push-in 1.15/1.3), back to 1.0 AT the impact (sped shots are muted — the
+  impact's sound plays) held ≥2s — only in the span that CONTAINS the peak
+  (an event straddling a scene boundary once ramped toward a peak outside
+  its span, duplicating the ramp). Every piece alternates framing from the
+  previous shot's LAST zoom. Hype with no ranker cold open leads with
+  `event_cold_open` (strongest peak, -1.5s/+1.0s, not the first 5s),
+  passed to `plan_edit(cold_open=)` so hype keeps it one untouched shot.
+  Director (d3 unchanged): a nudge across a boundary shared by contiguous
+  pieces of one take MOVES the boundary (the neighbour gives up the time,
+  or the nudge stops there) — it used to replay 0.5s of footage — and it
+  may not change the speed of a planned slow step. Live skate reel: 8.7 ->
+  36.1 changes/min, longest static 7.0 -> 2.5s.
+- **Pro-editing CP9: automatic B-roll (2026-09-30).** `compose/autobroll.py`,
+  scene mode only (a saved timeline / AI mix carries its own layers): after
+  captions, when the clip list is FINAL, `timeline_from_clips` turns the
+  rendered clips into the ReelTimeline `broll/suggest.suggest_broll`
+  already understands (its `shot_segments` = the editor preview's
+  placement, so a cutaway lands on the same words in both), one call with
+  `auto_budget` (~1 per 8s on shorts, ~1 per 20s past 180s, cap grows with
+  length; `suggest_broll(budget=)`), stamped in `auto_broll.json` (version
+  a1 + model + budget + shot list + source ids). Layers render through the
+  existing final-pass compositor; sfx whooshes their entries. Gate
+  (`wants_auto_broll`): `ComposeConfig.auto_broll` auto = smart flow, NOT
+  hype, speech ratio ≥0.4 (the beach "talking head" measured 0.14 — mostly
+  ocean — and correctly got none), and only with `broll_sources`, which the
+  compose endpoint fills from the project's videos + photos at enqueue
+  (scene-mode reels only; paths resolved there like every other path).
+  compose.json records `auto_broll` (paths blanked). The editor: GET
+  /edit's default timeline is now `_rendered_timeline` — the LAST RENDER's
+  shots (plan, speeds, framing keys, transitions, cold open) plus the auto
+  layers — falling back to scene-per-shot without a compose.json; the old
+  default didn't match what grammars render at all, and auto layers timed to
+  the plan would have sat on the wrong words. Saving it makes the reel a
+  timeline edit (baked plan, grammars no longer re-run — like mixes).
+  `tests/conftest.py` blocks `autobroll._default_client`.
+- **Pro-editing CP10: music sections (2026-09-30).**
+  `compose/music_analysis.py`: `analyze_track` (cached per file at
+  `$REELFORGE_MUSIC_DIR/analysis/`, version m2) = tempo + phase over up to
+  600s, the downbeat (the most accented of the 4 beat positions), 8-bar
+  phrases, per-phrase RMS and `drops` (phrase starts ≥1.25x louder than the
+  previous and ≥0.6 of peak, strongest first). `beats.refine_tempo` is
+  load-bearing: the autocorrelation lag is whole 23ms frames (123 BPM for a
+  120 BPM track), harmless from 0:00 but ~0.8s of drift 30s into a song —
+  it searches ±3% / 24 phases for the grid collecting the most onset flux
+  (now 120.015). compose picks the section BEFORE planning because hype
+  snaps cuts to it: `choose_section` puts the strongest drop that fits on
+  the estimated payoff (hype money event + cold open + ramp slowdown), else
+  ends the reel on a phrase (offset ≤ 2/3 into the track), else 0:00; all
+  offsets are whole beats so `grid_for_offset` is the mezzanine grid for
+  planning AND beat trims. After extraction `refine_offset` (drop) /
+  `realign_end` (phrase) correct by WHOLE beats only (the pre-plan length
+  estimate missed by 1.2s live). Reels longer than the rest of the track
+  get `loop_plan`: play to the last whole phrase, then loop phrase 2 ->
+  last phrase with 2s crossfades (no more blind `-stream_loop`); the prep
+  fades out 1.5s on the phrase. The music cache key gains segments + fade
+  only when sectioned; no analysis = the legacy command byte-for-byte.
+  `select_track(style="hype")` prefers 110-150 BPM (half/double time
+  counts; very ambient tracks can read an octave high). compose.json
+  records `music_section`. Live: a skate sandbox reel's drop (96.3s of the
+  track) played 0.08s from the impact; a 400s bed on a 208s track rendered
+  exactly 400s with flat RMS through both loop crossfades.
+  The final-bus alimiter now sits `TRUE_PEAK_HEADROOM_DB` (1 dB) below the
+  true-peak target: it limits SAMPLES, while the -1 dBTP spec is true peak
+  and AAC adds overshoot — a dense section measured -0.6 dBTP at the old
+  ceiling; all references now measure -2.1 to -2.3 dBTP at -14 LUFS.
+  Every section offset is a WHOLE BEAT — "top of the track" is the first
+  beat, not 0:00 — so the mezzanine grid is always phase 0 at the measured
+  tempo (`mezzanine_grid`); the mix job plans hype cuts on it (it used the
+  0:00 grid, which put hype mix cuts off the beat once compose started
+  choosing sections).
+- **Pro-editing CP11: long-form retention (2026-09-30).** Mixes over
+  `LONG_FORM_THRESHOLD_SEC` sequence on `LONG_FORM_MODEL` (claude-opus-5-5;
+  no sampling params — CP1's capability map) with `RECORD_MIX_LONG`
+  (MIX_PROMPT_VERSION m4): per section `keep_priority` 1-5 and
+  `chapter_title` (starts a chapter), plus `intro_lines` (3-4 lines, each
+  1.5-8s, ≤30s total, inside their section, word-snapped or dropped, no
+  overlaps, ≥2 or none — `validate_intro`) and `rehook_text`. Sections
+  send up to 400 words of text cut at a sentence end, within a 12k-word
+  total (`_sentence_text`). Length fitting (`_fit_long_form`) trims the
+  lowest-priority sections back to an earlier SENTENCE end (keeping ≥10s
+  and half) before dropping anything, then drops lowest priority — never
+  the opening or closing section. `planner.plan_long_form`: intro montage
+  first + a forced hard cut into the story; chapters as
+  `Chapter(title, shot_index)` on `ReelTimeline.chapters` (indices, not
+  seconds, so re-timing can't break them; the model validator drops
+  indices past the shots; web Zod declares it so saves keep it); a 2s
+  title card per chapter after the first and a 3s "Coming up: …" re-hook
+  in the 35-60% window (nearest 45%, moved off a chapter card) — both
+  ordinary top-position overlays the editor can delete. `youtube_chapters`
+  (first at 0:00, ≥10s each, ≥3 or none) runs in the planner AND in
+  compose (`pipeline._chapter_times`, from the render's own crossfade
+  math), which writes compose.json `chapters` + `chapters.txt` (YouTube
+  format). Publishing to YouTube appends chapters.txt to the description
+  (idempotent, like the music credit). Music: a timeline with ≥3 chapters
+  over `BED_MIN_SEC` (150s), not hype, gets `chapter_bed` — the chosen
+  track plus same-mood tracks (user first, ≤4), switching at the chapter
+  start where the next chapter would pass 70% of the current track, each
+  group its own phrase-ending section/loops, 2s crossfades; beat trims
+  still use the first track's grid; every CC-BY track used is credited.
+  Two infrastructure fixes found live: (1) Claude 5 models reject FORCED
+  tool use ("tool_choice: type tool/any not supported") — `rank._call_model`
+  now forces only `FORCES_TOOL_CHOICE` (the 4.x set), sends everything else
+  tool_choice auto + "Respond ONLY by calling the X tool", and flips to
+  auto if a forced call 400s on tool_choice; the Opus sequencer had been
+  silently falling back to its deterministic order. (2)
+  `_run_ffmpeg_with_progress` reads stderr in chunks split on \r AND \n:
+  `-stats` redraws with carriage returns only, so readline() grew one line
+  until a ~6-min render hit asyncio's 64 KB limit ("Separator is not
+  found, and chunk exceed the limit") and the compose crashed.
+  Found on the live long-form render (and fixed): the final bus now LIMITS
+  AT loudnorm's 192 kHz (4x oversampled) and resamples to 48 kHz after — a
+  48 kHz limiter can't see inter-sample peaks (a GoPro transient measured
+  -0.9 dBTP with the ceiling at -2.5 dBFS; -2.1 oversampled); a bed never
+  splices bundled placeholder tracks into real songs, and only tracks the
+  bed actually used are credited; and `plan_long_form` gives every
+  non-hype shot over 8s gentle framing keys (`LONG_RHYTHM`: ~6s, max 8s
+  static, 1.0/1.12 — `styles.rhythm_keys` now takes interval / force /
+  max_static / zooms) — a 6-minute "chill" mix held one framing for 80s.
+- **Pro-editing CP12: learning loop (2026-09-30).** `reelforge_core/
+  learning/`: `dataset.collect` joins each clip's LATEST label
+  (`labels.sqlite3`, written by apps/queue_consumer from the growth agent,
+  keyed by `reelforge_clip_id` = candidate_id; `REELFORGE_LABELS_DB`) with
+  its reels.json entry and its render's qa.json checks; `report` = Spearman
+  (ties averaged; n < 8 flagged as noise); `weights.fit_weights` = ridge on
+  the four standardised score dims, clipped ≥0, normalised, SHRUNK toward
+  the defaults by n/(n+50), refused below `MIN_LABELS` 50;
+  `fewshot.examples_block` = the top 4 by completion (≥10 joined labels,
+  ≥3 examples) as a "WHAT HAS WORKED FOR THIS CREATOR" system-prompt block,
+  cached on the labels db mtime. Runtime: `rank.active_weights` replaces
+  `ReelScores.weighted` in `_coerce_rankings` ONLY when an applied file
+  exists (`/data/learning/score_weights.json`, `REELFORGE_WEIGHTS_FILE`,
+  validated: 4 keys, ≥0, sum 1, n ≥50), and `rank.fewshot_block` appends
+  examples; both enter the ranking stamp only when active
+  (`weights_version`, `fewshot` digest), so pre-label stamps keep matching.
+  `SelectionConfig.learned_weights` / `fewshot` switch them off. CLI:
+  `reelforge eval-labels` (read-only report) and `reelforge fit-weights
+  [--target] [--apply]` (dry run by default). Never trained online. As of
+  2026-09-30 there are NO labels (no labels db; the queue consumer isn't
+  running) — all of this is inert until the growth agent sends some.
 - **Only libx264 + AAC.** No NVENC, no hardware encode. Determinism and
   quality come first; we can revisit in Phase 7 after measuring.
 - **Do not use `-c copy` for clip extraction.** Stream-copy with `-ss` snaps to

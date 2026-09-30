@@ -209,7 +209,8 @@ async def test_suggest_broll_calls_model_and_validates():
     tl, talking, transcripts = _talking_timeline_and_sources()
     client = _FakeClient([{"candidate_id": "c1", "start_sec": 1.0, "end_sec": 3.0, "reason": "surf"}])
     res = await suggest_broll(tl, [talking], [PhotoSource("p", "surf.jpg")], transcripts,
-                              model="m", prompt="use the surf photo", client=client)
+                              model="claude-sonnet-4-5", prompt="use the surf photo", client=client)
+    # A 4.x model is forced to the tool (Claude 5 models get "auto" — rank._call_model).
     assert client.calls == 1 and client.kwargs["tool_choice"]["name"] == "record_broll"
     assert [s["asset_id"] for s in res.suggestions] == ["p"]
     assert res.usage.input_tokens == 900 and res.note is None

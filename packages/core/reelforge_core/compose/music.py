@@ -60,6 +60,7 @@ def select_track(
     library: list[MusicTrack],
     config: ComposeConfig,
     reel: RankedReel,
+    style: str | None = None,
 ) -> MusicTrack | None:
     """Deterministic mood-matched selection. Returns None if nothing matches
     (not an error; the pipeline just renders without music)."""
@@ -84,6 +85,20 @@ def select_track(
     user_matches = [t for t in matches if t.source == "user"]
     if user_matches:
         matches = user_matches
+    if style == "hype":
+        # Action wants a driving tempo (110-150 BPM, half/double time
+        # counts). Tracks without a manifest bpm are measured once and cached.
+        from reelforge_core.compose.music_analysis import analyze_track, bpm_fits
+
+        def tempo(t: MusicTrack) -> float | None:
+            if t.bpm:
+                return float(t.bpm)
+            ta = analyze_track(Path(t.path))
+            return ta.bpm if ta is not None else None
+
+        fast = [t for t in matches if bpm_fits(tempo(t))]
+        if fast:
+            matches = fast
     # Stable pick by reel.candidate_id + config.seed
     key = f"{reel.candidate_id}|{config.seed}".encode("utf-8")
     idx = int(hashlib.sha256(key).hexdigest(), 16) % len(matches)
@@ -100,7 +115,17 @@ def build_music_prep_command(
     out_path: Path,
     target_duration_sec: float,
     config: ComposeConfig,
+    segments: list[tuple] | None = None,
+    fade_out_sec: float = 1.0,
 ) -> list[str]:
+    """Trim + fade + level the track to the reel's length. With `segments`
+    (compose/music_analysis.py — a chosen section, or phrase-aligned loops)
+    the track plays from those source ranges, joined by crossfades; without
+    them, the legacy blind stream loop from 0:00."""
+    if segments:
+        return _sectioned_prep_command(
+            track, out_path, target_duration_sec, config, segments, fade_out_sec
+        )
     gain = _linear_gain(config.music_volume_db)
     fade_out_start = max(0.0, target_duration_sec - 1.0)
     af = (
@@ -136,12 +161,60 @@ def build_music_prep_command(
     ]
 
 
+def _sectioned_prep_command(
+    track: MusicTrack,
+    out_path: Path,
+    target: float,
+    config: ComposeConfig,
+    segments: list[tuple[float, float]],
+    fade_out_sec: float,
+) -> list[str]:
+    from reelforge_core.compose.music_analysis import LOOP_XFADE_SEC
+
+    gain = _linear_gain(config.music_volume_db)
+    args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    for seg in segments:
+        a, b = seg[0], seg[1]
+        # (start, end) from `track`, or (start, end, path) — a multi-track
+        # long-form bed (music_analysis.chapter_bed).
+        path = seg[2] if len(seg) > 2 else track.path
+        args += ["-ss", f"{a:.3f}", "-t", f"{max(0.1, b - a):.3f}", "-i", str(path)]
+    fade_out_start = max(0.0, target - fade_out_sec)
+    tail = (
+        f"atrim=duration={target:.3f},asetpts=PTS-STARTPTS,"
+        "aresample=48000,aformat=channel_layouts=stereo,"
+        "afade=t=in:st=0:d=0.3,"
+        f"afade=t=out:st={fade_out_start:.3f}:d={fade_out_sec:.2f},"
+        f"volume={gain:.6f}"
+    )
+    if len(segments) == 1:
+        fc = f"[0:a]{tail}[m]"
+    else:
+        parts = []
+        prev = "[0:a]"
+        for i in range(1, len(segments)):
+            out = f"[x{i}]"
+            parts.append(f"{prev}[{i}:a]acrossfade=d={LOOP_XFADE_SEC:.2f}:c1=tri:c2=tri{out}")
+            prev = out
+        parts.append(f"{prev}{tail}[m]")
+        fc = ";".join(parts)
+    return args + [
+        "-filter_complex", fc, "-map", "[m]",
+        "-c:a", "pcm_s16le",
+        "-metadata", "creation_time=1970-01-01T00:00:00Z",
+        "-fflags", "+bitexact", "-flags:a", "+bitexact",
+        str(out_path),
+    ]
+
+
 def prepare_music(
     track: MusicTrack,
     target_duration_sec: float,
     config: ComposeConfig,
     reel_dir: Path,
     log_file: Path,
+    segments: list[tuple[float, float]] | None = None,
+    fade_out_sec: float = 1.0,
 ) -> Path:
     """Produce music.wav sized to `target_duration_sec` with 0.5s in / 1.0s out fades.
 
@@ -159,6 +232,12 @@ def prepare_music(
             "track_id": track.id,
             "dur": f"{target_duration_sec:.3f}",
             "vol_db": f"{config.music_volume_db:.1f}",
+            # Only when sectioned, so legacy cached beds keep their keys.
+            **(
+                {"segments": [[round(seg[0], 3), round(seg[1], 3), *seg[2:]] for seg in segments],
+                 "fade_out": f"{fade_out_sec:.2f}"}
+                if segments else {}
+            ),
         },
     )
     cached = file_cache.lookup(cache_key)
@@ -178,6 +257,8 @@ def prepare_music(
         out_path=out_path,
         target_duration_sec=target_duration_sec,
         config=config,
+        segments=segments,
+        fade_out_sec=fade_out_sec,
     )
     run_ffmpeg(cmd, log_file=log_file)
     try:

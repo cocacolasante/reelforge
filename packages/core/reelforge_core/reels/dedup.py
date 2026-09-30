@@ -48,19 +48,57 @@ def dedup(
     return kept, dropped
 
 
+# CP7: what the reels SAY counts too — two reels of one speaker share scene
+# tags but may make different points, and two made of different scenes may
+# repeat the same point.
+TEXT_WEIGHT = 0.5
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
 def similarity(
-    tags_a: set[str], tags_b: set[str], mood_a: str, mood_b: str
+    tags_a: set[str],
+    tags_b: set[str],
+    mood_a: str,
+    mood_b: str,
+    words_a: set[str] | None = None,
+    words_b: set[str] | None = None,
 ) -> float:
-    """Topic similarity: Jaccard over scene-tag sets + a same-mood bonus."""
-    union = tags_a | tags_b
-    j = len(tags_a & tags_b) / len(union) if union else 0.0
-    return j + (SAME_MOOD_BONUS if mood_a == mood_b else 0.0)
+    """Topic similarity: Jaccard over scene-tag sets + a same-mood bonus +
+    TEXT_WEIGHT x Jaccard over the reels' content words (when given)."""
+    sim = _jaccard(tags_a, tags_b) + (SAME_MOOD_BONUS if mood_a == mood_b else 0.0)
+    if words_a is not None and words_b is not None:
+        sim += TEXT_WEIGHT * _jaccard(words_a, words_b)
+    return sim
+
+
+def content_words(transcript, start: float, end: float) -> set[str]:
+    """Lower-cased content words spoken inside [start, end]: no stop words,
+    nothing shorter than 4 letters. Pure."""
+    from reelforge_core.compose.keywords import _STOP
+
+    out: set[str] = set()
+    if transcript is None:
+        return out
+    for seg in transcript.segments:
+        if seg.end < start or seg.start > end:
+            continue
+        for w in seg.words:
+            if start <= (w.start + w.end) / 2.0 <= end:
+                token = "".join(ch for ch in w.word.lower() if ch.isalnum() or ch == "'")
+                if len(token) >= 4 and token not in _STOP:
+                    out.add(token)
+    return out
 
 
 def mmr_diversify(
     reels: list[RankedReel],
     tag_sets: dict[str, set[str]],
     lam: float,
+    word_sets: dict[str, set[str]] | None = None,
 ) -> list[RankedReel]:
     """Re-rank with maximal marginal relevance:
     `score = overall − λ · max_sim(reel, already_selected)`.
@@ -85,6 +123,8 @@ def mmr_diversify(
                         tag_sets.get(s.candidate_id, set()),
                         r.suggested_mood,
                         s.suggested_mood,
+                        word_sets.get(r.candidate_id) if word_sets is not None else None,
+                        word_sets.get(s.candidate_id) if word_sets is not None else None,
                     )
                     for s in selected
                 ),

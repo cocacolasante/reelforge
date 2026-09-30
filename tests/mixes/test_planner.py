@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from reelforge_core.compose.beats import BeatGrid
+from reelforge_core.compose.styles import RHYTHM_ZOOMS
 from reelforge_core.mixes.planner import MAX_MIX_SHOTS, plan_mix
 from reelforge_core.models import ComposeConfig, EnergyPoint, ReelTimeline
 
@@ -61,13 +62,13 @@ def test_chill_long_fades():
     assert tl.shots[0].transition_after.duration_sec == 0.6
 
 
-def test_hype_source_change_slides_same_source_cuts():
+def test_hype_mix_cuts_between_every_moment():
     shots = [(A1, 0.0, 3.0), (A1, 10.0, 13.0), (A2, 0.0, 3.0), (A1, 20.0, 23.0)]
     tl = plan_mix(shots, _analyses(), "hype", None)
     _conforms(tl)
     kinds = [s.transition_after.kind for s in tl.shots[:-1]]
-    # a->a cut, a->b slide, b->a slide (alternating direction).
-    assert kinds == ["cut", "slideleft", "slideright"]
+    # Source changes cut too — slides on every change made mixes flashy.
+    assert len(kinds) >= 3 and set(kinds) == {"cut"}
 
 
 def test_hype_beat_splits_long_moments():
@@ -81,17 +82,18 @@ def test_hype_beat_splits_long_moments():
         assert abs(grid.snap(s.out_ts) - s.out_ts) < 1e-6
 
 
-def test_hype_slow_mo_on_global_peak():
+def test_hype_ramp_on_the_global_peak():
     analyses = _analyses(energy_for=A2)
-    shots = [(A1, 0.0, 3.0), (A2, 19.0, 22.0), (A1, 10.0, 13.0)]
+    shots = [(A1, 0.0, 3.0), (A2, 17.0, 24.0), (A1, 10.0, 13.0)]
     tl = plan_mix(shots, analyses, "hype", None)
     _conforms(tl)
     slow = [s for s in tl.shots if s.speed == 0.5]
     assert len(slow) == 1
-    assert slow[0].asset_id == A2 and slow[0].in_ts <= 20.5 <= slow[0].out_ts
-    assert slow[0].punch_in == 1.2 and slow[0].punch_in_animated
-    # Sped shots mute their own audio (model rule).
+    assert slow[0].asset_id == A2 and slow[0].out_ts == pytest.approx(20.5)
+    # Sped shots mute their own audio (model rule); the impact plays at 1.0.
     assert slow[0].effective_gain == 0.0
+    after = tl.shots[tl.shots.index(slow[0]) + 1]
+    assert after.speed == 1.0 and after.in_ts == pytest.approx(20.5)
 
 
 def test_hype_respects_shot_cap():
@@ -111,7 +113,10 @@ def test_talking_head_jump_cuts_across_sources():
     _conforms(tl)
     # A1's moment split around its two silences -> 3 pieces + A2's whole.
     assert len(tl.shots) == 4
-    assert [s.punch_in for s in tl.shots] == [None, 1.25, None, 1.25]
+    assert all(s.punch_in is None for s in tl.shots)
+    zooms = [k[1] for s in tl.shots for k in s.framing_keys]
+    assert all(s.framing_keys for s in tl.shots)
+    assert zooms == [RHYTHM_ZOOMS[i % len(RHYTHM_ZOOMS)] for i in range(len(zooms))]
     assert all(
         s.transition_after.kind == "cut" for s in tl.shots[:-1]
     )

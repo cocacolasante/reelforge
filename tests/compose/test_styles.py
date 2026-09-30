@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from reelforge_core.compose.beats import BeatGrid
+from reelforge_core.compose.styles import RHYTHM_ZOOMS
 from reelforge_core.compose.styles import (
     MUSIC_MOOD_BIAS,
     STYLE_NAMES,
@@ -108,8 +109,9 @@ def test_classic_plan_is_identity():
 # ---- hype ------------------------------------------------------------------
 
 
-def test_hype_places_cuts_on_beats_and_slow_mos_the_peak():
-    # 30s single scene; beats every 0.5s; flat energy with one huge peak.
+def test_hype_ramps_into_the_peak_and_cuts_filler_on_beats():
+    # 30s single scene; beats every 0.5s; flat energy with one huge peak
+    # (an action event at t=10-11, peak 10.5).
     analysis = _analysis([_scene(0, 0, 30)], None).model_copy(
         update={"energy": _energy([1.0] * 10 + [50.0] + [1.0] * 19)}  # peak t=10.5
     )
@@ -118,21 +120,22 @@ def test_hype_places_cuts_on_beats_and_slow_mos_the_peak():
     plan = plan_edit("hype", [(0, 0.0, 30.0)], reel, analysis, ComposeConfig(), grid)
 
     assert len(plan.shots) > 5  # the long take got cut up
-    # Source cut points land on the 0.5s beat grid (speed shifts none here
-    # before the peak piece).
-    first_cuts = [s.out_ts for s in plan.shots[:3]]
-    for c in first_cuts:
-        assert abs(grid.snap(c) - c) < 1e-6
-    # Exactly one slow-mo, on the piece containing the peak, with a drifting
-    # punch-in.
-    slow = [s for s in plan.shots if s.speed == 0.5]
-    assert len(slow) == 1
-    assert slow[0].in_ts <= 10.5 <= slow[0].out_ts
-    assert slow[0].punch_in == 1.2 and slow[0].punch_in_animated
-    # Intra-scene boundaries are hard cuts.
-    kinds = {c[0] for c in plan.per_cut if c is not None}
-    assert "cut" in kinds
-    assert any("slow-mo" in n for n in plan.notes)
+    # Filler cuts before the event land on the 0.5s beat grid.
+    for sh in plan.shots[:2]:
+        assert abs(grid.snap(sh.out_ts) - sh.out_ts) < 1e-6
+    # A stepped ramp INTO the impact: 0.7 then 0.5, ending exactly on it,
+    # then back to 1.0 at the impact and held >= 2s so its sound plays.
+    speeds = [sh.speed for sh in plan.shots]
+    i = speeds.index(0.5)
+    assert speeds[i - 1] == 0.7 and plan.shots[i].out_ts == pytest.approx(10.5)
+    impact = plan.shots[i + 1]
+    assert impact.speed == 1.0 and impact.in_ts == pytest.approx(10.5)
+    assert impact.out_ts - impact.in_ts >= 2.0 - 1e-6
+    # Pushing in each step, snapping back wide on the impact.
+    assert [plan.shots[j].framing_keys[0][1] for j in (i - 1, i, i + 1)] == [1.15, 1.3, 1.0]
+    assert all(c == ("cut", 0.04) for c in plan.per_cut)
+    assert any("speed ramp" in n for n in plan.notes)
+
 
 
 def test_hype_speeds_through_lulls():
@@ -154,19 +157,21 @@ def test_hype_without_grid_or_energy_still_splits():
     assert all(s.speed == 1.0 for s in plan.shots)
 
 
-def test_hype_scene_boundary_gets_slide():
+def test_hype_scene_boundary_is_a_hard_cut():
+    """Pros cut: a slide on every scene change made two-thirds of a real
+    skate reel's joins flashy (v0 baseline, 2026-09-30)."""
     analysis = _analysis([_scene(0, 0, 3), _scene(1, 3, 6)], None)
     reel = _reel([0, 1], 0.0, 6.0)
     plan = plan_edit(
         "hype", [(0, 0.0, 3.0), (1, 3.0, 6.0)], reel, analysis, ComposeConfig(), None
     )
-    assert plan.per_cut == [("slideleft", 0.25)]
+    assert plan.per_cut and all(c == ("cut", 0.04) for c in plan.per_cut)
 
 
 # ---- talking head ----------------------------------------------------------
 
 
-def test_talking_head_jump_cuts_and_alternating_punch_ins():
+def test_talking_head_jump_cuts_and_framing_rhythm():
     analysis = _analysis([_scene(0, 0, 14)], None).model_copy(
         update={"transcript": _speech_with_gaps()}
     )
@@ -175,9 +180,15 @@ def test_talking_head_jump_cuts_and_alternating_punch_ins():
         "talking_head", [(0, 0.0, 14.0)], reel, analysis, ComposeConfig(), None
     )
     assert len(plan.shots) == 3  # the two silences got cut
-    assert [s.punch_in for s in plan.shots] == [None, 1.25, None]
+    # Framing keys replace the old every-other punch-in: each shot opens on
+    # the next framing in the wide/medium/wide/tight cycle.
+    assert all(s.punch_in is None for s in plan.shots)
+    zooms = [k[1] for s in plan.shots for k in s.framing_keys]
+    assert all(s.framing_keys for s in plan.shots)
+    assert zooms == [RHYTHM_ZOOMS[i % len(RHYTHM_ZOOMS)] for i in range(len(zooms))]
     assert all(c == ("cut", 0.04) for c in plan.per_cut)
-    assert plan.caption_mode == "karaoke" and plan.caption_position == "centered"
+    # Restrained punch captions in the safe lower band, not karaoke over the face.
+    assert plan.caption_mode == "punch" and plan.caption_position == "lower_third"
 
 
 # ---- cinematic + chill -----------------------------------------------------

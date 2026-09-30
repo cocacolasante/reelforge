@@ -192,9 +192,59 @@ MAX_OVERLAYS = 40
 MAX_LAYERS = 20
 
 
+def _rendered_timeline(r: dbmod.Reel) -> ReelTimeline | None:
+    """What the last render ACTUALLY cut — the style plan's shots, speeds,
+    framing keys, transitions, cold open and automatic B-roll — from its
+    compose.json, or None. The scene-per-shot fallback below doesn't know
+    the plan, so auto B-roll timed to the plan would land on the wrong words
+    there (CP9)."""
+    from reelforge_core.models import PictureLayer, TransitionStyle
+
+    path = working_dir_for(r.asset_id) / "reels" / r.id / "compose.json"
+    if not path.exists():
+        return None
+    try:
+        m = json.loads(path.read_text())
+        shots: list[TimelineShot] = []
+        entries = m.get("scene_clip_map") or []
+        for i, e in enumerate(entries):
+            tr = e.get("transition_after")
+            after = (
+                TransitionStyle(kind=tr[0], duration_sec=max(0.04, float(tr[1])))
+                if tr and i < len(entries) - 1
+                else None
+            )
+            if e.get("kind") == "photo":
+                shots.append(TimelineShot(kind="photo", asset_id=e.get("photo_asset_id") or "",
+                                          duration_sec=float(e.get("duration") or 2.0),
+                                          transition_after=after))
+                continue
+            shots.append(TimelineShot(
+                kind="video",
+                asset_id=e.get("asset_id") or r.asset_id,
+                in_ts=float(e["in_ts"]),
+                out_ts=float(e["out_ts"]),
+                speed=float(e.get("speed") or 1.0),
+                punch_in=e.get("punch_in"),
+                punch_in_animated=bool(e.get("punch_in_animated")),
+                framing_keys=e.get("framing_keys") or [],
+                transition_after=after,
+            ))
+        layers = [PictureLayer(**{**lay, "path": ""}) for lay in m.get("auto_broll") or []]
+        if not shots:
+            return None
+        return ReelTimeline(shots=shots, layers=layers)
+    except Exception:  # noqa: BLE001 — an old or odd manifest: use the plain cut
+        return None
+
+
 def _default_timeline(r: dbmod.Reel) -> ReelTimeline:
-    """The AI cut as an editable timeline: one video shot per scene, with the
-    reel's saved trim offsets folded into the outer bounds."""
+    """The AI cut as an editable timeline: what the last render cut when
+    there is one (`_rendered_timeline`), else one video shot per scene with
+    the reel's saved trim offsets folded into the outer bounds."""
+    rendered = _rendered_timeline(r) if not r.child_reel_ids_json else None
+    if rendered is not None:
+        return rendered
     wd = working_dir_for(r.asset_id)
     scene_indices = json.loads(r.scene_indices_json)
     shots: list[TimelineShot] = []

@@ -181,8 +181,10 @@ def test_candidate_context_shows_what_the_edges_leave_out():
     assert [e["where"] for e in ctx["action_events"]] == ["after_end", "inside"]
 
 
-def test_ranking_prompt_v4_explains_outside_frames_and_announced_action():
-    assert SelectionConfig().ranking_prompt_version == "v4"
+def test_ranking_prompt_explains_outside_frames_and_announced_action():
+    # v5 kept every v4 instruction; it added the real duration and the
+    # whole-transcript note (see test_select_pipeline).
+    assert SelectionConfig().ranking_prompt_version == "v6"
     prompt = build_system_prompt(SelectionConfig())
     assert "RED BORDER" in prompt and "another one coming" in prompt
 

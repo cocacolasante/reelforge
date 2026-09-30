@@ -135,6 +135,94 @@ SYSTEM_PROMPT_V2 = (
     "Mood: pick from the fixed vocabulary to aid music selection downstream."
 )
 
+SYSTEM_PROMPT_V3_TEMPLATE = (
+    "You are a senior video editor selecting moments from a longer piece of "
+    "footage for a {duration} second {destination}.\n\n"
+    "You will receive every viable candidate span at once. Each candidate "
+    "comes as a 5-frame contact sheet — 2s BEFORE the start / opening frame / "
+    "energy peak / closing frame / 2s AFTER the end; the two outer frames have "
+    "a RED BORDER and are NOT part of the clip (a black tile means the footage "
+    "ends there) — followed by its data as JSON: per-scene summaries and "
+    "tags, the transcript (word-timestamped near each edge where cuts happen; "
+    "on long spans the middle comes as plain text in transcript_middle, so "
+    "you can judge the WHOLE story, not only how it starts and ends) plus the "
+    "words just outside each edge, "
+    "per-second energy, detected action events near it, and the heuristic "
+    "features that pre-selected it. Candidates arrive in heuristic prescore "
+    "order — treat that order as a weak prior, not the answer.\n\n"
+    "You are seeing the whole set: first decide the ORDERING — which would "
+    "you post first, second, third. Record it as rank_position (1 = best). "
+    "Then assign the four dimension scores so they reflect RELATIVE quality "
+    "within this set, using the full 0-100 range; the top 5 candidates must "
+    "be separated by at least 5 points of overall quality. Do not compress "
+    "everything into a 55-80 band.\n\n"
+    "Score meanings (be harsh — most raw candidates are mediocre):\n"
+    "- narrative_coherence: does this span tell a self-contained story or make "
+    "a complete point? A random 45 seconds of B-roll scores low. A clear "
+    "setup-development-payoff scores high.\n"
+    "- hook_strength: would someone scrolling past stop in the first 2 seconds? "
+    "Judge from the OPENING frame (second tile) and the opening line. Strong "
+    "opening visual, unexpected moment, or compelling question scores high.\n"
+    "- emotional_payoff: does the span deliver an emotional or informational "
+    "punch? Laughter, revelation, surprise, release of tension all score high.\n"
+    "- standalone_clarity: does the span make sense without the surrounding "
+    "video? Heavy reliance on prior context scores low.\n\n"
+    "Action footage — where the cut falls matters as much as the content. "
+    "People talk BEFORE the action ('here it comes', 'another one coming') and "
+    "react AFTER it ('it just smashed me'). A candidate whose closing line or "
+    "words_after_end announce something that happens after its end, whose red "
+    "after-end frame shows the wave/jump/fall arriving, or that lists an "
+    "action event as after_end / crosses_end, is missing its payoff: score "
+    "emotional_payoff and narrative_coherence low. One that opens on the "
+    "aftermath (the red before-start frame shows the action, or an event is "
+    "listed as before_start / crosses_start) has a weak hook. The best action "
+    "candidates contain the whole event: build-up, the moment, a beat of "
+    "reaction.\n\n"
+    "Openings and endings — each candidate's hook_features are measured for "
+    "you: first_word_sec (seconds of silence before anyone speaks), "
+    "opening_greeting ('hey guys', 'welcome back', 'so today' — a greeting is "
+    "not a hook: score hook_strength low), trailing_filler and "
+    "ends_on_sentence. Viewers decide in the first second; a reel that makes "
+    "them wait or trails off loses them.\n"
+    "- ending_lands (0-100): does the last line land — a payoff, a punchline, "
+    "a finished point? A span that ends mid-thought or on 'so yeah' / 'anyway' "
+    "scores low.\n"
+    "- trim_tail_words: how many words at the very END are trailing filler to "
+    "cut ('so yeah', 'anyway', 'that's it', 'um'); 0 when it ends cleanly. "
+    "Only filler — never cut real content.\n"
+    "- cold_open: when the candidate's single strongest moment — the payoff "
+    "line or the action peak — would make a better FIRST 1-3.5 seconds than "
+    "its real opening, give its start_sec/end_sec (absolute source seconds, "
+    "inside the span and NOT in its first 5 seconds, starting and ending "
+    "between words). It plays first, then the reel starts from the top. Only "
+    "when that moment stands on its own and makes a viewer want to see how it "
+    "happens; otherwise null.\n\n"
+    "opening_description: at most 80 characters stating what is LITERALLY on "
+    "screen and said in the first 2 seconds — from the opening frame (second "
+    "tile) and the opening line. No marketing language; describe, don't sell.\n\n"
+    "content_style: which editing grammar suits this candidate best.\n"
+    "- hype: action/sports/high-energy visuals that want fast beat-cut "
+    "editing, speed ramps, punch-ins.\n"
+    "- talking_head: a person talking to camera; wants jump cuts and "
+    "prominent captions.\n"
+    "- cinematic: scenery, travel, atmosphere; wants long dissolves and "
+    "slow camera drift.\n"
+    "- chill: low-key ambient content; wants gentle fades and minimal "
+    "editing.\n"
+    "- classic: none of the above clearly fits — conservative editing.\n"
+    "Judge from the contact sheets and transcript, not the mood label.\n\n"
+    "Call the record_rankings tool exactly once with rankings for ALL "
+    "candidates. Do not omit candidates. Do not include any text outside the "
+    "tool call.\n\n"
+    "Titles: <= 60 characters, no emoji, no trailing punctuation, written like "
+    "a content creator would actually title a reel.\n"
+    "Hooks: <= 140 characters, one sentence, designed to retain a viewer past "
+    "3 seconds.\n"
+    "Justifications: 1-2 sentences, specific to the content, not generic.\n"
+    "Mood: pick from the fixed vocabulary to aid music selection downstream."
+)
+
+
 RECORD_RANKINGS: dict[str, Any] = {
     "name": "record_rankings",
     "description": "Record rankings for every candidate reel.",
@@ -220,8 +308,29 @@ _V2_ITEM["properties"]["content_style"] = {
     "enum": ["classic", "hype", "talking_head", "cinematic", "chill"],
     "description": "The editing grammar that suits this candidate best.",
 }
+_V2_ITEM["properties"]["ending_lands"] = {
+    "type": "integer",
+    "minimum": 0,
+    "maximum": 100,
+    "description": "Does the last line land: a payoff or finished point (100) vs trailing off (0).",
+}
+_V2_ITEM["properties"]["trim_tail_words"] = {
+    "type": "integer",
+    "minimum": 0,
+    "maximum": 8,
+    "description": "Trailing filler words at the very end to cut; 0 if it ends cleanly.",
+}
+_V2_ITEM["properties"]["cold_open"] = {
+    "type": ["object", "null"],
+    "properties": {
+        "start_sec": {"type": "number"},
+        "end_sec": {"type": "number"},
+    },
+    "required": ["start_sec", "end_sec"],
+    "description": "1-3.5s payoff/peak inside the span (not its first 5s) to play first, or null.",
+}
 _V2_ITEM["required"].extend(
-    ["rank_position", "opening_description", "content_style"]
+    ["rank_position", "opening_description", "content_style", "ending_lands"]
 )
 del _V2_ITEM
 
@@ -257,15 +366,58 @@ USER_DIRECTION_TEMPLATE = (
 )
 
 
-def build_system_prompt(config: SelectionConfig) -> str:
-    """SYSTEM_PROMPT_V2, plus the user-direction block when a prompt is set.
+# Above this, a span is a section of a long video, not a short-form reel.
+SHORT_FORM_MAX_SEC = 180.0
 
-    SYSTEM_PROMPT_V1 stays in the file for reference/stamp archaeology only —
-    old stamps recording ranking_prompt_version "v1" simply won't match and
-    force one fresh rank."""
+
+def build_system_prompt(config: SelectionConfig) -> str:
+    """SYSTEM_PROMPT_V3_TEMPLATE filled with the span length actually asked
+    for, plus the user-direction block when a prompt is set.
+
+    v2 told the model every span was "30-60 seconds" whatever the config said
+    — a 15-30s request and a 300s long_single span were judged as 30-60s
+    reels. SYSTEM_PROMPT_V1/V2 stay in the file for stamp archaeology only."""
+    lo, hi = config.effective_min_sec, config.effective_max_sec
+    destination = (
+        "standalone short-form video (the kind that works on TikTok, "
+        "Instagram Reels or YouTube Shorts)"
+        if hi <= SHORT_FORM_MAX_SEC
+        else "self-contained section of a longer YouTube video"
+    )
+    prompt = SYSTEM_PROMPT_V3_TEMPLATE.format(
+        duration=f"{lo:g}-{hi:g}", destination=destination
+    )
+    block = fewshot_block(config)
+    if block:
+        prompt += block
     if not config.prompt:
-        return SYSTEM_PROMPT_V2
-    return SYSTEM_PROMPT_V2 + USER_DIRECTION_TEMPLATE.format(prompt=config.prompt)
+        return prompt
+    return prompt + USER_DIRECTION_TEMPLATE.format(prompt=config.prompt)
+
+
+def fewshot_block(config: SelectionConfig) -> str | None:
+    """The creator's best performers (learning/fewshot.py), when enabled and
+    enough labels exist."""
+    if not config.fewshot:
+        return None
+    import os
+    from pathlib import Path
+
+    from reelforge_core.learning.fewshot import active_block
+
+    try:
+        return active_block(Path(os.environ.get("REELFORGE_DATA_DIR", "/data")))
+    except Exception:  # noqa: BLE001 — examples are a bonus, never a failure
+        return None
+
+
+def active_weights(config: SelectionConfig):
+    """Applied learned score weights (learning/weights.py), or None."""
+    if not config.learned_weights:
+        return None
+    from reelforge_core.learning.weights import load_weights
+
+    return load_weights()
 
 
 def build_ranking_tool(config: SelectionConfig) -> dict[str, Any]:
@@ -323,9 +475,14 @@ def _slice_transcript(
     return text
 
 
-# transcript_words keeps this many words from each end of the span (with a
-# "…" marker between when truncated) — openings and closings decide reels.
-WORD_WINDOW = 60
+# The ranker sees the WHOLE span's words, within a budget: every word when
+# the span is short; otherwise the first and last EDGE_WORDS with timestamps
+# (cuts happen there) and the middle as plain text — timestamps cost ~4x the
+# tokens of the word itself, and v1-v4 showed only 60 words at each end, so
+# the setup-development-payoff the prompt asks it to judge was invisible.
+EDGE_WORDS = 40
+TIMESTAMPED_ALL_UP_TO = 120
+MIDDLE_WORDS = 240
 
 
 def _span_words(
@@ -383,13 +540,20 @@ def build_candidate_context(
         )
 
     words = _span_words(analysis.transcript, start, end)
-    transcript_words: list[Any] = (
-        [[t, w] for t, w in words]
-        if len(words) <= 2 * WORD_WINDOW
-        else [[t, w] for t, w in words[:WORD_WINDOW]]
-        + ["…"]
-        + [[t, w] for t, w in words[-WORD_WINDOW:]]
-    )
+    transcript_middle: str | None = None
+    if len(words) <= TIMESTAMPED_ALL_UP_TO:
+        transcript_words: list[Any] = [[t, w] for t, w in words]
+    else:
+        transcript_words = (
+            [[t, w] for t, w in words[:EDGE_WORDS]]
+            + ["…"]
+            + [[t, w] for t, w in words[-EDGE_WORDS:]]
+        )
+        middle = [w for _, w in words[EDGE_WORDS:-EDGE_WORDS]]
+        if len(middle) > MIDDLE_WORDS:
+            half = MIDDLE_WORDS // 2
+            middle = middle[:half] + ["[…]"] + middle[-half:]
+        transcript_middle = " ".join(middle)
 
     opening_line = ""
     closing_line = ""
@@ -412,6 +576,7 @@ def build_candidate_context(
         "source": candidate.source,
         "scenes": scene_dicts,
         "transcript_words": transcript_words,
+        **({"transcript_middle": transcript_middle} if transcript_middle else {}),
         "opening_line": opening_line,
         "closing_line": closing_line,
         "words_before_start": [
@@ -421,6 +586,7 @@ def build_candidate_context(
             [t, w] for t, w in _span_words(analysis.transcript, end, end + OUTSIDE_WORDS_SEC)
         ],
         "energy_series": energy_series,
+        "hook_features": hook_features(analysis, start, end),
         "action_events": events_near(events or [], start, end),
         "prescore_features": features.to_dict() if features is not None else None,
     }
@@ -428,6 +594,81 @@ def build_candidate_context(
 
 # words_before_start / words_after_end reach this far past each edge.
 OUTSIDE_WORDS_SEC = 5.0
+
+
+def _timed_words(transcript, start: float, end: float) -> list[tuple[float, float, str]]:
+    out: list[tuple[float, float, str]] = []
+    if transcript is None:
+        return out
+    for seg in transcript.segments:
+        if seg.end < start or seg.start > end:
+            continue
+        for w in seg.words:
+            if w.word.strip() and start <= (w.start + w.end) / 2.0 <= end:
+                out.append((w.start, w.end, w.word.strip()))
+    return out
+
+
+def hook_features(analysis: AnalysisReport, start: float, end: float) -> dict:
+    """What a viewer meets first and last, measured the way the QA scorecard
+    measures a finished reel (qa/metrics.py patterns). Pure."""
+    from reelforge_core.qa.metrics import GREETING_RE, TRAILING_RE
+
+    words = _timed_words(analysis.transcript, start, end)
+    if not words:
+        return {"has_speech": False}
+    opening = " ".join(w for s_, _, w in words if s_ - start < 3.0)
+    tail = " ".join(w for _, _, w in words[-5:])
+    greeting = GREETING_RE.search(opening)
+    trailing = TRAILING_RE.search(tail)
+    return {
+        "has_speech": True,
+        "first_word_sec": round(max(0.0, words[0][0] - start), 2),
+        "opening_greeting": greeting.group(0) if greeting else None,
+        "trailing_filler": trailing.group(0).strip() if trailing else None,
+        "ends_on_sentence": words[-1][2].rstrip().endswith((".", "!", "?")),
+    }
+
+
+# Cold opens (CP6): the payoff played first. Validated like every other
+# model-proposed bound: inside the span, clear of its opening, word-safe.
+COLD_OPEN_MIN_SEC = 1.0
+COLD_OPEN_MAX_SEC = 3.5
+COLD_OPEN_CLEAR_SEC = 5.0  # never from the span's first 5s — that IS the opening
+COLD_OPEN_SNAP_SEC = 0.4
+ENDING_WEIGHT = 0.1  # overall += (ending_lands - 50) * this: +-5 points
+
+
+def validate_cold_open(
+    raw: Any, start: float, end: float, analysis: AnalysisReport | None
+) -> tuple[float, float] | None:
+    """The cold open as (start, end) source seconds, or None. Edges inside a
+    word snap outward (<= COLD_OPEN_SNAP_SEC) or the proposal is dropped."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        cs, ce = float(raw["start_sec"]), float(raw["end_sec"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if analysis is not None and analysis.transcript is not None:
+        from reelforge_core.compose.speech_snap import flatten_words, snap_end, snap_start
+
+        words = flatten_words(analysis.transcript)
+
+        def inside(t: float) -> bool:
+            return any(ws < t < we for ws, we in words)
+
+        if inside(cs):
+            cs = snap_start(cs, words, COLD_OPEN_SNAP_SEC)
+        if inside(ce):
+            ce = snap_end(ce, words, COLD_OPEN_SNAP_SEC)
+        if inside(cs) or inside(ce):
+            return None
+    if cs < start + COLD_OPEN_CLEAR_SEC - 1e-6 or ce > end + 1e-6:
+        return None
+    if not COLD_OPEN_MIN_SEC - 1e-6 <= ce - cs <= COLD_OPEN_MAX_SEC + 0.2:
+        return None
+    return (round(cs, 3), round(ce, 3))
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +705,34 @@ def _extract_rankings(resp: Any) -> list[dict]:
     raise RankingError("model did not emit a tool_use block")
 
 
+# Models known to accept `temperature` (passed through extra_body). Add one
+# only after a smoke call proves it; unknown models get no sampling params.
+ACCEPTS_TEMPERATURE = frozenset(
+    {
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251001",
+    }
+)
+
+
+def accepts_temperature(model: str) -> bool:
+    return model in ACCEPTS_TEMPERATURE
+
+
+# Forced tool use (tool_choice "tool"/"any") is rejected by Claude 5 models
+# ("not supported for this model", live 2026-09-30 on claude-opus-5-5 — the
+# long-form sequencer silently fell back to its deterministic order). Those
+# get tool_choice "auto" plus an explicit instruction; the stop_reason check
+# below retries an answer that skipped the tool.
+FORCES_TOOL_CHOICE = ACCEPTS_TEMPERATURE
+
+
+def forces_tool_choice(model: str) -> bool:
+    return model in FORCES_TOOL_CHOICE
+
+
 async def _call_model(
     client: Any,
     *,
@@ -476,22 +745,31 @@ async def _call_model(
     max_tokens: int = 16000,
 ) -> Any:
     last_exc: Exception | None = None
+    forced = forces_tool_choice(model)
     for attempt in range(MAX_RETRIES):
         try:
-            # NOTE: anthropic SDK 1.0.0 removed the `temperature` kwarg from
-            # messages.create, but the API still accepts it for
-            # claude-sonnet-4-5 (verified 2026-08-27), so we pass it through
-            # extra_body for reproducible ranking. If the ranking model ever
-            # moves to a Claude 5 family model that rejects sampling params
-            # (400), drop the extra_body line.
+            # anthropic SDK 1.0.0 removed the `temperature` kwarg; the API
+            # still accepts it for the models in ACCEPTS_TEMPERATURE (verified
+            # for claude-sonnet-4-5 2026-08-27), so it rides extra_body there.
+            # Any other model gets no sampling params — a Claude 5 model that
+            # rejects them would 400 every call. Reproducibility then rests on
+            # the resume stamps, not temperature=0.
+            extra = (
+                {"extra_body": {"temperature": temperature}}
+                if accepts_temperature(model)
+                else {}
+            )
             resp = await client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
-                system=system_prompt,
+                system=system_prompt if forced else (
+                    f"{system_prompt}\n\nRespond ONLY by calling the {tool_name} tool, "
+                    "exactly once, with no other text."
+                ),
                 tools=tools if tools is not None else [RECORD_RANKINGS],
-                tool_choice={"type": "tool", "name": tool_name},
+                tool_choice={"type": "tool", "name": tool_name} if forced else {"type": "auto"},
                 messages=messages,
-                extra_body={"temperature": temperature},
+                **extra,
             )
             stop_reason = getattr(resp, "stop_reason", None)
             if stop_reason not in {"tool_use", None}:
@@ -504,6 +782,11 @@ async def _call_model(
             return resp
         except Exception as exc:
             last_exc = exc
+            if forced and "tool_choice" in str(exc):
+                # A model we assumed could be forced can't: ask instead.
+                log.warning("%s rejects forced tool use; retrying with tool_choice auto", model)
+                forced = False
+                continue
             if not _is_retryable(exc):
                 raise RankingError(f"non-retryable Anthropic error: {exc}") from exc
             delay = min(60, 2**attempt + random.random())
@@ -525,8 +808,12 @@ def _coerce_rankings(
     *,
     candidate_map: dict[str, ReelCandidate],
     prompt_active: bool = False,
+    analysis: AnalysisReport | None = None,
+    weights=None,
 ) -> list[RankedReel]:
-    """Validate + convert raw tool-input entries to RankedReel. Skips extras."""
+    """Validate + convert raw tool-input entries to RankedReel. Skips extras.
+    `analysis` lets cold opens be snapped off words (dropped without it only
+    if they land mid-word — nothing to check against)."""
     seen: set[str] = set()
     out: list[RankedReel] = []
     for entry in rankings:
@@ -539,12 +826,14 @@ def _coerce_rankings(
             continue
         try:
             scores = ReelScores(**entry["scores"])
+            # Learned weights (CP12) replace the hand-set blend when applied.
+            base = weights.combine(scores) if weights is not None else scores.weighted
             relevance: int | None = None
             if prompt_active:
                 relevance = int(entry["prompt_relevance"])  # KeyError -> drop + retry
-                overall = round(0.45 * relevance + 0.55 * scores.weighted, 2)
+                overall = round(0.45 * relevance + 0.55 * base, 2)
             else:
-                overall = round(scores.weighted, 2)
+                overall = round(base, 2)
             candidate = candidate_map[cid]
             rank_position = entry.get("rank_position")
             rank_position = int(rank_position) if rank_position is not None else None
@@ -553,6 +842,15 @@ def _coerce_rankings(
             edit_style = entry.get("content_style")
             if edit_style not in ("classic", "hype", "talking_head", "cinematic", "chill"):
                 edit_style = None
+            ending = entry.get("ending_lands")
+            ending = int(ending) if isinstance(ending, (int, float)) and 0 <= ending <= 100 else None
+            if ending is not None:
+                overall = round(overall + (ending - 50) * ENDING_WEIGHT, 2)
+            tail = entry.get("trim_tail_words")
+            tail = int(tail) if isinstance(tail, (int, float)) and 0 <= tail <= 8 else None
+            cold = validate_cold_open(
+                entry.get("cold_open"), candidate.start_sec, candidate.end_sec, analysis
+            )
             reel = RankedReel(
                 candidate_id=cid,
                 scene_indices=candidate.scene_indices,
@@ -571,6 +869,9 @@ def _coerce_rankings(
                 rank_position=rank_position,
                 opening_description=opening,
                 edit_style=edit_style,
+                ending_lands=ending,
+                cold_open=cold,
+                tail_trim_words=tail,
             )
         except Exception as exc:
             log.warning(
@@ -581,9 +882,35 @@ def _coerce_rankings(
             continue
         seen.add(cid)
         out.append(reel)
+    out = blend_rank_positions(out)
     # Sort so the model's explicit listwise order breaks overall-score ties
     # (dedup's stable overall-desc sort then preserves this ordering).
     out.sort(key=lambda r: (-r.overall, r.rank_position if r.rank_position is not None else 1 << 30))
+    return out
+
+
+# CP7: the model's own list order carries information its per-dimension
+# scores flatten (it is told to rank first, then score). Borda-style: first
+# place +BORDA_WEIGHT/2, last -BORDA_WEIGHT/2, linear between. Set without
+# labels to tune on — conservative on purpose; revisit with eval-select.
+BORDA_WEIGHT = 8.0
+
+
+def blend_rank_positions(reels: list[RankedReel], weight: float = BORDA_WEIGHT) -> list[RankedReel]:
+    """overall += weight * (borda - 0.5), borda 1 for the model's first pick
+    down to 0 for its last (ties share a place). Reels without a
+    rank_position are untouched. Pure."""
+    placed = sorted({r.rank_position for r in reels if r.rank_position is not None})
+    if len(placed) < 2 or weight == 0:
+        return reels
+    place = {p: i for i, p in enumerate(placed)}
+    out = []
+    for r in reels:
+        if r.rank_position is None:
+            out.append(r)
+            continue
+        borda = 1.0 - place[r.rank_position] / (len(placed) - 1)
+        out.append(r.model_copy(update={"overall": round(r.overall + weight * (borda - 0.5), 2)}))
     return out
 
 
@@ -704,7 +1031,10 @@ async def _rank_once(
     rankings_raw = _extract_rankings(resp)
     usage = _accumulate_usage(resp)
 
-    ranked = _coerce_rankings(rankings_raw, candidate_map=candidate_map, prompt_active=prompt_active)
+    ranked = _coerce_rankings(
+        rankings_raw, candidate_map=candidate_map, prompt_active=prompt_active, analysis=analysis,
+        weights=active_weights(config),
+    )
     missing = [c.candidate_id for c in batch if c.candidate_id not in {r.candidate_id for r in ranked}]
 
     # One targeted retry for missing candidates.
@@ -748,7 +1078,10 @@ async def _rank_once(
             usage2 = _accumulate_usage(resp2)
             usage.input_tokens += usage2.input_tokens
             usage.output_tokens += usage2.output_tokens
-            ranked2 = _coerce_rankings(rankings2, candidate_map=candidate_map, prompt_active=prompt_active)
+            ranked2 = _coerce_rankings(
+                rankings2, candidate_map=candidate_map, prompt_active=prompt_active, analysis=analysis,
+                weights=active_weights(config),
+            )
             # Merge: prefer the second response's entry when it covers a candidate
             by_id = {r.candidate_id: r for r in ranked}
             for r in ranked2:

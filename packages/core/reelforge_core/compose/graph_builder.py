@@ -80,6 +80,57 @@ def _transition_duration(config: ComposeConfig) -> float:
     return 0.04 if config.transition.kind == "cut" else config.transition.duration_sec
 
 
+CAPTION_FONTS_DIR = "/app/assets/fonts"
+
+# The first ~20ms of the bus escape the limiter (nothing is in its lookahead
+# yet): a skate mix measured +4.6 dBTP in its first 10-20ms and nowhere
+# else. A 30ms fade at each end removes that transient and the end click.
+EDGE_FADE_SEC = 0.03
+
+
+def framing_window(key, width: int, height: int) -> tuple[int, int, int, int]:
+    """(scaled w, scaled h, crop x, crop y) for one framing key: the frame
+    scaled UP by `zoom`, then a fixed output-sized window centred on
+    (cx, cy) and kept inside it. Even sizes. Pure."""
+    _t, zoom, cx, cy = key
+    zoom = max(1.0, float(zoom))
+    sw = max(width, int(round(width * zoom / 2.0)) * 2)
+    sh = max(height, int(round(height * zoom / 2.0)) * 2)
+    x = int(round(min(max(cx * sw - width / 2.0, 0.0), sw - width)))
+    y = int(round(min(max(cy * sh - height / 2.0, 0.0), sh - height)))
+    return sw, sh, x, y
+
+
+TRUE_PEAK_HEADROOM_DB = 1.0
+
+
+def edge_fades(total_duration: float) -> str:
+    fade_out_at = max(0.0, total_duration - EDGE_FADE_SEC)
+    return (
+        f"afade=t=in:d={EDGE_FADE_SEC}"
+        f",afade=t=out:st={fade_out_at:.3f}:d={EDGE_FADE_SEC}"
+    )
+
+
+def voice_chain(effects) -> str | None:
+    """Dialogue cleanup before the voice loudnorm, or None when off.
+
+    high-pass (rumble, handling noise) -> optional denoise -> gentle 3:1
+    compression -> +2 dB presence at 3 kHz -> de-ess. Denoise only on talky
+    reels: on action footage the "noise" IS the content (waves, wheels)."""
+    if not getattr(effects, "voice_enhance", False):
+        return None
+    parts = ["highpass=f=75"]
+    if getattr(effects, "voice_denoise", "off") == "on":
+        parts.append("afftdn=nr=10:nf=-40")
+    parts += [
+        "acompressor=threshold=0.1:ratio=3:attack=10:release=150:makeup=1",
+        "equalizer=f=3000:t=q:w=1.0:g=2",
+        "deesser=i=0.4",
+    ]
+    return ",".join(parts)
+
+
 # Cloned frames appended to every clip's video (see the end guard in
 # build_final_command). Comfortably more than one frame at any output fps.
 CLIP_END_PAD_SEC = 0.25
@@ -193,11 +244,14 @@ def build_final_command(
     transitions: list[tuple[str, float]] | None = None,
     voiceovers: list[tuple[Path, float, float]] | None = None,
     layers: list | None = None,
+    final_pass: bool = True,
+    sfx: list[tuple[Path, float]] | None = None,
 ) -> RenderPlan:
     """`voiceovers`: (path, start_sec on the mezzanine, linear gain) per take.
     Muted takes should be omitted by the caller. `layers`: rendered
     `compose.layers.LayerInput`s (B-roll) composited over the main picture —
-    final pass only, never chunk parts."""
+    final pass only, never chunk parts. `sfx`: (file, start_sec) cues from
+    compose/sfx.py, mixed under the finished bus — final pass only too."""
     if not clips:
         raise ValueError("build_final_command requires at least one clip")
 
@@ -233,6 +287,11 @@ def build_final_command(
             len(clips) + (1 if music_path is not None else 0) + len(vo_inputs) + len(layer_indices)
         )
         args += ["-i", str(layer.path)]
+    sfx_inputs: list[tuple[int, float]] = []  # (input index, start)
+    if final_pass:
+        for sfx_file, sfx_start in sfx or []:
+            sfx_inputs.append((args.count("-i"), sfx_start))
+            args += ["-i", str(sfx_file)]
 
     graph = FilterGraph()
 
@@ -282,7 +341,44 @@ def build_final_command(
                 and clip.scene_index in low_energy_by_idx
             )
         )
-        if not clip.is_photo and clip.punch_in is not None:
+        if not clip.is_photo and clip.framing_keys:
+            # Framing changes within the shot. The frame is scaled UP by the
+            # key's zoom and a FIXED output-sized crop picks the window, both
+            # named so one `sendcmd` per key (a single interval each —
+            # `_ffescape` leaves ';', which the graph parser splits on) can
+            # retarget them. Never resize a crop mid-stream instead: on
+            # ffmpeg 5.1 GROWING a crop's w/h through a command wedges the
+            # graph forever (2026-09-30: a beach reel hung at the first
+            # tight -> wide key); shrinking works, which hid it in the spike.
+            sname, cname = f"scale@fk{i}", f"crop@fc{i}"
+            sw0, sh0, x0, y0 = framing_window(clip.framing_keys[0], width, height)
+            prev = v_prep_out
+            for k, key in enumerate(clip.framing_keys[1:], start=1):
+                sw, sh, x, y = framing_window(key, width, height)
+                out = f"[fk{i}s{k}]"
+                graph.add(
+                    FilterNode(
+                        filter_name="sendcmd",
+                        inputs=[prev],
+                        outputs=[out],
+                        args={
+                            "c": (
+                                f"{key[0]:.3f} {sname} w {sw}, {sname} h {sh}, "
+                                f"{cname} x {x}, {cname} y {y}"
+                            )
+                        },
+                    )
+                )
+                prev = out
+            graph.add(
+                FilterNode(
+                    filter_name=f"{sname}=w={sw0}:h={sh0}"
+                    f",{cname}=w={width}:h={height}:x={x0}:y={y0},setsar=1",
+                    inputs=[prev],
+                    outputs=[v_out],
+                )
+            )
+        elif not clip.is_photo and clip.punch_in is not None:
             # Punch-in: digital zoom in the graph (clip stays cache-shareable).
             zoom = min(1.6, max(1.01, clip.punch_in))
             sw = int(width * zoom / 2) * 2
@@ -433,8 +529,8 @@ def build_final_command(
                 inputs=[v_chain],
                 outputs=[next_v],
                 args={
-                    "luma_msize_x": 5,
-                    "luma_msize_y": 5,
+                    "luma_msize_x": 3,
+                    "luma_msize_y": 3,
                     "luma_amount": f"{config.effects.unsharp_amount:.2f}",
                 },
             )
@@ -468,7 +564,9 @@ def build_final_command(
                 outputs=[next_v],
                 args={
                     "filename": str(captions_path),
-                    "fontsdir": "/usr/share/fonts/truetype/inter",
+                    # The bundled caption fonts (Montserrat, see Dockerfile);
+                    # system fonts (Inter) still resolve through fontconfig.
+                    "fontsdir": CAPTION_FONTS_DIR,
                 },
             )
         )
@@ -583,7 +681,11 @@ def build_final_command(
         )
         a_chain = "[voice_pre]"
 
-    # ----- audio: loudnorm voice, then mix with optional music bed -----
+    # ----- audio: clean up dialogue, loudnorm voice, then mix with music -----
+    voice_fx = voice_chain(config.effects) if final_pass else None
+    if voice_fx:
+        graph.add(FilterNode(filter_name=voice_fx, inputs=[a_chain], outputs=["[voice_clean]"]))
+        a_chain = "[voice_clean]"
     graph.add(
         FilterNode(
             filter_name="loudnorm",
@@ -656,6 +758,40 @@ def build_final_command(
     else:
         a_pre_final = "[voice]"
 
+    # Sound effects sit under the finished voice+music bus, ahead of the
+    # final loudnorm/limiter so the level target and peak ceiling still hold.
+    if sfx_inputs:
+        sfx_labels = []
+        for j, (idx, start) in enumerate(sfx_inputs):
+            label = f"[sfx{j}]"
+            delay_ms = int(round(start * 1000))
+            graph.add(
+                FilterNode(
+                    filter_name=(
+                        "aformat=sample_rates=48000:channel_layouts=stereo,"
+                        f"volume={config.effects.sfx_gain_db:.1f}dB,"
+                        f"adelay={delay_ms}|{delay_ms}"
+                    ),
+                    inputs=[f"[{idx}:a]"],
+                    outputs=[label],
+                )
+            )
+            sfx_labels.append(label)
+        graph.add(
+            FilterNode(
+                filter_name="amix",
+                inputs=[a_pre_final, *sfx_labels],
+                outputs=["[asfx]"],
+                args={
+                    "inputs": 1 + len(sfx_labels),
+                    "duration": "first",
+                    "dropout_transition": 0,
+                    "normalize": 0,
+                },
+            )
+        )
+        a_pre_final = "[asfx]"
+
     # Final-bus loudness normalization. The per-stem loudnorms above set the
     # *balance* (voice vs music); this pass pins the finished mix to the
     # social-platform target so amix's input scaling and stem summing can't
@@ -680,22 +816,35 @@ def build_final_command(
         # settles during the first seconds; the brick-wall keeps sample peaks
         # at the configured true-peak ceiling. latency=1 compensates the
         # limiter's lookahead delay so audio stays in sync with video.
-        limit_linear = 10 ** (config.loudness_true_peak_db / 20.0)
+        # The limiter sees SAMPLES; the -1 dBTP delivery spec is TRUE peak
+        # (between samples), and the AAC encode adds its own overshoot — a
+        # dense music section measured -0.6 dBTP with the limiter at -1.5
+        # dBFS (2026-09-30). TRUE_PEAK_HEADROOM_DB below the target keeps
+        # the delivered file under it.
+        limit_linear = 10 ** ((config.loudness_true_peak_db - TRUE_PEAK_HEADROOM_DB) / 20.0)
         graph.add(
             FilterNode(
+                # Limit at loudnorm's 192 kHz — 4x oversampled — THEN come
+                # down to 48 kHz: a 48 kHz limiter can't see peaks between
+                # samples; a GoPro transient in a long mix measured -0.9 dBTP
+                # with the ceiling at -2.5 dBFS (2026-09-30), -2.1 oversampled.
                 filter_name=(
+                    "aformat=channel_layouts=stereo,"
+                    f"alimiter=limit={limit_linear:.4f}:level=false:latency=true,"
                     "aresample=48000,"
-                    "aformat=sample_rates=48000:channel_layouts=stereo,"
-                    f"alimiter=limit={limit_linear:.4f}:level=false:latency=true"
+                    "aformat=sample_rates=48000:channel_layouts=stereo"
+                    + ("," + edge_fades(total_duration) if final_pass else "")
                 ),
                 inputs=["[anorm]"],
                 outputs=["[afinal]"],
             )
         )
     else:
+        # Chunk parts are joined later: fading their edges would dip the
+        # audio at every join, so only the finished mezzanine gets them.
         graph.add(
             FilterNode(
-                filter_name="anull",
+                filter_name=edge_fades(total_duration) if final_pass else "anull",
                 inputs=[a_pre_final],
                 outputs=["[afinal]"],
             )

@@ -139,6 +139,7 @@ async def caption_preview(
     # Minimal: render a single frame with captions burned in via subtitles filter.
     # For simplicity we use the compose pipeline's existing ASS generation:
     from reelforge_core.compose.captions import build_captions
+    from reelforge_core.compose.graph_builder import CAPTION_FONTS_DIR
     from reelforge_core.models import CaptionStyle, ComposeConfig
 
     cfg = ComposeConfig(captions=CaptionStyle(mode=style))  # type: ignore[arg-type]
@@ -154,7 +155,7 @@ async def caption_preview(
     )
     if style != "off" and analysis.transcript is not None:
         vf += (
-            f",subtitles={ass_path}:fontsdir=/usr/share/fonts/truetype/inter"
+            f",subtitles={ass_path}:fontsdir={CAPTION_FONTS_DIR}"
         )
 
     cmd = [

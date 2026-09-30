@@ -21,7 +21,20 @@ from reelforge_core.models import MOOD_VALUES, AnalysisReport, UsageTotals
 
 log = logging.getLogger(__name__)
 
-MIX_PROMPT_VERSION = "m2"
+MIX_PROMPT_VERSION = "m4"  # m4: long-form chapters, priorities, intro, re-hook
+# Plain-text words sent per long-form section (timestamps would cost ~4x):
+# up to SECTION_TEXT_WORDS_LONG each, cut at a sentence end, within a total
+# budget so a 40-section pool stays a sane prompt.
+SECTION_TEXT_WORDS = 240
+SECTION_TEXT_WORDS_LONG = 400
+LONG_TEXT_BUDGET_WORDS = 12000
+# Long-form sequencing is the whole story's structure: the strongest model.
+LONG_FORM_MODEL = "claude-opus-5-5"
+INTRO_MAX_SEC = 30.0
+INTRO_LINE_MIN_SEC = 1.5
+INTRO_LINE_MAX_SEC = 8.0
+INTRO_MAX_LINES = 4
+SENTENCE_TRIM_MIN_SEC = 10.0
 TRIM_MAX_SEC = 1.0
 MIN_SHOT_SEC = 0.5
 MIN_SEQUENCE_LEN = 3
@@ -73,6 +86,24 @@ LONG_FORM_NOTE = (
     "using a minority of the pool is NOT expected."
 )
 
+LONG_FORM_STRUCTURE = (
+    "\n\nRETENTION STRUCTURE (long-form)\n"
+    "- keep_priority (1-5) on every chosen section: 5 = the video fails "
+    "without it, 1 = nice to have. If the video runs long, low-priority "
+    "sections are shortened or cut first.\n"
+    "- chapter_title on the section that STARTS each chapter: the first "
+    "chosen section always starts one; aim for one chapter per 1-3 minutes, "
+    "at least 3; titles are short, specific and promise what the chapter "
+    "delivers (not 'Part 2').\n"
+    "- intro_lines: 3-4 short, punchy lines (each 2-7s, together under 25s) "
+    "cut from the chosen sections — absolute start_sec/end_sec inside that "
+    "section, between words. They play FIRST as a cold-open montage, so the "
+    "first one must state or confirm the title's promise and the set should "
+    "make a viewer need the rest. Never a greeting.\n"
+    "- rehook_text: a short 'coming up' teaser (<= 60 chars) for the second "
+    "half, shown near the midpoint to stop mid-video drop-off."
+)
+
 USER_DIRECTION_TEMPLATE = (
     "\n\nUSER DIRECTION\n"
     'The user asked for: "{prompt}"\n'
@@ -110,6 +141,26 @@ RECORD_MIX: dict[str, Any] = {
 }
 
 
+RECORD_MIX_LONG: dict[str, Any] = json.loads(json.dumps(RECORD_MIX))
+_ITEM = RECORD_MIX_LONG["input_schema"]["properties"]["sequence"]["items"]["properties"]
+_ITEM["keep_priority"] = {"type": "integer", "minimum": 1, "maximum": 5}
+_ITEM["chapter_title"] = {"type": ["string", "null"], "maxLength": 60}
+RECORD_MIX_LONG["input_schema"]["properties"]["intro_lines"] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "moment_id": {"type": "string"},
+            "start_sec": {"type": "number"},
+            "end_sec": {"type": "number"},
+        },
+        "required": ["moment_id", "start_sec", "end_sec"],
+    },
+}
+RECORD_MIX_LONG["input_schema"]["properties"]["rehook_text"] = {"type": ["string", "null"], "maxLength": 60}
+del _ITEM
+
+
 @dataclass
 class SequencedMix:
     shots: list[tuple[str, float, float]]  # (asset_id, in_ts, out_ts)
@@ -119,12 +170,31 @@ class SequencedMix:
     content_style: str
     reasons: list[str] = field(default_factory=list)
     fallback: bool = False
+    # Long-form (CP11), aligned with `shots`: keep priority 1-5 and the
+    # chapter title a shot starts (None = continues the current chapter).
+    priorities: list[int] = field(default_factory=list)
+    chapter_titles: list[str | None] = field(default_factory=list)
+    intro: list[tuple[str, float, float]] = field(default_factory=list)
+    rehook_text: str | None = None
+
+
+def _sentence_text(words: list[str], limit: int) -> str:
+    """At most `limit` words, cut back to the last sentence end when there
+    is one past the halfway mark. Pure."""
+    if len(words) <= limit:
+        return " ".join(words)
+    cut = words[:limit]
+    for i in range(len(cut) - 1, limit // 2, -1):
+        if cut[i].rstrip().endswith((".", "!", "?")):
+            return " ".join(cut[: i + 1])
+    return " ".join(cut) + " …"
 
 
 def build_moment_context(
     moment: MinedMoment,
     analysis: AnalysisReport | None,
     asset_name: str,
+    text_words: int = SECTION_TEXT_WORDS,
 ) -> dict:
     """The JSON block the sequencer sees for one moment. Pure."""
     from reelforge_core.reels.rank import _span_words
@@ -155,9 +225,16 @@ def build_moment_context(
         "features": moment.features.to_dict(),
         "scene_summary": summary,
         "tags": tags[:7],
-        # Long-form sections (20s+) need enough of what's said to be placed
-        # in a sensible order; highlights stay compact.
-        "transcript_words": [[t, w] for t, w in words[: 80 if c.duration_sec >= 20 else 24]],
+        # The opening words keep their timestamps (trims act at the edges).
+        # Long-form sections (20s+) also carry what the WHOLE section says:
+        # at most 80 words (~25s of speech) left the model ordering 20-90s
+        # sections from their first sentence alone.
+        "transcript_words": [[t, w] for t, w in words[:24]],
+        **(
+            {"transcript_text": _sentence_text([w for _, w in words], text_words)}
+            if c.duration_sec >= 20 and len(words) > 24
+            else {}
+        ),
         "energy_peak_z": moment.features.energy_peak_z,
     }
 
@@ -167,8 +244,11 @@ def validate_sequence(
     pool: list[MinedMoment],
     target_sec: float,
     analyses: dict[str, AnalysisReport | None],
+    long_form: bool = False,
 ) -> SequencedMix:
-    """Coerce the model's answer into a safe sequence. Pure."""
+    """Coerce the model's answer into a safe sequence. Pure. Long-form also
+    keeps priorities, chapter starts, the intro montage and the re-hook, and
+    fits length by trimming sentences before dropping sections."""
     from reelforge_core.compose.speech_snap import flatten_words, snap_end, snap_start
 
     by_id = {m.moment_id: m for m in pool}
@@ -197,6 +277,7 @@ def validate_sequence(
     entries: list[tuple[MinedMoment, float, float]] = []
     seen: set[str] = set()
     reasons: list[str] = []
+    meta: dict[str, tuple[int, str | None]] = {}  # moment_id -> (priority, chapter)
 
     def _dup_of_kept(aid: str, in_ts: float, out_ts: float) -> bool:
         for kept, ki, ko in entries:
@@ -239,6 +320,11 @@ def validate_sequence(
                 continue
             seen.add(m.moment_id)
             entries.append((m, round(in_ts, 3), round(out_ts, 3)))
+            prio = item.get("keep_priority")
+            prio = int(prio) if isinstance(prio, (int, float)) and 1 <= prio <= 5 else 3
+            chap = item.get("chapter_title")
+            chap = str(chap).strip()[:60] if isinstance(chap, str) and chap.strip() else None
+            meta[m.moment_id] = (prio, chap)
             if item.get("reason"):
                 reasons.append(str(item["reason"])[:120])
         except (TypeError, ValueError):
@@ -249,8 +335,15 @@ def validate_sequence(
     def _total(es):
         return sum(o - i for _, i, o in es)
 
+    if long_form:
+        entries = _fit_long_form(entries, meta, target_sec * (1 + TARGET_BAND), analyses)
     while _total(entries) > target_sec * (1 + TARGET_BAND) and len(entries) > MIN_SEQUENCE_LEN:
-        weakest = min(entries, key=lambda e: e[0].score)
+        if long_form:
+            # Never the opening or the closing section; lowest priority first.
+            middle = entries[1:-1] or entries
+            weakest = min(middle, key=lambda e: (meta.get(e[0].moment_id, (3, None))[0], e[0].score))
+        else:
+            weakest = min(entries, key=lambda e: e[0].score)
         entries.remove(weakest)
 
     # Under-length: top up with the best unused pool moments, inserted just
@@ -282,7 +375,7 @@ def validate_sequence(
     style = raw.get("content_style")
     if style not in STYLE_ENUM:
         style = "classic"
-    return SequencedMix(
+    mix = SequencedMix(
         shots=[(m.asset_id, i, o) for m, i, o in entries],
         title=str(raw.get("title") or "Project mix")[:60],
         hook=str(raw.get("hook") or "")[:140],
@@ -290,6 +383,103 @@ def validate_sequence(
         content_style=style,
         reasons=reasons,
     )
+    if long_form:
+        mix.priorities = [meta.get(m.moment_id, (3, None))[0] for m, _, _ in entries]
+        mix.chapter_titles = [meta.get(m.moment_id, (3, None))[1] for m, _, _ in entries]
+        mix.intro = validate_intro(raw.get("intro_lines"), by_id, analyses)
+        rehook = raw.get("rehook_text")
+        if isinstance(rehook, str):
+            # The overlay adds "Coming up:" itself; the model often does too.
+            import re as _re
+
+            rehook = _re.sub(r"^\s*coming up\s*[:\-–—]?\s*", "", rehook, flags=_re.I).strip()
+        mix.rehook_text = str(rehook)[:60] if isinstance(rehook, str) and rehook else None
+    return mix
+
+
+def _fit_long_form(
+    entries: list[tuple[MinedMoment, float, float]],
+    meta: dict[str, tuple[int, str | None]],
+    limit: float,
+    analyses: dict[str, AnalysisReport | None],
+) -> list[tuple[MinedMoment, float, float]]:
+    """Shorten before cutting: trim the lowest-priority sections back to an
+    earlier sentence end (keeping >= SENTENCE_TRIM_MIN_SEC and half the
+    section) until the total fits or nothing trims. Pure."""
+    from reelforge_core.reels.generators.sentence import build_units
+
+    units_cache: dict[str, list] = {}
+
+    def units(aid: str) -> list:
+        if aid not in units_cache:
+            a = analyses.get(aid)
+            units_cache[aid] = build_units(a.transcript) if a is not None else []
+        return units_cache[aid]
+
+    out = list(entries)
+    guard = 0
+    while sum(o - i for _, i, o in out) > limit and guard < 500:
+        guard += 1
+        best = None
+        for idx, (m, i, o) in enumerate(out):
+            keep = max(SENTENCE_TRIM_MIN_SEC, (o - i) * 0.5)
+            ends = [u.end for u in units(m.asset_id) if i + keep <= u.end < o - 1.0]
+            if not ends:
+                continue
+            prio = meta.get(m.moment_id, (3, None))[0]
+            cand = (prio, -(o - i), idx, round(max(ends), 3))
+            if best is None or cand < best:
+                best = cand
+        if best is None:
+            break
+        _, _, idx, new_out = best
+        m, i, _o = out[idx]
+        out[idx] = (m, i, new_out)
+    return out
+
+
+def validate_intro(
+    raw: Any,
+    by_id: dict[str, MinedMoment],
+    analyses: dict[str, AnalysisReport | None],
+) -> list[tuple[str, float, float]]:
+    """The cold-open intro montage: up to INTRO_MAX_LINES lines, each inside
+    its moment, 1.5-8s, snapped off words (or dropped), no two overlapping,
+    together <= INTRO_MAX_SEC. Pure."""
+    from reelforge_core.compose.speech_snap import flatten_words, snap_end, snap_start
+
+    out: list[tuple[str, float, float]] = []
+    total = 0.0
+    for item in raw if isinstance(raw, list) else []:
+        try:
+            m = by_id.get(str(item.get("moment_id")))
+            if m is None:
+                continue
+            s, e = float(item["start_sec"]), float(item["end_sec"])
+        except (TypeError, ValueError, KeyError, AttributeError):
+            continue
+        s = max(s, m.candidate.start_sec)
+        e = min(e, m.candidate.end_sec)
+        a = analyses.get(m.asset_id)
+        words = flatten_words(a.transcript) if a is not None and a.transcript else []
+        if words:
+            if any(ws < s < we for ws, we in words):
+                s = snap_start(s, words, 0.4)
+            if any(ws < e < we for ws, we in words):
+                e = snap_end(e, words, 0.4)
+            if any(ws < s < we for ws, we in words) or any(ws < e < we for ws, we in words):
+                continue
+        if not INTRO_LINE_MIN_SEC <= e - s <= INTRO_LINE_MAX_SEC + 0.3:
+            continue
+        if total + (e - s) > INTRO_MAX_SEC:
+            break
+        if any(aid == m.asset_id and min(e, oe) - max(s, os_) > 0 for aid, os_, oe in out):
+            continue
+        out.append((m.asset_id, round(s, 3), round(e, 3)))
+        total += e - s
+        if len(out) >= INTRO_MAX_LINES:
+            break
+    return out if len(out) >= 2 else []
 
 
 def fallback_sequence(pool: list[MinedMoment], target_sec: float) -> SequencedMix:
@@ -359,9 +549,15 @@ async def sequence_mix(
 
     from reelforge_core.mixes.mining import LONG_FORM_THRESHOLD_SEC
 
+    long_form = target_sec > LONG_FORM_THRESHOLD_SEC
     system = MIX_SYSTEM_PROMPT
-    if target_sec > LONG_FORM_THRESHOLD_SEC:
-        system += LONG_FORM_NOTE.format(minutes=target_sec / 60.0)
+    if long_form:
+        system += LONG_FORM_NOTE.format(minutes=target_sec / 60.0) + LONG_FORM_STRUCTURE
+    text_words = (
+        min(SECTION_TEXT_WORDS_LONG, max(80, LONG_TEXT_BUDGET_WORDS // max(1, len(pool))))
+        if long_form
+        else SECTION_TEXT_WORDS
+    )
     if prompt:
         system += USER_DIRECTION_TEMPLATE.format(prompt=prompt)
 
@@ -396,7 +592,8 @@ async def sequence_mix(
             except OSError:
                 pass
         ctx = build_moment_context(
-            m, analyses.get(m.asset_id), asset_names.get(m.asset_id, m.asset_id[:8])
+            m, analyses.get(m.asset_id), asset_names.get(m.asset_id, m.asset_id[:8]),
+            text_words=text_words,
         )
         blocks.append({"type": "text", "text": json.dumps(ctx)})
 
@@ -407,13 +604,13 @@ async def sequence_mix(
             temperature=0.0,
             system_prompt=system,
             messages=[{"role": "user", "content": blocks}],
-            tools=[RECORD_MIX],
+            tools=[RECORD_MIX_LONG if long_form else RECORD_MIX],
             tool_name="record_mix",
-            max_tokens=8000,
+            max_tokens=16000 if long_form else 8000,
         )
         raw = _extract_mix(resp)
         usage = _accumulate_usage(resp)
-        mix = validate_sequence(raw, pool, target_sec, analyses)
+        mix = validate_sequence(raw, pool, target_sec, analyses, long_form=long_form)
         return mix, usage
     except Exception as exc:
         log.warning("mix sequencing failed; using deterministic fallback: %s", exc)

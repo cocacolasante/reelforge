@@ -18,24 +18,34 @@ log = logging.getLogger(__name__)
 ATTRIBUTION_REQUIRED_PREFIXES = ("CC-BY",)
 
 
+def _credit_line(track: dict) -> str | None:
+    license_id = (track.get("license") or "").upper()
+    attribution = track.get("attribution")
+    if not attribution or not license_id.startswith(ATTRIBUTION_REQUIRED_PREFIXES):
+        return None
+    return attribution if attribution.lower().startswith("music") else f"Music: {attribution}"
+
+
 def music_credit_for_reel(asset_id: str, reel_id: str, data_dir: Path) -> str | None:
-    """Credit line for the reel's rendered music, or None (no music / no
-    attribution required / manifest unreadable — never raises)."""
+    """Credit line(s) for the reel's rendered music, or None (no music / no
+    attribution required / manifest unreadable — never raises). A long-form
+    bed that changed track per chapter (CP11) credits every track it used."""
     manifest = data_dir / "working" / asset_id / "reels" / reel_id / "compose.json"
     try:
         data = json.loads(manifest.read_text())
     except Exception:
         return None
-    track = data.get("chosen_music")
-    if not track:
-        return None
-    license_id = (track.get("license") or "").upper()
-    attribution = track.get("attribution")
-    if not attribution:
-        return None
-    if not license_id.startswith(ATTRIBUTION_REQUIRED_PREFIXES):
-        return None
-    return attribution if attribution.lower().startswith("music") else f"Music: {attribution}"
+    tracks = [data.get("chosen_music")] + list(
+        ((data.get("music_section") or {}).get("tracks")) or []
+    )
+    lines: list[str] = []
+    for track in tracks:
+        if not track:
+            continue
+        line = _credit_line(track)
+        if line and line not in lines:
+            lines.append(line)
+    return "\n".join(lines) if lines else None
 
 
 def append_credit(text: str, credit: str | None) -> str:
