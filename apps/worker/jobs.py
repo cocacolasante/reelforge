@@ -209,7 +209,11 @@ async def compose_reel_job(
     wd = working_dir_for(asset_id)
     analysis_path = wd / "analysis.json"
     reels_path = wd / "reels.json"
-    if not analysis_path.exists() or not reels_path.exists():
+    # A mix carries its own RankedReel stub, so it only needs the analysis:
+    # a project that went straight to an AI mix never ran selection, and
+    # requiring reels.json made re-rendering one fail (2026-09-20).
+    needs_selection = reel_stub is None
+    if not analysis_path.exists() or (needs_selection and not reels_path.exists()):
         msg = (
             f"missing analysis/reels for asset {asset_id}. Run analyze and "
             f"select before compose."
@@ -220,14 +224,22 @@ async def compose_reel_job(
 
     try:
         analysis = AnalysisReport.model_validate_json(analysis_path.read_text())
-        selection = ReelSelection.model_validate_json(reels_path.read_text())
+        selection = (
+            ReelSelection.model_validate_json(reels_path.read_text())
+            if reels_path.exists()
+            else None
+        )
     except Exception as exc:
         tb = traceback.format_exc()
         await db.record_job_failure(job_id, str(exc), tb)
         await write_terminal(redis, job_id, "error", str(exc))
         raise
 
-    reel = next((r for r in selection.reels if r.candidate_id == reel_id), None)
+    reel = (
+        next((r for r in selection.reels if r.candidate_id == reel_id), None)
+        if selection is not None
+        else None
+    )
     if reel is None and reel_stub is not None:
         # Synthetic reels (AI mixes) live only as DB rows; the API passes a
         # stub built from the row so compose works without a reels.json entry.
@@ -595,6 +607,98 @@ async def publish_reel_job(ctx: dict, publication_id: str) -> dict:
 # ---------------------------------------------------------------------------
 # create_mix_job (AI Mix: cross-clip reels)
 # ---------------------------------------------------------------------------
+
+
+def _cut_request(project_id: str, sources: list, opts: dict):
+    """The options an agent passed, as the cut pipeline's own request."""
+    from apps.worker.agent_cut import CutRequest
+    from apps.worker.delivery import parse_channels
+
+    return CutRequest(
+        project_id=project_id,
+        sources=[tuple(s) for s in sources],
+        top_k=int(opts.get("top_k") or 3),
+        min_sec=opts.get("min_sec"),
+        max_sec=opts.get("max_sec"),
+        prompt=opts.get("prompt"),
+        aspect=str(opts.get("aspect") or "9:16"),
+        delivery=parse_channels(
+            opts.get("delivery"), os.environ.get("REELFORGE_DELIVERY_DEFAULT", "links")
+        ),
+        project_name=str(opts.get("project_name") or "your footage"),
+    )
+
+
+async def agent_cut_job(
+    ctx: dict,
+    project_id: str,
+    mode: str,
+    sources: list,  # [(asset_id, source_path, filename)]
+    options: dict | None = None,
+    mix_id: str | None = None,
+    primary_asset_id: str | None = None,
+) -> dict:
+    """One agent request, start to finish: analyze whatever is unanalyzed,
+    then either cut short reels or build one long video.
+
+    The agent polls this single job rather than driving four. For the long
+    mode the mix pipeline is CALLED, not copied — `create_mix_job` already
+    mines, sequences, persists the timeline and renders, and it records its
+    own progress and result against this same job row.
+    """
+    from apps.worker.agent_cut import (
+        CutRequest,
+        cut_reels,
+        ensure_analyses,
+        export_and_deliver_long,
+    )
+    from apps.worker.delivery import parse_channels
+
+    job_id = ctx["job_id"]
+    redis = ctx["redis"]
+    opts = options or {}
+    extra = {"job_id": job_id, "project_id": project_id}
+    log.info("agent_cut_job start (%s)", mode, extra=extra)
+    await db.record_job_start(job_id, kind="agent_cut", asset_id=primary_asset_id)
+    on_progress = make_throttled_progress_writer(redis, job_id)
+
+    try:
+        if mode == "long":
+            if not (mix_id and primary_asset_id):
+                raise ValueError("long mode needs a mix id and a primary clip")
+            # The mix pipeline loads analysis.json for every source, so the
+            # footage has to be analyzed before it starts.
+            analyses = await ensure_analyses(sources, on_progress)
+            if len(analyses) < 2:
+                raise RuntimeError(
+                    "a long video needs at least 2 clips that could be read; "
+                    f"{len(analyses)} of {len(sources)} were usable"
+                )
+            usable = [s for s in sources if s[0] in analyses]
+            mix_result = await create_mix_job(
+                ctx, project_id, mix_id, primary_asset_id, usable, opts
+            )
+            # create_mix_job already recorded success for the render; the
+            # delivered result replaces it so the agent sees the file too.
+            result = await export_and_deliver_long(
+                mix_id, primary_asset_id, _cut_request(project_id, sources, opts), mix_result
+            )
+            await db.record_job_success(job_id, result)
+            log.info("agent_cut_job delivered long video", extra=extra)
+            return result
+
+        result = await cut_reels(_cut_request(project_id, sources, opts), on_progress)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        log.error("agent_cut_job failed: %s", exc, extra=extra, exc_info=True)
+        await db.record_job_failure(job_id, str(exc), tb)
+        await write_terminal(redis, job_id, "error", str(exc))
+        raise
+
+    await db.record_job_success(job_id, result)
+    await write_terminal(redis, job_id, "done", "done")
+    log.info("agent_cut_job done: %d clip(s)", len(result.get("clips", [])), extra=extra)
+    return result
 
 
 async def create_mix_job(

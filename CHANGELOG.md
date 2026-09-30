@@ -4,7 +4,61 @@ Format per [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Fixed
+- **The public tunnel no longer exposes the whole API.** It was forwarding
+  every path on `reelforge.blueprintautomation.tech` to an API that has no
+  login, so anyone who knew the hostname could list your projects, download
+  footage, or delete a project. It now forwards only the agent endpoint,
+  signed media and upload links, the Instagram fetch path and `/health`.
+- **AI B-roll spreads across the whole video.** Suggestions were capped at 8
+  and skipped any scene partly used in the main cut, so on a 5-minute video a
+  demo clip that was also its own section only showed up near the end. The
+  assistant now offers every unused stretch of a clip, scales the number of
+  cutaways with length (one per ~25s, up to 20; up to 8s each on long
+  videos), keeps them at least 5s apart, and is told to spread them from
+  beginning to end — weaving in any clip your direction names.
+- **Picture no longer runs ahead of the sound on edits with hard cuts.**
+  Clips joined with quick "cut" transitions could silently lose a whole shot
+  when a clip came out a frame shorter than planned, so everything after it
+  played early (a 5-minute video showed the demo while the speaker was still
+  talking about hosting). Every join now has a few frames of slack, and each
+  shot's audio is pinned to its planned length so long renders stay in sync.
+- **Exports of long videos no longer fail with "duration drift".** Long
+  timelines render in chunks whose frame rounding added ~0.8s; exports now
+  check against the real rendered length.
+
 ### Added
+- **Connect an agent to ReelForge** (`docs/muse-mcp.md`). Muse — or any MCP
+  client — can see your footage, cut clips from it and hand them back, using
+  a key you create in Agent access and revoke whenever you like.
+- **Choose how finished clips come back.** Per request: a link per clip
+  (expiring, works on a phone with no login), copied into a synced folder so
+  they appear in Files, an email listing them, or any combination. Set a
+  default with `REELFORGE_DELIVERY_DEFAULT`; the folder is
+  `REELFORGE_DELIVERY_DIR` and email needs the `SMTP_*` settings. If a
+  delivery route fails, the clips are still cut and the reason is reported.
+- **Ask an agent to cut your footage.** Two new tools: short vertical clips
+  (pick how many, how long, and what to look for) or one longer video mixed
+  from every clip in a batch. Either one runs as a single job you can ask
+  about in plain words — "listening to what's said", "rendering", 60% — and
+  the finished clips come back when it's done. Only one cut runs per batch at
+  a time, so asking twice can't start two.
+- **Send footage from your phone.** Ask the agent for an upload link and it
+  returns one you tap: pick clips from your camera roll and they upload
+  straight into a named batch, with per-file progress. The link expires after
+  a few hours. Clips already in ReelForge are reported as such rather than
+  looking like they were added twice.
+- **Watch folder.** Point `REELFORGE_WATCH_DIR` at an iCloud or Dropbox
+  folder and footage saved there becomes a project automatically — a
+  subfolder keeps its own name, loose files group by the day they arrived.
+  Your files stay where they are; ReelForge only copies them in, and waits
+  until a file has finished syncing before touching it.
+- **Agent access.** Settings → Agent access mints keys that let an assistant
+  like Muse reach ReelForge as an MCP connector: paste the URL and the key
+  into the agent and it can see your projects and footage. It can't publish
+  anything or delete your work, and the key is shown once, stored hashed, and
+  revocable. The page warns when the address is still localhost, which a
+  phone can't reach.
 - **One long video from several clips.** Choosing "Long single span" with
   two or more analyzed clips now builds a single long-form video (up to 30
   minutes): the AI picks the strongest whole sections from every clip, puts

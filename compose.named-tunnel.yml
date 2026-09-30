@@ -1,0 +1,29 @@
+# A stable HTTPS origin for the API, on a domain we own.
+#
+#   ./scripts/named-tunnel-setup.sh     # once, after `cloudflared tunnel login`
+#   docker compose -f compose.yml -f compose.named-tunnel.yml up -d
+#
+# Replaces the `tunnel` profile in compose.yml. That one is a quick tunnel: a
+# new random hostname every restart, which has to be copied out of the logs and
+# pasted into REELFORGE_PUBLIC_MEDIA_BASE by hand each time. Meta caches nothing
+# and refetches per publish, so a stale base URL fails at publish time rather
+# than at startup.
+#
+# This tunnel's hostname is ours and does not move, so the .env value is written
+# once. Deliberately a SEPARATE tunnel from growth-agent's: each stack owns its
+# own, on its own docker network, so restarting one cannot take the other's
+# ingress down with it.
+services:
+  named-tunnel:
+    image: cloudflare/cloudflared:2025.8.1
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml --metrics 0.0.0.0:2000 run
+    volumes:
+      # Written by scripts/named-tunnel-setup.sh; gitignored. The credentials
+      # file is the tunnel's private key — anyone holding it can serve this
+      # hostname.
+      - ./secrets/cloudflared:/etc/cloudflared:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [reelforge_net]
+    restart: unless-stopped

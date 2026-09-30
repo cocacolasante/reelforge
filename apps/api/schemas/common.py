@@ -75,7 +75,9 @@ class UploadSessionOut(BaseModel):
 # --------- jobs ----------
 
 
-JobKindLit = Literal["analyze", "select", "compose", "export", "publish", "broll"]
+JobKindLit = Literal[
+    "analyze", "select", "compose", "export", "publish", "broll", "agent_cut"
+]
 JobStatusLit = Literal["queued", "running", "done", "failed"]
 
 

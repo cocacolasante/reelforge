@@ -41,3 +41,6 @@ Thumbs.db
 htmlcov/
 
 # Lockfiles we do want to commit are re-listed via ! if needed
+
+# Cloudflare named-tunnel credentials
+secrets/

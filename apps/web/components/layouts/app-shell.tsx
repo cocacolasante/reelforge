@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { Clapperboard, Heart } from 'lucide-react';
+import { Clapperboard, Heart, KeyRound } from 'lucide-react';
 import { useProjects, useHealth } from '@/lib/api/hooks';
 import {
   Select,
@@ -54,6 +54,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               </Select>
             ) : null}
           </div>
+
+          <Link
+            href="/settings/agent-access"
+            title="Agent access"
+            aria-label="Agent access"
+            className="text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <KeyRound className="h-4 w-4" />
+          </Link>
 
           <HealthPill ok={healthQuery.data?.status === 'ok'} />
         </div>

@@ -18,6 +18,12 @@ log = logging.getLogger(__name__)
 
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 
+# Auto-reframe opens an OpenCV decoder per shot, and a 4K decoder costs
+# hundreds of MB. It used to run outside `sem` — every shot at once — so an
+# 8-shot mix of 4K clips ballooned the worker to 4.8 GB and the kernel killed
+# it mid-render (2026-09-20, "how to wax a skimboard").
+REFRAME_CONCURRENCY = 2
+
 
 class _SkipCache(Exception):
     """A clip that must not enter the cache (e.g. eye contact was requested
@@ -304,6 +310,7 @@ async def extract_clips(
     is_hdr = (asset.probe.color_transfer or "") in HDR_TRANSFERS
     total = len(plan) if plan is not None else len(reel.scene_indices)
     sem: asyncio.Semaphore = asyncio.Semaphore(min(4, max(1, total)))
+    pan_sem: asyncio.Semaphore = asyncio.Semaphore(REFRAME_CONCURRENCY)
     done = 0
 
     source_mtime = int(asset.path.stat().st_mtime)
@@ -342,7 +349,8 @@ async def extract_clips(
             out_ts = max(in_ts + 0.5 * speed, out_ts - end_trims[position] * speed)
         pan: tuple[float, float] | None = None
         if crop_track:
-            pan = await asyncio.to_thread(estimate_pan, asset.path, in_ts, out_ts)
+            async with pan_sem:
+                pan = await asyncio.to_thread(estimate_pan, asset.path, in_ts, out_ts)
         out_path = clips_dir / f"clip_{position:04d}.mp4"
 
         # Clip cache: same asset + scene + source mtime + aspect/fps/resolution
@@ -485,6 +493,7 @@ async def extract_timeline_clips(
     total = n
     done = 0
     sem: asyncio.Semaphore = asyncio.Semaphore(4)
+    pan_sem: asyncio.Semaphore = asyncio.Semaphore(REFRAME_CONCURRENCY)
 
     async def _video(position: int, shot) -> ClipInfo:
         asset = sources[shot.asset_id]
@@ -512,7 +521,8 @@ async def extract_timeline_clips(
         )
         pan = None
         if crop_track:
-            pan = await asyncio.to_thread(estimate_pan, asset.path, in_ts, out_ts)
+            async with pan_sem:
+                pan = await asyncio.to_thread(estimate_pan, asset.path, in_ts, out_ts)
         out_path = clips_dir / f"clip_{position:04d}.mp4"
         source_mtime = int(asset.path.stat().st_mtime)
         cache_key = file_cache.compute_key(

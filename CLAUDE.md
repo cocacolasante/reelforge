@@ -378,7 +378,7 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
 
 **Skip-if-exists contract**: when an output file and its sidecar already exist, and both the mezzanine hash and `preset_spec_version` match, `export()` returns the existing manifest without re-transcoding. Pass `--force` to override. Bumping `PRESET_SPEC_VERSION` in code invalidates existing exports for subsequent runs (without touching the files on disk).
 
-**Mezzanine-as-source-of-truth**: `export()` reads `mezzanine.mp4` and never touches `compose.json` beyond reading `duration_sec` for progress math. Changing export format is a transcode pass, never a re-render.
+**Mezzanine-as-source-of-truth**: `export()` reads `mezzanine.mp4` and checks duration drift against the mezzanine's PROBED length (`compose.json`'s `duration_sec` is only a fallback; compose now records the probed length too, because hierarchical renders of long timelines run ~0.8s past the plan and failed every export). Changing export format is a transcode pass, never a re-render.
 
 ## Known gotchas
 - **Two worker replicas by default.** `compose.yml` sets `deploy.replicas: 2`.
@@ -598,7 +598,14 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   output-side seeking on post-setpts timestamps: `-ss/-to` and the reframe
   pan window scale by 1/speed; speed≠1 shots render muted with captions
   suppressed. (4) >6 clips render hierarchically (chunks of ≤5) — a 12-clip
-  single-pass 1080x1920 xfade chain OOM'd at ~6 GB. (5) Style grammars
+  single-pass 1080x1920 xfade chain OOM'd at ~6 GB. (4b) Every clip's
+  video gets `tpad` clone slack (`CLIP_END_PAD_SEC`, last clip trimmed back)
+  and its audio is `apad`+`atrim`med to `ClipInfo.duration`: extracted video
+  is whole frames and can end a frame short of plan, and when the running
+  total fell short of a 0.04s "cut" xfade's end ffmpeg 5.1's xfade dropped
+  the WHOLE next clip (2026-09-16: a 76-shot mix lost 8s of picture, which
+  ran up to 16s ahead of the sound); AAC priming in each chunk encode also
+  added ~0.8s of audio. (5) Style grammars
   (compose/styles.py) engage only in the smart-auto flow or when explicit;
   director proposals (compose/director.py) are validated against
   STYLE_BOUNDS or reverted per-entry — the director must never be able to
@@ -643,14 +650,106 @@ Per-reel output dir: `/data/outputs/{asset_id}/{reel_id}/`.
   `JobKindLit` and the web `JobSchema` enum; one job per reel at a time) +
   worker `suggest_broll_job`. The editor sends its CURRENT timeline; the job
   maps main-track words to mezzanine time (`shot_segments` mirrors the
-  preview's `buildSegments`), catalogs photos + video scenes not already on
-  screen as main shots (`MAIN_OVERLAP_FRAC`), makes ONE `record_broll` call
-  (director model; scene thumbnails + photo thumbs as image blocks), and
-  `validate_suggestions` clamps/drops everything (1.5–6s, inside the reel
-  and the scene, no overlaps with each other or existing layers, ≤ 8).
+  preview's `buildSegments`), catalogs photos + the stretches of each video
+  scene the main track does NOT already show (`free_ranges`, ≤3 longest per
+  scene — whole-scene exclusion hid most of a demo clip that was also a main
+  section; SPEAKING scenes > `MAIN_OVERLAP_FRAC` used are still skipped, or
+  the catalog fills with the talking head's leftovers), makes ONE `record_broll` call (director model; scene thumbnails +
+  photo thumbs as image blocks; the prompt tells it to spread cutaways across
+  the whole reel), and `validate_suggestions` clamps/drops everything
+  (1.5–6s, 8s on reels > 120s; inside the reel and the stretch; no overlaps
+  with existing layers; ≥ `MIN_GAP_SEC` 5s apart; never the clip already
+  on screen as the main shot; budget
+  `suggestion_budget` = one per 25s, 8–20).
   Results ride the job row (`result.suggestions`); nothing touches the reel
   until the user accepts in `BrollAssistant` and saves. No candidates or no
   speech → a note, zero tokens.
+- **Agent access (MCP, CP1).** An outside agent — Muse (Meta's assistant) is
+  the first — reaches ReelForge as a **custom MCP connector**: a hosted
+  `POST /mcp` plus a bearer key. Same design as growth-agent's and
+  emailblaster's Muse integrations, so read `~/Projects/emailblaster/
+  docs/muse-mcp.md` before changing anything here. Shape:
+  `apps/api/routers/mcp.py` (stateless JSON-RPC over Streamable HTTP —
+  `initialize`/`ping`/`tools/list`/`tools/call`, batch arrays, 202 for
+  notifications, plain JSON and NEVER SSE, `GET`/`DELETE` -> 405);
+  `apps/api/mcp/tools.py` (`TOOLS` list of declarative `Tool` objects;
+  `mutates` drives the MCP `readOnlyHint`/`idempotentHint` annotations);
+  `apps/api/services/api_keys.py` + `db.ApiKey` (SHA-256 hashed, `rf_`
+  prefix indexed for lookup, `secrets.compare_digest`, revocable,
+  `last_used_at` stamped); `apps/api/routers/api_keys.py` (dashboard-only
+  minting — deliberately NOT reachable from a tool, so a key can't mint
+  another). Invariants: the MCP router mounts at the ROOT, not `/api/v1`
+  (connector URLs are `host/mcp`); tools dispatch through the app's own
+  routes in-process via `httpx.ASGITransport(app=request.app)` re-presenting
+  the caller's key (`request.app`, not an import — `create_app()` means an
+  import would hit a different instance and break tests); refusals are tool
+  output (`isError: true`, "ReelForge refused this: …"), never protocol
+  errors; and `tests/api/test_mcp.py` PINS the tool list plus the absence of
+  any publish/delete/key tool — widening the surface is an edit there.
+- **Footage in, for agents (CP2).** MCP tools carry JSON, so an agent can
+  never hand over the video itself — both paths here exist because of that.
+  (1) `start_upload` mints a project plus an HMAC-signed, 6h link
+  (`services/signing.py`, secret auto-generated at `/data/.link_secret` so it
+  survives restarts); `routers/upload_link.py` serves a self-contained phone
+  page at ROOT `/upload/{token}` (XHR per file, for upload progress) and
+  `POST /upload/{token}/file`. (2) `services/watch_folder.py` scans
+  `REELFORGE_WATCH_DIR` every `watch_scan_seconds`, taking only files whose
+  mtime has settled (`watch_settle_seconds`) so a half-synced clip is never
+  probed; a subfolder becomes its own project, loose files join a per-day
+  one; the user's file is never moved or deleted and `db.WatchIngest`
+  (path + size + mtime) is what stops a re-ingest. Both share
+  `services/ingest_file.py::ingest_media_file`, which returns
+  `(asset, created)`: an asset id IS the content hash and an asset belongs to
+  ONE project, so re-sending footage that is already here returns the
+  existing row pointing at ITS project — callers must report that ("already
+  in ReelForge, in 'first batch'") instead of crediting a batch with a clip
+  it never received.
+- **Cutting, for agents (CP3).** An agent asks once and polls ONE job, rather
+  than driving analyze -> select -> compose -> export itself.
+  `POST /api/v1/agent/cuts` (`routers/agent.py`) does the database-side setup
+  — validating the project, dropping asset rows whose file has vanished,
+  picking the longest clip as the mix primary, creating the `mix-` Reel row —
+  then enqueues `agent_cut_job` (`apps/worker/jobs.py`), which runs
+  `apps/worker/agent_cut.py`: analysis is REUSED when `analysis.json` exists
+  (it is the expensive stage and is keyed by content hash), selection runs
+  per clip, and the top-K ACROSS the batch are composed + exported. Long mode
+  CALLS `create_mix_job` with the same ctx rather than copying the mix
+  pipeline, so progress and the result land on the same job row. One agent
+  cut per project at a time (`conflict_filter` on kind + project) — cutting
+  costs tokens and tens of minutes. A clip that won't probe is skipped with a
+  warning; only an entirely unreadable batch fails the job. Job kind
+  `agent_cut` is in `JobKindLit` AND the web `JobSchema` enum. NOTE: a
+  `RankedReel`'s score field is `overall` — `overall_score` is the DB Reel
+  column, and a test fake using the wrong name let that bug reach live
+  footage once (2026-09-29); agent tests build REAL `RankedReel`s.
+- **Delivery (CP4).** `apps/worker/delivery.py` runs the channels an agent
+  asked for once clips exist: `links` (always, and both other channels
+  reference them), `folder` (copy into `REELFORGE_DELIVERY_DIR`, a synced
+  folder), `email` (SMTP_* env; never raises — a failed send reports itself
+  and the cut still succeeds). `reelforge_core/links.py` is shared by API and
+  worker (the worker must not import `apps.api`): HMAC tokens over a path
+  RELATIVE to `/data/outputs`, re-checked for containment on resolve, served
+  by `GET /media/{token}` at ROOT and OUTSIDE auth — the link is the
+  capability, and it has to work from a phone with no key. Long mode exports
+  the mix mezzanine first (`export_and_deliver_long`), since a mix renders a
+  mezzanine but never an export and there would otherwise be no file to hand
+  over. Collision naming appends " (2)" rather than editing the name: a clip
+  titled "take 2" must not be filed as "take 3".
+- **The tunnel forwards PATHS, not the host (CP5).** `scripts/
+  named-tunnel-setup.sh` writes path-scoped ingress: only `/mcp`, `/health`,
+  `/media/*`, `/upload/*` and `/public/media/*` reach `api:8001`; everything
+  else 404s at Cloudflare's edge. Load-bearing — this API has no session
+  auth (it assumes localhost), so the blanket forward that shipped for
+  Instagram published the dashboard API, `DELETE /api/v1/projects/{id}`
+  included, to anyone who knew the hostname (found and closed 2026-09-29).
+  cloudflared reads its rules at STARTUP: editing `secrets/cloudflared/
+  config.yml` does nothing until the container restarts. The dashboard stays
+  on localhost:3000 and OAuth uses `REELFORGE_PUBLIC_API_BASE` (localhost),
+  so nothing needs a wider forward. `REELFORGE_WATCH_DIR` /
+  `REELFORGE_DELIVERY_DIR` are HOST paths, bind-mounted at the SAME path
+  inside `api` (and the delivery one into `worker`), so one .env value is
+  right on both sides; unset they fall back to `/dev/null`. See
+  `docs/muse-mcp.md`.
 - **Eye-contact correction.** `ComposeConfig.eye_contact` (default off) →
   `compose/eyecontact.py`, run on each freshly extracted VIDEO clip in both
   `extract_clips` and `extract_timeline_clips` (never photos or B-roll

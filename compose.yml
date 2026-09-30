@@ -27,6 +27,13 @@ services:
     volumes:
       - ./data:/data
       - whisper_models:/models/whisper
+      # Folders on the Mac that agents use: footage dropped in
+      # REELFORGE_WATCH_DIR is ingested, finished clips are copied to
+      # REELFORGE_DELIVERY_DIR. Mounted at the SAME path inside the
+      # container so one .env value is correct on both sides. Unset, they
+      # fall back to /dev/null, which mounts harmlessly and disables both.
+      - ${REELFORGE_WATCH_DIR:-/dev/null}:${REELFORGE_WATCH_DIR:-/dev/null}
+      - ${REELFORGE_DELIVERY_DIR:-/dev/null}:${REELFORGE_DELIVERY_DIR:-/dev/null}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8001/ready"]
       interval: 10s
@@ -56,6 +63,7 @@ services:
     volumes:
       - ./data:/data
       - whisper_models:/models/whisper
+      - ${REELFORGE_DELIVERY_DIR:-/dev/null}:${REELFORGE_DELIVERY_DIR:-/dev/null}
     networks: [reelforge_net]
     deploy:
       replicas: 2
@@ -98,7 +106,11 @@ services:
     networks: [reelforge_net]
 
   # Public tunnel for Instagram publishing: Meta's servers must FETCH the
-  # video, so the API needs a public HTTPS URL. Quick tunnels need no
+  # video, so the API needs a public HTTPS URL.
+  #
+  # Prefer compose.named-tunnel.yml — a stable hostname that survives restarts,
+  # so REELFORGE_PUBLIC_MEDIA_BASE is written once instead of after every
+  # bounce. This quick tunnel stays for throwaway use. Quick tunnels need no
   # Cloudflare account; the random URL is printed in this service's logs:
   #   docker compose --profile tunnel up -d tunnel
   #   docker compose logs tunnel | grep trycloudflare

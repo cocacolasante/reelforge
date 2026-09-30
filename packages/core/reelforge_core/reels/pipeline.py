@@ -208,7 +208,9 @@ async def _render_sheets(
     jobs: list[tuple[str, list, tuple, Path]], analysis: AnalysisReport, label: str
 ) -> dict[str, Path]:
     """Render (key, frame times, outside tile indices, out path) jobs, skipping
-    files that already exist; parallelism 4; failures are logged and skipped."""
+    files that already exist; failures are logged and skipped. Each sheet
+    decodes 5 frames at once, so 4K sources get parallelism 2 — four
+    concurrent 4K sheets were OOM-killed on an 8 GB Docker VM (2026-09-20)."""
     import asyncio
 
     from reelforge_core.compose.graph import run_ffmpeg
@@ -218,7 +220,7 @@ async def _render_sheets(
     if not source.exists():
         log.warning("%ss skipped: source missing at %s", label, source)
         return {}
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(2 if (analysis.width or 0) >= 3000 else 4)
 
     async def _one(key: str, times: list, outside: tuple, out: Path) -> tuple[str, Path] | None:
         if out.exists():

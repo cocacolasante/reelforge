@@ -140,6 +140,29 @@ async def test_stub_fallback_composes_synthetic_reel(
     assert captured["reel"].edit_style == "hype"
 
 
+async def test_stub_composes_without_a_reels_json(
+    isolated_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A project that went straight to an AI mix never ran selection: the
+    stub carries the reel, so only analysis.json is required."""
+    aid = "e" * 64
+    _seed_asset(aid, isolated_data_dir)
+    (working_dir_for(aid) / "reels.json").unlink()
+    result, captured = await _run_job(monkeypatch, aid, "mix-abc123", _stub_dict("mix-abc123"))
+    assert result["reel_id"] == "mix-abc123"
+    assert captured["reel"].candidate_id == "mix-abc123"
+
+
+async def test_no_reels_json_without_a_stub_still_raises(
+    isolated_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    aid = "d" * 64
+    _seed_asset(aid, isolated_data_dir)
+    (working_dir_for(aid) / "reels.json").unlink()
+    with pytest.raises(FileNotFoundError):
+        await _run_job(monkeypatch, aid, "deadbeefdeadbeef", None)
+
+
 async def test_missing_id_without_stub_still_raises(
     isolated_data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

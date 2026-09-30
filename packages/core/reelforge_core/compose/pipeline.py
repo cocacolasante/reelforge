@@ -756,6 +756,21 @@ async def compose(
             }
         )
 
+    # Record what was actually rendered: chunk levels round frame boundaries,
+    # so a long timeline's file can run a little past the planned length —
+    # and exports verify against this number.
+    from reelforge_core.export.verify import probe_duration
+
+    rendered_sec = await asyncio.to_thread(probe_duration, mezzanine_path)
+    if rendered_sec is None:
+        rendered_sec = plan.mezzanine_duration_sec
+    elif abs(rendered_sec - plan.mezzanine_duration_sec) > 0.2:
+        log.info(
+            "rendered %.3fs vs planned %.3fs (chunk frame rounding)",
+            rendered_sec,
+            plan.mezzanine_duration_sec,
+        )
+
     manifest = ComposeManifest(
         asset_id=asset.id,
         reel_id=reel.candidate_id,
@@ -764,7 +779,7 @@ async def compose(
         config=config,
         chosen_music=track,
         mezzanine_path=str(mezzanine_path),
-        duration_sec=round(plan.mezzanine_duration_sec, 3),
+        duration_sec=round(rendered_sec, 3),
         width=config.resolution[0],
         height=config.resolution[1],
         fps=float(config.target_fps),

@@ -51,9 +51,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Reset jobs that were running when the API/worker died. See spec §5/§6.
     await _reset_interrupted_jobs(app)
 
-    # Start background upload-cleanup loop.
+    # Start background loops: upload cleanup, and the watch folder when one
+    # is configured (it returns immediately otherwise).
+    from apps.api.services.watch_folder import watch_loop  # noqa: E402
+
     app.state.bg_tasks = [
         asyncio.create_task(_purge_abandoned_uploads_loop()),
+        asyncio.create_task(watch_loop(dbmod.db_state.sessionmaker)),
     ]
 
     try:
@@ -197,6 +201,20 @@ def create_app() -> FastAPI:
     from apps.api.routers import social as social_router  # noqa: E402
 
     app.include_router(social_router.router, prefix=api_v1)
+
+    from apps.api.routers import api_keys as api_keys_router  # noqa: E402
+    from apps.api.routers import mcp as mcp_router  # noqa: E402
+
+    app.include_router(api_keys_router.router, prefix=api_v1)
+    # Root-level: the upload link is tapped on a phone through the tunnel.
+    from apps.api.routers import agent as agent_router  # noqa: E402
+    from apps.api.routers import upload_link as upload_link_router  # noqa: E402
+
+    app.include_router(agent_router.router, prefix=api_v1)
+    app.include_router(upload_link_router.router)
+    # Root-level, not /api/v1: the URL pasted into an agent's connector
+    # settings is the bare hostname + /mcp, and MCP clients append nothing.
+    app.include_router(mcp_router.router)
 
     # Exception handlers
     @app.exception_handler(ApiError)

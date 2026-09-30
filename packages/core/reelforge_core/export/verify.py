@@ -56,6 +56,15 @@ def _ffprobe(path: Path) -> dict:
         raise OutputVerificationError(f"ffprobe returned invalid JSON: {exc}") from exc
 
 
+def probe_duration(path: Path) -> float | None:
+    """Container duration of a media file, or None when it can't be read."""
+    try:
+        value = float(_ffprobe(path).get("format", {}).get("duration") or 0)
+    except (OutputVerificationError, ValueError, TypeError):
+        return None
+    return value if value > 0 else None
+
+
 def _parse_fps(rate: str | None) -> float:
     if not rate or rate == "0/0":
         return 0.0

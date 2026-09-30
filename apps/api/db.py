@@ -200,6 +200,48 @@ class UploadSession(SQLModel, table=True):
     completed_at: Optional[datetime] = None
 
 
+class ApiKey(SQLModel, table=True):
+    """A bearer key an agent (Muse) presents to reach this ReelForge.
+
+    ReelForge is single-user, so a key grants the whole install rather than
+    scoping to a workspace — it is the credential, nothing else. Only the
+    SHA-256 hash is stored; the token is shown once at mint time. `prefix`
+    is the token's first characters, kept so a presented key can be looked
+    up without scanning every row.
+    """
+
+    __tablename__ = "api_keys"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    name: str  # what it is for, e.g. "Muse on my phone"
+    prefix: str = Field(index=True)
+    token_hash: str = Field(index=True)
+    created_at: datetime = Field(default_factory=_now)
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+class WatchIngest(SQLModel, table=True):
+    """One row per file taken from the watch folder.
+
+    The source file is the user's own and is left where it is, so this table
+    is what stops a re-scan ingesting it again. Keyed on the path plus its
+    size and mtime: replacing a file with a new recording of the same name
+    is a new file and should come in.
+    """
+
+    __tablename__ = "watch_ingests"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    path: str = Field(index=True)
+    size_bytes: int
+    mtime: float
+    asset_id: Optional[str] = None  # None when the file could not be read
+    project_id: Optional[str] = None
+    error: Optional[str] = None
+    ingested_at: datetime = Field(default_factory=_now)
+
+
 class SemanticsCache(SQLModel, table=True):
     """Moved from reelforge_core.db to unify schemas. Same layout."""
 

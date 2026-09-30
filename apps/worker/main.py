@@ -8,6 +8,7 @@ import os
 from arq.connections import RedisSettings
 
 from apps.worker.jobs import (
+    agent_cut_job,
     analyze_asset,
     compile_montage_job,
     compose_reel_job,
@@ -77,6 +78,7 @@ class WorkerSettings:
         publish_reel_job,
         create_mix_job,
         suggest_broll_job,
+        agent_cut_job,
     ]
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
     # Lets the API abort in-flight jobs (e.g. when a source clip is deleted
