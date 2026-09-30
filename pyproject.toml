@@ -10,9 +10,10 @@ dependencies = [
     # API
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    # Queue / broker
-    "arq>=0.26",
-    "redis>=5.2",
+    # Queue libraries live in optional-dependencies below, not here: arq pins
+    # redis<6 and bullmq pins redis>=6.4, so they cannot share an environment.
+    # They never need to — the arq worker and the growth-agent queue consumer
+    # are separate processes in separate images.
     # External services
     "anthropic>=1.0,<2",
     # CLI
@@ -46,7 +47,28 @@ dev = [
     "fakeredis>=2.26",
 ]
 
+[project.optional-dependencies]
+# The existing FastAPI + arq worker path. Behaviour unchanged.
+worker = [
+    "arq>=0.26",
+    "redis>=5.2,<6",
+]
+# The growth-agent queue interface (apps/queue_consumer). BullMQ's Python
+# package is a port of the same Lua scripts as the Node client, so the two
+# interoperate directly without a bridge process.
+queue = [
+    "bullmq>=2.24",
+    "boto3>=1.35",
+]
+
+
 [tool.uv]
+# arq and bullmq pin mutually exclusive redis ranges. Declaring them as
+# conflicting extras lets uv resolve each independently instead of refusing to
+# produce a lock at all.
+conflicts = [
+    [{ extra = "worker" }, { extra = "queue" }],
+]
 # scenedetect 0.7 hard-requires opencv-python; mediapipe requires
 # opencv-contrib-python. Both install `cv2` and clobber each other, so the
 # base wheel is overridden away (impossible marker) — contrib is a superset.
