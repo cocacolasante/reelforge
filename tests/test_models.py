@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from reelforge_core.models import (
     AnalysisConfig,
     AnalysisReport,
@@ -59,6 +62,74 @@ def test_semantics_roundtrip_and_defaults() -> None:
     )
     assert s.cached is False
     assert SceneSemantics.model_validate(s.model_dump()) == s
+
+
+def test_semantics_accepts_a_comma_separated_tag_string() -> None:
+    """The model sometimes answers with a string where the tool schema says array.
+
+    This is the exact payload that failed a real analysis: the shape error is
+    not a retryable API error, so it escaped the retry wrapper and threw away a
+    completed transcription and scene detection.
+    """
+    s = SceneSemantics(
+        scene_index=0,
+        summary="A full-stack breakdown.",
+        tags="tech, explanation, software, streaming, presentation",
+        mood="calm",
+        has_speech=True,
+        visual_energy="medium",
+    )
+    assert s.tags == ["tech", "explanation", "software", "streaming", "presentation"]
+
+
+def test_semantics_accepts_a_joined_string_inside_a_list() -> None:
+    s = SceneSemantics(
+        scene_index=0,
+        summary="Same mistake wearing a list.",
+        tags=["tech, explanation, software"],
+        mood="calm",
+        has_speech=True,
+        visual_energy="medium",
+    )
+    assert s.tags == ["tech", "explanation", "software"]
+
+
+def test_semantics_tag_coercion_drops_empties_and_trims() -> None:
+    s = SceneSemantics(
+        scene_index=0,
+        summary="Trailing comma and stray spaces.",
+        tags="  tech ,, explanation ,  software , ",
+        mood="calm",
+        has_speech=True,
+        visual_energy="medium",
+    )
+    assert s.tags == ["tech", "explanation", "software"]
+
+
+def test_semantics_leaves_a_proper_list_alone() -> None:
+    tags = ["tech", "explanation", "software"]
+    s = SceneSemantics(
+        scene_index=0,
+        summary="Already correct.",
+        tags=tags,
+        mood="calm",
+        has_speech=True,
+        visual_energy="medium",
+    )
+    assert s.tags == tags
+
+
+def test_semantics_still_enforces_the_tag_count() -> None:
+    """Coercion fixes the shape, not the contract — too few tags must still fail."""
+    with pytest.raises(ValidationError):
+        SceneSemantics(
+            scene_index=0,
+            summary="Only two.",
+            tags="tech, explanation",
+            mood="calm",
+            has_speech=True,
+            visual_energy="medium",
+        )
 
 
 def test_analysis_config_defaults() -> None:

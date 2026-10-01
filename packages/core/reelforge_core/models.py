@@ -100,6 +100,31 @@ class SceneSemantics(BaseModel):
     visual_energy: VisualEnergy
     cached: bool = False
 
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _coerce_tag_list(cls, v: object) -> object:
+        """Accept a comma-separated string where a list was asked for.
+
+        Semantics come back through a tool call, so the array shape is declared
+        in the tool schema — but the model still occasionally answers with
+        ``"tech, explanation, software, streaming, presentation"`` instead of a
+        list. That is not a retryable API error, so it escapes
+        ``_call_claude_with_retries`` and surfaces as a pydantic ValidationError
+        that fails the entire analysis after transcription and scene detection
+        have already been paid for. Observed on a 5-minute source; the same file
+        analysed cleanly on the next attempt, which is what makes it expensive
+        rather than obvious.
+
+        Splitting here rather than at the call site also covers the cache-read
+        path, which rebuilds this model straight from a stored row.
+        """
+        if isinstance(v, str):
+            return [t.strip() for t in v.split(",") if t.strip()]
+        # The same mistake wearing a list: ["a, b, c"].
+        if isinstance(v, list) and len(v) == 1 and isinstance(v[0], str) and "," in v[0]:
+            return [t.strip() for t in v[0].split(",") if t.strip()]
+        return v
+
 
 # ---------------------------------------------------------------------------
 # Config + report
